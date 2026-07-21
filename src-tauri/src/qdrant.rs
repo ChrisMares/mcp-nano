@@ -10,7 +10,7 @@ use tauri::{AppHandle, Manager};
 use tauri_plugin_shell::{process::CommandEvent, ShellExt};
 
 // Must match the dense embedder output size (Snowflake/snowflake-arctic-embed-xs).
-const EMBEDDING_DIM: u64 = 384;
+pub const EMBEDDING_DIM: u64 = 384;
 
 const COLLECTIONS: [&str; 2] = ["codebase", "general"];
 

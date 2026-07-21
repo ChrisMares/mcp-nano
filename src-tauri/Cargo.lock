@@ -3434,6 +3434,7 @@ dependencies = [
  "globset",
  "libchm",
  "pdf-extract",
+ "portpicker",
  "qdrant-client",
  "quick-xml 0.41.0",
  "reqwest 0.13.4",
@@ -4283,6 +4284,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d20d5497ef88037a52ff98267d066e7f11fcc5e99bbfbd58a42336193aacec3"
 
 [[package]]
+name = "portpicker"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "be97d76faf1bfab666e1375477b23fde79eccf0276e9b63b92a39d676a889ba9"
+dependencies = [
+ "rand 0.8.7",
+]
+
+[[package]]
 name = "postscript"
 version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4477,6 +4487,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tonic",
+ "uuid",
 ]
 
 [[package]]

@@ -26,12 +26,13 @@ after installation.
 | `src/utils/apicalls.ts` | The sole UI-to-backend boundary: typed Tauri `invoke()` calls. |
 | `src/types/` | TypeScript request and response contracts used by the UI. |
 | `src-tauri/src/controllers/` | Thin `#[tauri::command]` wrappers over Rust core services. |
+| `src-tauri/src/controllers/debug.rs` | `#[cfg(debug_assertions)]` shared scenario helpers (spawn_qdrant, load_embedders, cosine, etc.) used by integration tests in `src-tauri/tests/`. Stripped from release builds. |
 | `src-tauri/src/models/` | Serde request, response, business, and future SQLite entity types. |
-| `src-tauri/src/embed/` | Planned embedding, reranking, BM25, and chunking implementation. |
+| `src-tauri/src/services/` | Core business logic: `embedders/` (dense, reranker, BM25), `embedder_state.rs`, `qdrant_service.rs`, `ingestion_service.rs`. |
 | `src-tauri/src/db/` | SQLite pool setup and access; migrations in `src-tauri/migrations/`. |
-| `src-tauri/src/worker/` | Planned background job worker and task execution. |
+| `src-tauri/src/worker/` | Background job worker: poll loop, `TaskRegistry`, async `ProgressCallback`. |
 | `src-tauri/src/qdrant.rs` | Qdrant sidecar lifecycle, client connect/retry, and startup collection/index init. |
-| `src-tauri/src/mcp/` | Planned localhost Axum and rmcp endpoint. |
+| `src-tauri/tests/` | Integration tests (separate crates). `embedder_models.rs` (6 tests, needs downloaded model files), `qdrant_e2e.rs` (2 `#[ignore]` tests, needs bundled Qdrant binary + models), `common/mod.rs` re-exports `controllers::debug`. |
 
 ## Current Status
 
@@ -106,6 +107,58 @@ after installation.
 - Keep external resource directories and platform-specific Qdrant binaries out
   of git as specified by the plan.
 
+## Testing
+
+Rust tests follow the standard Rust split: unit tests live inline next to
+the code they test (inside `#[cfg(test)] mod tests` in each `src/` file);
+integration tests live in `src-tauri/tests/` as separate crates that see
+only the library's public API.
+
+### Test layout
+
+| Location | Type | Count | External deps |
+| --- | --- | --- | --- |
+| `src-tauri/src/**/mod tests` | Unit (inline) | 46 | None (temp SQLite in-process) |
+| `src-tauri/tests/embedder_models.rs` | Integration | 6 | `resources/models/` files on disk (skip-safe) |
+| `src-tauri/tests/qdrant_e2e.rs` | Integration (E2E) | 2 `#[ignore]` | Bundled Qdrant binary + downloaded models |
+| `src-tauri/tests/common/mod.rs` | Shared helpers | — | Re-exports `controllers::debug` |
+
+### Shared scenario helpers
+
+`src-tauri/src/controllers/debug.rs` holds the single source of truth for
+helpers used by integration tests (`spawn_qdrant`, `ChildGuard`,
+`load_embedders`, `dense_ready`, `reranker_ready`, `open_sqlite_pool`,
+`create_test_collection`, `cosine`). It is gated by
+`#[cfg(debug_assertions)]` so it is stripped from release builds, and
+re-exported into the `tests/` crates via `tests/common/mod.rs`. Do not
+copy-paste these helpers into individual test files; extend `debug.rs`
+instead.
+
+### Public API for tests
+
+`src-tauri/src/lib.rs` exposes all backend modules as `pub mod`
+(`controllers`, `db`, `models`, `services`, `worker`, `qdrant`) so that
+integration test crates can import `mcp_nano_lib::services::*` etc. Keep
+these `pub`; do not re-narrow them.
+
+### Commands
+
+```bash
+# Unit tests (inline, no external deps)
+cargo test --manifest-path src-tauri/Cargo.toml --lib
+
+# Integration tests — embedder model tests run/skip, Qdrant E2E ignored
+cargo test --manifest-path src-tauri/Cargo.toml --tests
+
+# Qdrant E2E — requires bundled binary + downloaded models
+cargo test --manifest-path src-tauri/Cargo.toml --tests -- --ignored
+```
+
+Model files are fetched by `src-tauri/scripts/download-models.sh` into
+`src-tauri/resources/models/` (gitignored). The 6 embedder model tests
+silently skip if the files are absent; the 2 Qdrant E2E tests are
+`#[ignore]`'d and require `binaries/qdrant-x86_64-unknown-linux-gnu`.
+
 ## Development And Verification
 
 ```bash
@@ -113,7 +166,9 @@ npm run lint
 npm run build
 npm run test
 cargo check --manifest-path src-tauri/Cargo.toml
-cargo test --manifest-path src-tauri/Cargo.toml
+cargo test --manifest-path src-tauri/Cargo.toml --lib
+cargo test --manifest-path src-tauri/Cargo.toml --tests
+cargo test --manifest-path src-tauri/Cargo.toml --tests -- --ignored
 npm run tauri dev
 ```
 
