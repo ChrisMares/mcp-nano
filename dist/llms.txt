@@ -1,0 +1,13 @@
+# NASA MCP
+
+NASA MCP is a local UI for embedding code and documents, querying context, and managing MCP servers and tools.
+
+## Docs
+
+- [Getting Started](/docs/getting-started)
+- [Upload & Embed Files](/docs/embed/upload)
+- [Data Management](/docs/embed/data-management)
+- [Fetch Context](/docs/query/fetch-context)
+- [Create MCP Tools](/docs/mcp/create)
+- [Manage MCP Servers](/docs/mcp/manage)
+- [Connect to AI Agents](/docs/mcp/connect)

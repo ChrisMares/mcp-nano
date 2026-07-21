@@ -1,0 +1,74 @@
+[package]
+name = "mcp-nano"
+version = "0.1.0"
+description = "A Tauri App"
+authors = ["you"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "mcp_nano_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1.53.0", features = ["full"] }
+tokio-util = { version = "0.7.18", features = ["rt"] }
+axum = "0.8.9"
+rmcp = { version = "2.2.0", features = ["server-side-http", "client", "transport-child-process"] }
+sqlx = { version = "0.9.0", features = ["runtime-tokio", "tls-rustls", "sqlite", "migrate", "macros", "chrono", "uuid"] }
+candle-core = "0.11.0"
+candle-nn = "0.11.0"
+candle-transformers = "0.11.0"
+tokenizers = "0.23.1"
+text-splitter = { version = "0.32.0", features = ["tokenizers"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "http2", "charset", "json"] }
+scraper = "0.27.0"
+dirs = "6.0.0"
+uuid = { version = "1.24.0", features = ["v4", "serde"] }
+sha2 = "0.11.0"
+chrono = { version = "0.4.45", features = ["serde"] }
+tauri-plugin-shell = "2.3.5"
+tauri-plugin-dialog = "2.7.2"
+tauri-plugin-updater = "2.10.1"
+tree-sitter = "0.26.11"
+tree-sitter-rust = "0.24.2"
+tree-sitter-python = "0.25.0"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-typescript = "0.23.2"
+tree-sitter-java = "0.23.5"
+tree-sitter-c = "0.24.2"
+tree-sitter-cpp = "0.23.4"
+tree-sitter-c-sharp = "0.23.5"
+tree-sitter-sequel = "0.3.11"
+qdrant-client = "1.18.0"
+zip = "8.6.0"
+walkdir = "2.5.0"
+globset = "0.4.19"
+pdf-extract = "0.12.0"
+docx-lite = "0.2.0"
+calamine = "0.36.0"
+libchm = "0.2.0"
+quick-xml = "0.41.0"
+csv = "1.4.0"
+url = "2.5.8"
+dotenvy = "0.15.7"
+anyhow = "1.0.104"
+thiserror = "2.0.19"
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+tower-http = { version = "0.7.0", features = ["cors"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+

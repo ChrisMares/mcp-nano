@@ -1,0 +1,36 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "mcp-nano",
+  "version": "0.1.0",
+  "identifier": "com.mcpquick.mcp-nano",
+  "build": {
+    "beforeDevCommand": "npm run ensure:qdrant && npm run dev",
+    "devUrl": "http://localhost:18674",
+    "beforeBuildCommand": "npm run ensure:qdrant && npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "mcp-nano",
+        "width": 1500,
+        "height": 800
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "externalBin": ["binaries/qdrant"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}

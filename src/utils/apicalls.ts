@@ -1,0 +1,220 @@
+import { invoke } from "@tauri-apps/api/core";
+import type { RagQueryPayload, RagResponse } from "@/types/rag";
+import type {
+  EmbedJob,
+  EmbeddingOptions,
+  JobStatus,
+  UploadResponse,
+  UserFiles,
+  WebsiteItem,
+} from "@/types/embed";
+import type {
+  ConnectionInfo,
+  McpServer,
+  ToolDefinition,
+  ToolPayload,
+} from "@/types/mcp";
+
+export interface MetadataValuesResponse {
+  values: string[];
+}
+
+export interface ActiveJobsResponse {
+  jobs: EmbedJob[];
+  total_count: number;
+}
+
+export interface DeleteResponse {
+  deleted: boolean;
+}
+
+export interface MessageResponse {
+  message: string;
+}
+
+export interface ServersResponse {
+  servers: McpServer[];
+}
+
+export interface ServerResponse {
+  server: McpServer;
+}
+
+export interface ToolResponse {
+  tool: ToolDefinition;
+}
+
+export interface WebsitesResponse {
+  websites: WebsiteItem[];
+}
+
+export interface CrawlResponse {
+  urls: string[];
+  count: number;
+}
+
+export interface EmbedWebsiteResponse {
+  job_id: string;
+  url_count: number;
+}
+
+export async function ragQuery(payload: RagQueryPayload): Promise<RagResponse> {
+  return invoke("rag_query", { payload });
+}
+
+export async function getMetadataValues(
+  collectionName: string,
+  key: string
+): Promise<MetadataValuesResponse> {
+  return invoke("get_metadata_values", { collectionName, key });
+}
+
+export async function uploadRepoZip(
+  files: File[],
+  embeddingOptions: EmbeddingOptions
+): Promise<UploadResponse> {
+  return invoke("upload_repo_zip", {
+    paths: files.map((f) => f.name),
+    embeddingOptions,
+  });
+}
+
+export async function uploadDocuments(
+  files: File[],
+  embeddingOptions: EmbeddingOptions
+): Promise<UploadResponse> {
+  return invoke("upload_documents", {
+    paths: files.map((f) => f.name),
+    embeddingOptions,
+  });
+}
+
+export async function uploadCodeFiles(
+  files: File[],
+  embeddingOptions: EmbeddingOptions
+): Promise<UploadResponse> {
+  return invoke("upload_code_files", {
+    paths: files.map((f) => f.name),
+    embeddingOptions,
+  });
+}
+
+export async function getActiveJobs(): Promise<ActiveJobsResponse> {
+  return invoke("get_active_jobs");
+}
+
+export async function getJobStatus(jobId: string): Promise<JobStatus> {
+  return invoke("get_job_status", { jobId });
+}
+
+export async function getFiles(): Promise<UserFiles> {
+  return invoke("get_files");
+}
+
+export async function deleteRepo(repoName: string): Promise<DeleteResponse> {
+  return invoke("delete_repo", { repoName });
+}
+
+export async function deleteDocument(filename: string): Promise<DeleteResponse> {
+  return invoke("delete_document", { filename });
+}
+
+export async function deleteGroup(groupName: string): Promise<DeleteResponse> {
+  return invoke("delete_group", { groupName });
+}
+
+export async function clearUserCollection(
+  collectionName: string
+): Promise<DeleteResponse> {
+  return invoke("clear_user_collection", { collectionName });
+}
+
+export async function getWebsites(): Promise<WebsitesResponse> {
+  return invoke("get_websites");
+}
+
+export async function deleteWebsite(url: string): Promise<DeleteResponse> {
+  return invoke("delete_website", { url });
+}
+
+export async function deleteWebsiteGroup(
+  groupName: string
+): Promise<DeleteResponse> {
+  return invoke("delete_website_group", { groupName });
+}
+
+export async function clearWebsites(): Promise<DeleteResponse> {
+  return invoke("clear_websites");
+}
+
+export async function getMcpServers(): Promise<ServersResponse> {
+  return invoke("get_mcp_servers");
+}
+
+export async function createMcpServer(
+  name: string,
+  description?: string
+): Promise<ServerResponse> {
+  return invoke("create_mcp_server", { name, description });
+}
+
+export async function getMcpServer(serverId: string): Promise<ServerResponse> {
+  return invoke("get_mcp_server", { serverId });
+}
+
+export async function deleteMcpServer(
+  serverId: string
+): Promise<MessageResponse> {
+  return invoke("delete_mcp_server", { serverId });
+}
+
+export async function createMcpTool(
+  serverId: string,
+  toolData: ToolPayload
+): Promise<ToolResponse> {
+  return invoke("create_mcp_tool", { serverId, toolData });
+}
+
+export async function updateMcpTool(
+  serverId: string,
+  toolId: string,
+  toolData: ToolPayload
+): Promise<ToolResponse> {
+  return invoke("update_mcp_tool", { serverId, toolId, toolData });
+}
+
+export async function deleteMcpTool(
+  serverId: string,
+  toolId: string
+): Promise<MessageResponse> {
+  return invoke("delete_mcp_tool", { serverId, toolId });
+}
+
+export async function toggleMcpTool(
+  serverId: string,
+  toolId: string,
+  active: boolean
+): Promise<ToolResponse> {
+  return invoke("toggle_mcp_tool", { serverId, toolId, active });
+}
+
+export async function getMcpConnectionInfo(
+  serverId: string
+): Promise<ConnectionInfo> {
+  return invoke("get_mcp_connection_info", { serverId });
+}
+
+export async function crawlWebsite(
+  url: string,
+  depth: number,
+  sameDomainOnly: boolean
+): Promise<CrawlResponse> {
+  return invoke("crawl_website", { url, depth, sameDomainOnly });
+}
+
+export async function embedWebsite(
+  urls: string[],
+  group: string
+): Promise<EmbedWebsiteResponse> {
+  return invoke("embed_website", { urls, group });
+}

@@ -1,0 +1,990 @@
+@import "tailwindcss";
+
+@plugin "tailwindcss-animate";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+/* ── Theme token mapping ── */
+@theme inline {
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --radius-2xl: calc(var(--radius) + 8px);
+  --radius-3xl: calc(var(--radius) + 12px);
+  --radius-4xl: calc(var(--radius) + 16px);
+
+  /* Core semantic */
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
+  /* Status */
+  --color-success: var(--success);
+  --color-success-foreground: var(--success-foreground);
+  --color-warning: var(--warning);
+  --color-warning-foreground: var(--warning-foreground);
+  --color-info: var(--info);
+  --color-info-foreground: var(--info-foreground);
+
+  /* Brand (landing page palette, available globally) */
+  --color-brand-gold: var(--brand-gold);
+  --color-brand-gold-bright: var(--brand-gold-bright);
+  --color-brand-cyan: var(--brand-cyan);
+  --color-brand-cyan-light: var(--brand-cyan-light);
+  --color-brand-cream: var(--brand-cream);
+  --color-brand-surface: var(--brand-surface);
+  --color-brand-surface-raised: var(--brand-surface-raised);
+
+  /* Charts */
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+
+  /* Sidebar */
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+}
+
+/* ── Light mode ── */
+:root {
+  --radius: 0.625rem;
+
+  --background: oklch(0.96 0.008 85);
+  --foreground: oklch(0.15 0.025 260);
+  --card: oklch(0.995 0.004 85);
+  --card-foreground: oklch(0.15 0.025 260);
+  --popover: oklch(0.995 0.004 85);
+  --popover-foreground: oklch(0.15 0.025 260);
+  --primary: oklch(0.62 0.18 68);
+  --primary-foreground: oklch(0.99 0.005 85);
+  --secondary: oklch(0.93 0.012 85);
+  --secondary-foreground: oklch(0.22 0.025 260);
+  --muted: oklch(0.92 0.01 85);
+  --muted-foreground: oklch(0.48 0.03 260);
+  --accent: oklch(0.90 0.018 78);
+  --accent-foreground: oklch(0.22 0.025 260);
+  --destructive: oklch(0.577 0.245 27.325);
+  --border: oklch(0.82 0.025 80);
+  --input: oklch(0.94 0.012 85);
+  --ring: oklch(0.62 0.18 68);
+
+  /* Status */
+  --success: oklch(0.55 0.17 152);
+  --success-foreground: oklch(0.99 0.005 85);
+  --warning: oklch(0.75 0.18 80);
+  --warning-foreground: oklch(0.18 0.02 260);
+  --info: oklch(0.55 0.15 230);
+  --info-foreground: oklch(0.99 0.005 85);
+
+  /* Brand */
+  --brand-gold: oklch(0.72 0.15 75);
+  --brand-gold-bright: oklch(0.88 0.14 88);
+  --brand-cyan: oklch(0.82 0.12 192);
+  --brand-cyan-light: oklch(0.90 0.08 192);
+  --brand-cream: oklch(0.96 0.02 90);
+  --brand-surface: oklch(0.25 0.005 260);
+  --brand-surface-raised: oklch(0.30 0.005 260);
+
+  /* Charts */
+  --chart-1: oklch(0.58 0.16 70);
+  --chart-2: oklch(0.55 0.12 192);
+  --chart-3: oklch(0.398 0.07 227.392);
+  --chart-4: oklch(0.828 0.189 84.429);
+  --chart-5: oklch(0.769 0.188 70.08);
+
+  /* Sidebar */
+  --sidebar: oklch(0.985 0.004 85);
+  --sidebar-foreground: oklch(0.15 0.025 260);
+  --sidebar-primary: oklch(0.62 0.18 68);
+  --sidebar-primary-foreground: oklch(0.99 0.005 85);
+  --sidebar-accent: oklch(0.62 0.18 68 / 10%);
+  --sidebar-accent-foreground: oklch(0.22 0.025 260);
+  --sidebar-border: oklch(0.85 0.02 80);
+  --sidebar-ring: oklch(0.62 0.18 68);
+}
+
+/* ── Dark mode ── */
+.dark {
+  --background: oklch(0.23 0.01 260);
+  --foreground: oklch(0.95 0.02 85);
+  --card: oklch(0.27 0.012 260);
+  --card-foreground: oklch(0.95 0.02 85);
+  --popover: oklch(0.27 0.012 260);
+  --popover-foreground: oklch(0.95 0.02 85);
+  --primary: oklch(0.82 0.15 78);
+  --primary-foreground: oklch(0.15 0.01 260);
+  --secondary: oklch(0.32 0.014 260);
+  --secondary-foreground: oklch(0.92 0.02 85);
+  --muted: oklch(0.30 0.012 260);
+  --muted-foreground: oklch(0.72 0.03 80);
+  --accent: oklch(0.34 0.018 75);
+  --accent-foreground: oklch(0.95 0.02 85);
+  --destructive: oklch(0.704 0.191 22.216);
+  --border: oklch(0.80 0.12 75 / 25%);
+  --input: oklch(0.25 0.01 260);
+  --ring: oklch(0.82 0.15 78);
+
+  /* Status */
+  --success: oklch(0.70 0.17 152);
+  --success-foreground: oklch(0.15 0.01 260);
+  --warning: oklch(0.85 0.15 80);
+  --warning-foreground: oklch(0.15 0.01 260);
+  --info: oklch(0.78 0.12 192);
+  --info-foreground: oklch(0.15 0.01 260);
+
+  /* Brand */
+  --brand-gold: oklch(0.78 0.16 75);
+  --brand-gold-bright: oklch(0.90 0.15 85);
+  --brand-cyan: oklch(0.85 0.13 192);
+  --brand-cyan-light: oklch(0.92 0.09 192);
+  --brand-cream: oklch(0.96 0.02 90);
+  --brand-surface: oklch(0.25 0.005 260);
+  --brand-surface-raised: oklch(0.30 0.005 260);
+
+  /* Charts */
+  --chart-1: oklch(0.82 0.15 78);
+  --chart-2: oklch(0.78 0.12 192);
+  --chart-3: oklch(0.769 0.188 70.08);
+  --chart-4: oklch(0.627 0.265 303.9);
+  --chart-5: oklch(0.645 0.246 16.439);
+
+  /* Sidebar */
+  --sidebar: oklch(0.20 0.012 260);
+  --sidebar-foreground: oklch(0.95 0.02 85);
+  --sidebar-primary: oklch(0.82 0.15 78);
+  --sidebar-primary-foreground: oklch(0.95 0.02 85);
+  --sidebar-accent: oklch(0.82 0.15 78 / 15%);
+  --sidebar-accent-foreground: oklch(0.95 0.02 85);
+  --sidebar-border: oklch(0.80 0.12 75 / 20%);
+  --sidebar-ring: oklch(0.82 0.15 78);
+}
+
+/* ── Base layer ── */
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+  
+  /* Modern light mode enhancements */
+  :root:not(.dark) {
+    /* Subtle gradient background */
+    --bg-gradient-start: oklch(0.97 0.006 85);
+    --bg-gradient-end: oklch(0.95 0.008 85);
+  }
+  
+  :root:not(.dark) body {
+    background: linear-gradient(180deg, var(--bg-gradient-start) 0%, var(--bg-gradient-end) 100%);
+    min-height: 100vh;
+  }
+  
+  /* Enhanced card styling for light mode */
+  :root:not(.dark) .rounded-lg,
+  :root:not(.dark) [class*="rounded-lg"] {
+    box-shadow: 
+      0 1px 3px 0 color-mix(in oklch, oklch(0.2 0.01 260) 5%, transparent),
+      0 1px 2px -1px color-mix(in oklch, oklch(0.2 0.01 260) 5%, transparent),
+      0 0 0 1px color-mix(in oklch, var(--border) 50%, transparent);
+  }
+  
+  /* Enhanced input fields */
+  :root:not(.dark) input:not([type="checkbox"]):not([type="radio"]),
+  :root:not(.dark) textarea {
+    background-color: oklch(0.99 0.003 85);
+    border-color: oklch(0.78 0.02 80);
+    box-shadow: inset 0 1px 2px color-mix(in oklch, oklch(0.2 0.01 260) 4%, transparent);
+    transition: all 0.2s ease;
+  }
+  
+  :root:not(.dark) input:not([type="checkbox"]):not([type="radio"]):focus,
+  :root:not(.dark) textarea:focus,
+  :root:not(.dark) select:focus {
+    background-color: oklch(0.995 0.002 85);
+    border-color: var(--brand-cyan);
+    box-shadow: 
+      0 0 0 3px color-mix(in oklch, var(--brand-cyan) 20%, transparent),
+      inset 0 1px 2px color-mix(in oklch, oklch(0.2 0.01 260) 4%, transparent);
+  }
+  
+  /* Better button styling */
+  :root:not(.dark) button:not([class*="ghost"]):not([class*="link"]) {
+    box-shadow: 
+      0 1px 2px 0 color-mix(in oklch, oklch(0.2 0.01 260) 8%, transparent),
+      0 0 0 1px color-mix(in oklch, var(--border) 30%, transparent);
+  }
+  
+  :root:not(.dark) button[class*="primary"],
+  :root:not(.dark) .bg-primary {
+    box-shadow: 
+      0 1px 3px 0 color-mix(in oklch, var(--primary) 30%, transparent),
+      0 0 0 1px color-mix(in oklch, var(--primary) 20%, transparent),
+      inset 0 1px 0 0 color-mix(in oklch, white 20%, transparent);
+  }
+  
+  /* Sidebar enhancements */
+  :root:not(.dark) aside,
+  :root:not(.dark) [class*="sidebar"] {
+    box-shadow: 
+      1px 0 3px 0 color-mix(in oklch, oklch(0.2 0.01 260) 4%, transparent);
+  }
+  
+  /* Menu item active state with gold accent */
+  :root:not(.dark) .menu-item-active {
+    background: linear-gradient(90deg, color-mix(in oklch, var(--primary) 8%, transparent) 0%, transparent 100%);
+    box-shadow: 
+      inset 3px 0 0 0 var(--primary),
+      0 1px 2px 0 color-mix(in oklch, var(--primary) 15%, transparent);
+  }
+  
+  :root:not(.dark) .menu-item-active .menu-item-icon-active {
+    color: var(--primary);
+    filter: drop-shadow(0 0 4px color-mix(in oklch, var(--primary) 40%, transparent));
+  }
+
+  /* Dashboard nav active state — gold/cyan gradient pop */
+  :root:not(.dark) .menu-item-dashboard-active {
+    background: linear-gradient(135deg,
+      color-mix(in oklch, var(--primary) 16%, transparent) 0%,
+      color-mix(in oklch, var(--brand-cyan) 10%, transparent) 100%);
+    border-color: color-mix(in oklch, var(--primary) 40%, transparent);
+    box-shadow:
+      0 2px 8px color-mix(in oklch, var(--primary) 20%, transparent),
+      inset 0 1px 0 color-mix(in oklch, white 10%, transparent);
+  }
+
+  :root:not(.dark) .menu-item-dashboard-active .menu-item-icon-active {
+    color: var(--primary);
+    filter: drop-shadow(0 0 6px color-mix(in oklch, var(--primary) 50%, transparent));
+  }
+  
+  /* Links with cyan accent */
+  :root:not(.dark) a {
+    color: color-mix(in oklch, var(--brand-cyan) 80%, var(--foreground) 20%);
+    transition: color 0.2s ease;
+  }
+  
+  :root:not(.dark) a:hover {
+    color: var(--brand-cyan);
+  }
+  
+  /* Text selection with cyan */
+  :root:not(.dark) ::selection {
+    background-color: color-mix(in oklch, var(--brand-cyan) 30%, transparent);
+    color: var(--foreground);
+  }
+  
+  /* Scrollbar with cyan accent */
+  :root:not(.dark) ::-webkit-scrollbar-thumb {
+    background-color: color-mix(in oklch, var(--brand-cyan) 60%, oklch(0.8 0.02 260));
+    border-radius: 4px;
+  }
+  
+  :root:not(.dark) ::-webkit-scrollbar-thumb:hover {
+    background-color: var(--brand-cyan);
+  }
+  
+  /* Checkbox and radio with cyan accent */
+  :root:not(.dark) input[type="checkbox"]:checked,
+  :root:not(.dark) input[type="radio"]:checked {
+    accent-color: var(--brand-cyan);
+  }
+  
+  /* Range slider with cyan */
+  :root:not(.dark) input[type="range"] {
+    accent-color: var(--brand-cyan);
+  }
+  
+  /* Focus ring with cyan for all interactive elements */
+  :root:not(.dark) *:focus-visible {
+    outline: 2px solid var(--brand-cyan);
+    outline-offset: 2px;
+  }
+  
+  /* Radio buttons with cyan accent */
+  :root:not(.dark) input[type="radio"] {
+    accent-color: var(--brand-cyan);
+  }
+  
+  :root:not(.dark) input[type="radio"]:checked {
+    accent-color: var(--brand-cyan);
+  }
+  
+  /* Primary buttons with cyan glow on hover */
+  :root:not(.dark) button[class*="primary"]:hover,
+  :root:not(.dark) .bg-primary:hover {
+    box-shadow: 
+      0 1px 3px 0 color-mix(in oklch, var(--brand-cyan) 30%, transparent),
+      0 0 0 1px color-mix(in oklch, var(--brand-cyan) 20%, transparent),
+      0 0 15px color-mix(in oklch, var(--brand-cyan) 25%, transparent),
+      inset 0 1px 0 0 color-mix(in oklch, white 20%, transparent);
+  }
+  
+  /* Info/warning badges with cyan */
+  :root:not(.dark) [class*="badge"][class*="info"],
+  :root:not(.dark) .badge-info {
+    background-color: color-mix(in oklch, var(--brand-cyan) 15%, transparent);
+    color: color-mix(in oklch, var(--brand-cyan) 70%, var(--foreground));
+    border-color: color-mix(in oklch, var(--brand-cyan) 30%, transparent);
+  }
+  
+  /* Status indicators with cyan */
+  :root:not(.dark) [class*="status"][class*="active"],
+  :root:not(.dark) [class*="indicator"][class*="on"] {
+    background-color: var(--brand-cyan);
+    box-shadow: 0 0 8px color-mix(in oklch, var(--brand-cyan) 50%, transparent);
+  }
+  
+  /* Tabs with cyan underline */
+  :root:not(.dark) [role="tab"][aria-selected="true"] {
+    border-bottom-color: var(--brand-cyan);
+    color: color-mix(in oklch, var(--brand-cyan) 80%, var(--foreground));
+  }
+  
+  /* Toggle switches with cyan */
+  :root:not(.dark) [role="switch"][aria-checked="true"] {
+    background-color: var(--brand-cyan);
+  }
+  
+  /* Progress bars with cyan */
+  :root:not(.dark) progress::-webkit-progress-value {
+    background-color: var(--brand-cyan);
+  }
+  
+  :root:not(.dark) progress::-moz-progress-bar {
+    background-color: var(--brand-cyan);
+  }
+  
+  /* Hover accent for interactive cards */
+  :root:not(.dark) .hover\:border-primary:hover {
+    border-color: var(--brand-cyan);
+  }
+  
+  /* Page header accent line (skip docs) */
+  :root:not(.dark) h1:not(.dark h1)::after {
+    content: '';
+    display: block;
+    width: 60px;
+    height: 3px;
+    background: linear-gradient(90deg, var(--brand-cyan) 0%, var(--brand-gold) 100%);
+    margin-top: 0.5rem;
+    border-radius: 2px;
+  }
+  
+  /* Active navigation items with cyan glow */
+  :root:not(.dark) [aria-current="page"] {
+    color: var(--brand-cyan);
+  }
+  
+  /* Divider lines with cyan tint */
+  :root:not(.dark) hr,
+  :root:not(.dark) [class*="divider"] {
+    border-color: color-mix(in oklch, var(--brand-cyan) 20%, var(--border));
+  }
+  
+  /* Highlighted text with cyan background */
+  :root:not(.dark) mark,
+  :root:not(.dark) [class*="highlight"] {
+    background: linear-gradient(180deg, transparent 60%, color-mix(in oklch, var(--brand-cyan) 30%, transparent) 60%);
+    padding: 0 0.2em;
+  }
+}
+  /* Override browser-default blue on form controls */
+  select,
+  input[type="checkbox"],
+  input[type="radio"],
+  input[type="range"] {
+    accent-color: var(--primary);
+  }
+  
+  /* Custom select styling with cyan accent */
+  select {
+    background-color: var(--input);
+    border-color: var(--border);
+    color: var(--foreground);
+    background-image: url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 20 20'%3e%3cpath stroke='%236b7280' stroke-linecap='round' stroke-linejoin='round' stroke-width='1.5' d='m6 8 4 4 4-4'/%3e%3c/svg%3e");
+    background-position: right 0.5rem center;
+    background-repeat: no-repeat;
+    background-size: 1.5em 1.5em;
+    padding-right: 2.5rem;
+    -webkit-appearance: none;
+    appearance: none;
+  }
+  
+  select option {
+    background-color: var(--card);
+    color: var(--card-foreground);
+    padding: 0.5rem;
+  }
+  
+  /* Use cyan accent for option hover states */
+  select option:hover,
+  select option:focus,
+  select option:active {
+    background: linear-gradient(90deg, var(--brand-cyan) 0%, color-mix(in oklch, var(--brand-cyan) 85%, white) 100%) !important;
+    color: oklch(0.15 0.02 260) !important;
+    font-weight: 500;
+  }
+  
+  select:focus {
+    outline: none;
+    border-color: var(--brand-cyan);
+    box-shadow: 0 0 0 3px color-mix(in oklch, var(--brand-cyan) 25%, transparent), 0 2px 8px color-mix(in oklch, var(--brand-cyan) 15%, transparent);
+  }
+  
+  /* Target selected option specifically with cyan */
+  select option[selected] {
+    background: linear-gradient(90deg, var(--brand-cyan) 0%, color-mix(in oklch, var(--brand-cyan) 85%, white) 100%);
+    color: oklch(0.15 0.02 260);
+    font-weight: 500;
+  }
+  
+  /* Firefox-specific fixes */
+  select:-moz-focusring {
+    color: transparent;
+    text-shadow: 0 0 0 var(--foreground);
+  }
+
+/* ── Custom Select Component ── */
+.custom-select-root {
+  position: relative;
+  width: 100%;
+}
+
+.custom-select-trigger {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 0.375rem;
+  background-color: var(--input);
+  color: var(--foreground);
+  font-size: 0.875rem;
+  line-height: 1.25rem;
+  text-align: left;
+  cursor: pointer;
+  box-shadow: 0 1px 2px 0 color-mix(in oklch, oklch(0.2 0.01 260) 5%, transparent);
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+.custom-select-trigger:focus {
+  outline: none;
+  border-color: var(--brand-cyan);
+  box-shadow:
+    0 0 0 3px color-mix(in oklch, var(--brand-cyan) 25%, transparent),
+    0 2px 8px color-mix(in oklch, var(--brand-cyan) 15%, transparent);
+}
+
+.custom-select-placeholder {
+  color: var(--muted-foreground);
+}
+
+.custom-select-chevron {
+  width: 1.25rem;
+  height: 1.25rem;
+  flex-shrink: 0;
+  color: var(--muted-foreground);
+}
+
+.custom-select-list {
+  position: absolute;
+  z-index: 50;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  max-height: 15rem;
+  overflow-y: auto;
+  margin: 0;
+  padding: 0.25rem 0;
+  list-style: none;
+  border: 1px solid var(--border);
+  border-radius: 0.375rem;
+  background-color: var(--card);
+  box-shadow: 0 4px 16px color-mix(in oklch, oklch(0.1 0 0) 15%, transparent);
+}
+
+.custom-select-option {
+  padding: 0.5rem 0.75rem;
+  font-size: 0.875rem;
+  line-height: 1.25rem;
+  color: var(--card-foreground);
+  cursor: pointer;
+  transition: background-color 0.1s;
+}
+
+.custom-select-option-highlighted {
+  background-color: var(--brand-cyan-light);
+  color: oklch(0.15 0.02 260);
+}
+
+.custom-select-option-selected {
+  font-weight: 500;
+  background-color: color-mix(in oklch, var(--brand-cyan) 20%, transparent);
+}
+
+.custom-select-option-selected.custom-select-option-highlighted {
+  background-color: var(--brand-cyan-light);
+  color: oklch(0.15 0.02 260);
+}
+
+.custom-select-option-disabled {
+  color: var(--muted-foreground);
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.custom-select-option-disabled.custom-select-option-highlighted {
+  background-color: transparent;
+}
+
+/* ═══════════════════════════════════════════
+   Landing Page
+   ═══════════════════════════════════════════ */
+
+/* ── Animations ── */
+@keyframes landing-orb-drift {
+  0%, 100% { transform: translate(0, 0) scale(1); }
+  25% { transform: translate(30px, -50px) scale(1.1); }
+  50% { transform: translate(-20px, 20px) scale(0.95); }
+  75% { transform: translate(40px, 30px) scale(1.05); }
+}
+
+@keyframes landing-fade-up {
+  from { opacity: 0; transform: translateY(24px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes landing-glow-pulse {
+  0%, 100% { text-shadow: 0 0 20px rgba(255, 228, 122, 0.5), 0 0 40px rgba(92, 224, 214, 0.15); }
+  50% { text-shadow: 0 0 32px rgba(255, 228, 122, 0.7), 0 0 60px rgba(92, 224, 214, 0.25); }
+}
+
+@keyframes landing-border-shimmer {
+  0%, 100% { border-color: rgba(255, 255, 255, 0.12); box-shadow: 0 0 20px rgba(92, 224, 214, 0.06), inset 0 0 20px rgba(255, 228, 122, 0.04); }
+  50% { border-color: rgba(255, 255, 255, 0.2); box-shadow: 0 0 28px rgba(92, 224, 214, 0.1), inset 0 0 28px rgba(255, 228, 122, 0.06); }
+}
+
+@keyframes landing-signup-pulse {
+  0%, 100% { box-shadow: 0 0 60px rgba(92, 224, 214, 0.08), 0 0 30px rgba(255, 228, 122, 0.06); }
+  50% { box-shadow: 0 0 80px rgba(92, 224, 214, 0.14), 0 0 40px rgba(255, 228, 122, 0.1); }
+}
+
+@keyframes landing-logo-reveal {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes landing-logo-glow {
+  0%, 100% { filter: drop-shadow(0 0 4px rgba(92, 224, 214, 0.2)) drop-shadow(0 0 8px rgba(255, 228, 122, 0.15)); }
+  50% { filter: drop-shadow(0 0 10px rgba(92, 224, 214, 0.35)) drop-shadow(0 0 16px rgba(255, 228, 122, 0.25)); }
+}
+
+@keyframes particle-warp {
+  0% { transform: translate(-50%, -50%) scale(0.3); opacity: 0; }
+  5% { opacity: 0.6; }
+  70% { opacity: 0.8; }
+  100% { transform: translate(calc(-50% + var(--tx)), calc(-50% + var(--ty))) scale(1); opacity: 0; }
+}
+
+/* ── Landing components ── */
+@layer components {
+  /* Blocky pixel logo */
+  .landing-block-logo {
+    width: 400px;
+    height: auto;
+    animation: landing-logo-reveal 0.8s ease-out both, landing-logo-glow 4s ease-in-out 0.8s infinite;
+  }
+
+  @media (max-width: 639px) {
+    .landing-block-logo {
+      width: 260px;
+    }
+  }
+
+  .landing-block-logo rect {
+    transition: opacity 0.3s ease;
+  }
+
+  /* Landing page (always dark bg) — warm gold stepped from muted to bright */
+  .landing-block-logo .logo-block-1 { fill: oklch(0.65 0.14 75); }
+  .landing-block-logo .logo-block-2 { fill: oklch(0.70 0.15 75); }
+  .landing-block-logo .logo-block-3 { fill: oklch(0.74 0.15 76); }
+  .landing-block-logo .logo-block-4 { fill: oklch(0.78 0.16 75); }
+  .landing-block-logo .logo-block-5 { fill: oklch(0.82 0.15 78); }
+  .landing-block-logo .logo-block-6 { fill: oklch(0.85 0.14 80); }
+  .landing-block-logo .logo-block-7 { fill: oklch(0.88 0.14 84); }
+  .landing-block-logo .logo-block-8 { fill: oklch(0.90 0.13 87); }
+  .landing-block-logo .logo-block-9 { fill: oklch(0.92 0.12 90); }
+
+  /* Sidebar logo (no animations) */
+  .sidebar-block-logo {
+    width: 100%;
+    height: auto;
+  }
+
+  /* Logo block fills - Light mode (dark navy, matching --foreground) */
+  .logo-block-1 { fill: oklch(0.15 0.025 260); }
+  .logo-block-2 { fill: oklch(0.20 0.025 260); }
+  .logo-block-3 { fill: oklch(0.25 0.025 260); }
+  .logo-block-4 { fill: oklch(0.30 0.028 260); }
+  .logo-block-5 { fill: oklch(0.35 0.030 260); }
+  .logo-block-6 { fill: oklch(0.40 0.035 260); }
+  .logo-block-7 { fill: oklch(0.45 0.040 260); }
+  .logo-block-8 { fill: oklch(0.50 0.045 260); }
+  .logo-block-9 { fill: oklch(0.55 0.050 260); }
+
+  /* Logo block fills - Dark mode (warm gold, matching --primary) */
+  .dark .logo-block-1 { fill: oklch(0.65 0.14 75); }
+  .dark .logo-block-2 { fill: oklch(0.70 0.15 75); }
+  .dark .logo-block-3 { fill: oklch(0.74 0.15 76); }
+  .dark .logo-block-4 { fill: oklch(0.78 0.16 75); }
+  .dark .logo-block-5 { fill: oklch(0.82 0.15 78); }
+  .dark .logo-block-6 { fill: oklch(0.85 0.14 80); }
+  .dark .logo-block-7 { fill: oklch(0.88 0.14 84); }
+  .dark .logo-block-8 { fill: oklch(0.90 0.13 87); }
+  .dark .logo-block-9 { fill: oklch(0.92 0.12 90); }
+
+  /* Particle cloud */
+  .landing-particles {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    z-index: 0;
+    overflow: hidden;
+  }
+
+  .particle {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: 2px;
+    height: 2px;
+    border-radius: 50%;
+    background: rgba(255, 255, 255, 0.4);
+    animation: particle-warp linear infinite;
+    opacity: 0;
+    will-change: transform, opacity;
+  }
+
+  .particle-1  { --tx: -600px; --ty: -400px; animation-duration: 6s;  animation-delay: 0s; }
+  .particle-2  { --tx: 500px;  --ty: -350px; animation-duration: 7s;  animation-delay: -1s;  background: rgba(92, 224, 214, 0.35); }
+  .particle-3  { --tx: -400px; --ty: 500px;  animation-duration: 5s;  animation-delay: -2s; }
+  .particle-4  { --tx: 650px;  --ty: 300px;  animation-duration: 8s;  animation-delay: -0.5s; background: rgba(255, 228, 122, 0.3); }
+  .particle-5  { --tx: -200px; --ty: -550px; animation-duration: 6.5s; animation-delay: -3s; }
+  .particle-6  { --tx: 350px;  --ty: -500px; animation-duration: 5.5s; animation-delay: -1.5s; background: rgba(92, 224, 214, 0.25); }
+  .particle-7  { --tx: -550px; --ty: 200px;  animation-duration: 7.5s; animation-delay: -4s;  width: 1.5px; height: 1.5px; }
+  .particle-8  { --tx: 100px;  --ty: 600px;  animation-duration: 6s;  animation-delay: -2.5s; }
+  .particle-9  { --tx: -700px; --ty: -100px; animation-duration: 8.5s; animation-delay: -0.8s; background: rgba(255, 228, 122, 0.2); width: 1.5px; height: 1.5px; }
+  .particle-10 { --tx: 450px;  --ty: 450px;  animation-duration: 5s;  animation-delay: -3.5s; }
+  .particle-11 { --tx: -300px; --ty: -600px; animation-duration: 7s;  animation-delay: -1.2s; background: rgba(92, 224, 214, 0.3); width: 1.5px; height: 1.5px; }
+  .particle-12 { --tx: 600px;  --ty: -150px; animation-duration: 6.5s; animation-delay: -4.5s; }
+  .particle-13 { --tx: -500px; --ty: -300px; animation-duration: 5.5s; animation-delay: -2.2s; width: 1.5px; height: 1.5px; }
+  .particle-14 { --tx: 250px;  --ty: -600px; animation-duration: 7.5s; animation-delay: -0.3s; background: rgba(92, 224, 214, 0.2); }
+  .particle-15 { --tx: -150px; --ty: 650px;  animation-duration: 6s;  animation-delay: -3.8s; }
+  .particle-16 { --tx: 700px;  --ty: 100px;  animation-duration: 8s;  animation-delay: -1.8s; background: rgba(255, 228, 122, 0.25); width: 1.5px; height: 1.5px; }
+  .particle-17 { --tx: -650px; --ty: 350px;  animation-duration: 5.5s; animation-delay: -5s; }
+  .particle-18 { --tx: 400px;  --ty: -400px; animation-duration: 7s;  animation-delay: -2.8s; background: rgba(92, 224, 214, 0.2); }
+  .particle-19 { --tx: -350px; --ty: 550px;  animation-duration: 6.5s; animation-delay: -0.6s; width: 1.5px; height: 1.5px; }
+  .particle-20 { --tx: 550px;  --ty: -250px; animation-duration: 5s;  animation-delay: -4.2s; }
+  .particle-21 { --tx: -100px; --ty: -700px; animation-duration: 8.5s; animation-delay: -1.5s; background: rgba(255, 228, 122, 0.2); }
+  .particle-22 { --tx: 300px;  --ty: 550px;  animation-duration: 6s;  animation-delay: -3.2s; width: 1.5px; height: 1.5px; }
+  .particle-23 { --tx: -600px; --ty: 100px;  animation-duration: 7.5s; animation-delay: -0.9s; background: rgba(92, 224, 214, 0.3); }
+  .particle-24 { --tx: 200px;  --ty: 650px;  animation-duration: 5.5s; animation-delay: -5.5s; }
+  .particle-25 { --tx: -450px; --ty: -500px; animation-duration: 6.5s; animation-delay: -2s;  width: 1.5px; height: 1.5px; }
+  .particle-26 { --tx: 650px;  --ty: -50px;  animation-duration: 7s;  animation-delay: -3.5s; background: rgba(255, 228, 122, 0.2); }
+  .particle-27 { --tx: -250px; --ty: 400px;  animation-duration: 8s;  animation-delay: -1s; }
+  .particle-28 { --tx: 500px;  --ty: 350px;  animation-duration: 5.5s; animation-delay: -4.8s; background: rgba(92, 224, 214, 0.15); width: 1.5px; height: 1.5px; }
+  .particle-29 { --tx: -550px; --ty: -200px; animation-duration: 6s;  animation-delay: -2.5s; }
+  .particle-30 { --tx: 150px;  --ty: -550px; animation-duration: 7.5s; animation-delay: -3.8s; width: 1.5px; height: 1.5px; }
+  .particle-31 { --tx: -520px; --ty: -320px; animation-duration: 5.8s; animation-delay: -0.2s; width: 3px; height: 3px; }
+  .particle-32 { --tx: 420px;  --ty: 480px;  animation-duration: 6.8s; animation-delay: -2.1s; background: rgba(92, 224, 214, 0.25); }
+  .particle-33 { --tx: -180px; --ty: 620px;  animation-duration: 7.2s; animation-delay: -4.3s; width: 4px; height: 4px; background: rgba(255, 255, 255, 0.2); }
+  .particle-34 { --tx: 580px;  --ty: -180px; animation-duration: 5.2s; animation-delay: -1.4s; }
+  .particle-35 { --tx: -680px; --ty: 80px;   animation-duration: 8.2s; animation-delay: -5.6s; width: 3px; height: 3px; background: rgba(255, 228, 122, 0.2); }
+  .particle-36 { --tx: 280px;  --ty: -520px; animation-duration: 6.2s; animation-delay: -0.7s; }
+  .particle-37 { --tx: -380px; --ty: -480px; animation-duration: 7.8s; animation-delay: -3.1s; width: 4px; height: 4px; background: rgba(255, 255, 255, 0.15); }
+  .particle-38 { --tx: 620px;  --ty: 220px;  animation-duration: 5.5s; animation-delay: -6.2s; background: rgba(92, 224, 214, 0.18); }
+  .particle-39 { --tx: -120px; --ty: -680px; animation-duration: 6.5s; animation-delay: -1.9s; width: 3px; height: 3px; }
+  .particle-40 { --tx: 480px;  --ty: -380px; animation-duration: 7.5s; animation-delay: -4.7s; }
+  .particle-41 { --tx: -580px; --ty: 420px;  animation-duration: 5.8s; animation-delay: -0.4s; width: 4px; height: 4px; background: rgba(255, 228, 122, 0.15); }
+  .particle-42 { --tx: 160px;  --ty: 680px;  animation-duration: 8s;  animation-delay: -2.6s; background: rgba(92, 224, 214, 0.2); }
+  .particle-43 { --tx: -450px; --ty: -180px; animation-duration: 6s;  animation-delay: -5.1s; width: 3px; height: 3px; }
+  .particle-44 { --tx: 700px;  --ty: -80px;  animation-duration: 7s;  animation-delay: -1.1s; }
+  .particle-45 { --tx: -320px; --ty: 580px;  animation-duration: 5.3s; animation-delay: -3.6s; width: 4px; height: 4px; background: rgba(255, 255, 255, 0.18); }
+  .particle-46 { --tx: 380px;  --ty: 320px;  animation-duration: 6.8s; animation-delay: -6.8s; background: rgba(255, 228, 122, 0.18); }
+  .particle-47 { --tx: -640px; --ty: -420px; animation-duration: 8.5s; animation-delay: -0.9s; width: 3px; height: 3px; }
+  .particle-48 { --tx: 220px;  --ty: -620px; animation-duration: 5.8s; animation-delay: -2.3s; }
+  .particle-49 { --tx: -480px; --ty: 280px;  animation-duration: 7.2s; animation-delay: -4.9s; background: rgba(92, 224, 214, 0.22); width: 3px; height: 3px; }
+  .particle-50 { --tx: 540px;  --ty: -450px; animation-duration: 6.2s; animation-delay: -1.6s; width: 4px; height: 4px; background: rgba(255, 255, 255, 0.15); }
+  .particle-51 { --tx: -220px; --ty: -580px; animation-duration: 5.5s; animation-delay: -5.4s; }
+  .particle-52 { --tx: 680px;  --ty: 150px;  animation-duration: 7.8s; animation-delay: -0.1s; width: 3px; height: 3px; background: rgba(255, 228, 122, 0.22); }
+  .particle-53 { --tx: -550px; --ty: -80px;  animation-duration: 6.5s; animation-delay: -3.3s; }
+  .particle-54 { --tx: 120px;  --ty: 550px;  animation-duration: 8.2s; animation-delay: -6.5s; width: 4px; height: 4px; background: rgba(92, 224, 214, 0.15); }
+  .particle-55 { --tx: -380px; --ty: 480px;  animation-duration: 5.2s; animation-delay: -1.3s; width: 3px; height: 3px; }
+  .particle-56 { --tx: 480px;  --ty: -280px; animation-duration: 7s;  animation-delay: -4.1s; }
+  .particle-57 { --tx: -700px; --ty: -250px; animation-duration: 6.8s; animation-delay: -2.7s; background: rgba(255, 228, 122, 0.15); width: 3px; height: 3px; }
+  .particle-58 { --tx: 320px;  --ty: 620px;  animation-duration: 5.8s; animation-delay: -5.8s; width: 4px; height: 4px; background: rgba(255, 255, 255, 0.2); }
+  .particle-59 { --tx: -160px; --ty: 700px;  animation-duration: 7.5s; animation-delay: -0.6s; }
+  .particle-60 { --tx: 620px;  --ty: -520px; animation-duration: 6.2s; animation-delay: -3.9s; background: rgba(92, 224, 214, 0.18); width: 3px; height: 3px; }
+  .particle-61 { --tx: -420px; --ty: -620px; animation-duration: 8s;  animation-delay: -1.7s; }
+  .particle-62 { --tx: 180px;  --ty: -480px; animation-duration: 5.5s; animation-delay: -6.1s; width: 4px; height: 4px; background: rgba(255, 228, 122, 0.18); }
+  .particle-63 { --tx: -620px; --ty: 520px;  animation-duration: 7.2s; animation-delay: -2.4s; width: 3px; height: 3px; }
+  .particle-64 { --tx: 520px;  --ty: 180px;  animation-duration: 6s;  animation-delay: -4.6s; }
+  .particle-65 { --tx: -280px; --ty: -420px; animation-duration: 8.5s; animation-delay: -0.3s; background: rgba(92, 224, 214, 0.25); }
+  .particle-66 { --tx: 680px;  --ty: -350px; animation-duration: 5.8s; animation-delay: -5.2s; width: 3px; height: 3px; }
+  .particle-67 { --tx: -520px; --ty: 180px;  animation-duration: 7.5s; animation-delay: -1.8s; width: 4px; height: 4px; background: rgba(255, 255, 255, 0.15); }
+  .particle-68 { --tx: 380px;  --ty: -680px; animation-duration: 6.5s; animation-delay: -3.4s; }
+  .particle-69 { --tx: -180px; --ty: 420px;  animation-duration: 5.2s; animation-delay: -6.7s; background: rgba(255, 228, 122, 0.2); width: 3px; height: 3px; }
+  .particle-70 { --tx: 580px;  --ty: 520px;  animation-duration: 8.2s; animation-delay: -0.8s; }
+  .particle-71 { --tx: -680px; --ty: -150px; animation-duration: 6.8s; animation-delay: -4.4s; width: 4px; height: 4px; background: rgba(92, 224, 214, 0.15); }
+  .particle-72 { --tx: 250px;  --ty: 480px;  animation-duration: 5.5s; animation-delay: -2.2s; width: 3px; height: 3px; }
+  .particle-73 { --tx: -450px; --ty: -550px; animation-duration: 7.8s; animation-delay: -5.9s; }
+  .particle-74 { --tx: 420px;  --ty: -120px; animation-duration: 6.2s; animation-delay: -1.2s; background: rgba(255, 228, 122, 0.15); }
+  .particle-75 { --tx: -580px; --ty: 620px;  animation-duration: 5.8s; animation-delay: -3.7s; width: 3px; height: 3px; }
+  .particle-76 { --tx: 150px;  --ty: -700px; animation-duration: 7s;  animation-delay: -6.4s; width: 4px; height: 4px; background: rgba(255, 255, 255, 0.18); }
+  .particle-77 { --tx: -350px; --ty: 350px;  animation-duration: 8s;  animation-delay: -0.5s; background: rgba(92, 224, 214, 0.2); }
+  .particle-78 { --tx: 650px;  --ty: -480px; animation-duration: 5.3s; animation-delay: -4.8s; width: 3px; height: 3px; }
+  .particle-79 { --tx: -120px; --ty: -520px; animation-duration: 6.8s; animation-delay: -2.9s; }
+  .particle-80 { --tx: 520px;  --ty: 380px;  animation-duration: 7.5s; animation-delay: -5.5s; background: rgba(255, 228, 122, 0.2); width: 4px; height: 4px; }
+  .particle-81 { --tx: -650px; --ty: -380px; animation-duration: 5.5s; animation-delay: -1.5s; width: 3px; height: 3px; }
+  .particle-82 { --tx: 300px;  --ty: -580px; animation-duration: 8.2s; animation-delay: -3.2s; background: rgba(92, 224, 214, 0.18); }
+  .particle-83 { --tx: -480px; --ty: 680px;  animation-duration: 6s;  animation-delay: -6.3s; }
+  .particle-84 { --tx: 700px;  --ty: 50px;   animation-duration: 7.2s; animation-delay: -0.4s; width: 4px; height: 4px; background: rgba(255, 255, 255, 0.2); }
+  .particle-85 { --tx: -250px; --ty: -680px; animation-duration: 5.8s; animation-delay: -4.5s; width: 3px; height: 3px; }
+  .particle-86 { --tx: 480px;  --ty: -580px; animation-duration: 6.5s; animation-delay: -2s;  background: rgba(255, 228, 122, 0.18); }
+  .particle-87 { --tx: -620px; --ty: 250px;  animation-duration: 8.5s; animation-delay: -5.3s; }
+  .particle-88 { --tx: 220px;  --ty: 700px;  animation-duration: 5.2s; animation-delay: -1s;  width: 3px; height: 3px; background: rgba(92, 224, 214, 0.22); }
+  .particle-89 { --tx: -380px; --ty: -250px; animation-duration: 7s;  animation-delay: -6.6s; width: 4px; height: 4px; background: rgba(255, 255, 255, 0.15); }
+  .particle-90 { --tx: 580px;  --ty: 620px;  animation-duration: 6.2s; animation-delay: -3s;  width: 3px; height: 3px; }
+
+  /* Orbs */
+  .landing-orb {
+    position: absolute;
+    border-radius: 50%;
+    filter: blur(120px);
+    opacity: 0.25;
+    animation: landing-orb-drift 15s ease-in-out infinite;
+    pointer-events: none;
+  }
+
+  .landing-orb-dark {
+    width: 500px;
+    height: 500px;
+    background: #4a4a4a;
+    top: -10%;
+    left: -10%;
+    animation-delay: 0s;
+  }
+
+  .landing-orb-gold {
+    width: 400px;
+    height: 400px;
+    background: #D4A229;
+    bottom: -5%;
+    right: 10%;
+    animation-delay: -5s;
+    opacity: 0.2;
+  }
+
+  .landing-orb-cyan {
+    width: 350px;
+    height: 350px;
+    background: #5CE0D6;
+    top: 35%;
+    right: -8%;
+    animation-delay: -10s;
+    opacity: 0.15;
+  }
+
+  .landing-fade-in {
+    animation: landing-fade-up 0.8s ease-out both;
+  }
+
+  /* Fluid headline: scales with viewport, always 3 lines */
+  .landing-headline {
+    font-size: clamp(1.6rem, 6.5vw, 3.75rem);
+  }
+
+  .landing-glow-text {
+    background: linear-gradient(90deg, #FFE47A, #FFF7D4);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    animation: landing-glow-pulse 3s ease-in-out infinite;
+  }
+
+  .landing-free-banner {
+    @apply flex items-center gap-3 px-5 py-3 rounded-xl;
+    border: 1px solid rgba(92, 224, 214, 0.15);
+    background: linear-gradient(135deg, rgba(92, 224, 214, 0.06), rgba(255, 228, 122, 0.04));
+    animation: landing-fade-up 0.8s ease-out both, landing-border-shimmer 4s ease-in-out infinite;
+  }
+
+  .landing-step-card {
+    @apply relative p-4 rounded-lg backdrop-blur-sm transition-all duration-500 cursor-default;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    background: rgba(255, 255, 255, 0.03);
+    animation: landing-fade-up 0.8s ease-out both;
+  }
+
+  .landing-step-card:hover {
+    background: rgba(255, 255, 255, 0.06);
+    border-color: color-mix(in srgb, var(--step-color, #FFE47A) 30%, transparent);
+    box-shadow: 0 0 30px color-mix(in srgb, var(--step-color, #FFE47A) 15%, transparent);
+  }
+
+  .landing-signup-pulse {
+    animation: landing-signup-pulse 3s ease-in-out infinite;
+  }
+}
+
+/* ═══════════════════════════════════════════
+   Sidebar Menu
+   ═══════════════════════════════════════════ */
+@layer components {
+  .menu-item {
+    @apply flex items-center gap-3 px-3 py-2.5 rounded-lg font-medium text-sm transition-colors duration-200;
+  }
+
+  .menu-item-active {
+    @apply bg-primary/12 text-primary border-l-2 border-primary;
+  }
+
+  .menu-item-inactive {
+    @apply text-muted-foreground hover:bg-accent hover:text-accent-foreground;
+  }
+
+  .menu-item-icon-size {
+    @apply w-6 h-6 flex-shrink-0;
+  }
+
+  .menu-item-icon-size svg {
+    @apply w-full h-full;
+  }
+
+  .menu-item-icon-active {
+    @apply text-primary;
+  }
+
+  .menu-item-icon-inactive {
+    @apply text-muted-foreground group-hover:text-accent-foreground;
+  }
+
+  .menu-item-text {
+    @apply truncate;
+  }
+
+  /* Dashboard nav item — stands out from regular menu items */
+  .menu-item-dashboard {
+    @apply flex items-center gap-3 px-3 py-2.5 rounded-lg font-medium text-sm transition-all duration-200;
+  }
+
+  .menu-item-dashboard-active {
+    @apply text-primary;
+    background: linear-gradient(135deg,
+      color-mix(in oklch, var(--primary) 14%, transparent) 0%,
+      color-mix(in oklch, var(--brand-cyan) 8%, transparent) 100%);
+    border: 1px solid color-mix(in oklch, var(--primary) 30%, transparent);
+    box-shadow:
+      0 1px 4px color-mix(in oklch, var(--primary) 18%, transparent),
+      inset 0 1px 0 color-mix(in oklch, white 6%, transparent);
+  }
+
+  .menu-item-dashboard-inactive {
+    @apply text-foreground;
+    background: color-mix(in oklch, var(--primary) 6%, transparent);
+    border: 1px solid color-mix(in oklch, var(--primary) 15%, transparent);
+  }
+
+  .menu-item-dashboard-inactive:hover {
+    @apply text-foreground;
+    background: linear-gradient(135deg,
+      color-mix(in oklch, var(--primary) 10%, transparent) 0%,
+      color-mix(in oklch, var(--brand-cyan) 6%, transparent) 100%);
+    border-color: color-mix(in oklch, var(--primary) 25%, transparent);
+    box-shadow: 0 1px 3px color-mix(in oklch, var(--primary) 12%, transparent);
+  }
+
+  .menu-dropdown-item {
+    @apply block px-3 py-2 text-sm rounded-md transition-colors duration-200;
+  }
+
+  .menu-dropdown-item-active {
+    @apply text-primary font-medium bg-primary/8;
+  }
+
+  .menu-dropdown-item-inactive {
+    @apply text-muted-foreground hover:text-foreground;
+  }
+
+  .logo-container {
+    @apply relative;
+    background: linear-gradient(135deg, 
+      color-mix(in oklch, var(--primary) 8%, transparent) 0%, 
+      color-mix(in oklch, var(--brand-cyan) 8%, transparent) 100%);
+    border: 2px solid color-mix(in oklch, var(--primary) 55%, transparent);
+    box-shadow: 
+      0 2px 8px color-mix(in oklch, var(--primary) 20%, transparent),
+      inset 0 1px 1px color-mix(in oklch, white 10%, transparent);
+  }
+
+  .logo-container:hover {
+    background: linear-gradient(135deg, 
+      color-mix(in oklch, var(--primary) 12%, transparent) 0%, 
+      color-mix(in oklch, var(--brand-cyan) 12%, transparent) 100%);
+    border-color: color-mix(in oklch, var(--primary) 70%, transparent);
+    box-shadow: 
+      0 4px 12px color-mix(in oklch, var(--primary) 25%, transparent),
+      0 0 20px color-mix(in oklch, var(--brand-cyan) 8%, transparent),
+      inset 0 1px 1px color-mix(in oklch, white 15%, transparent);
+  }
+
+  .dark .logo-container {
+    background: linear-gradient(135deg, 
+      color-mix(in oklch, var(--primary) 12%, transparent) 0%, 
+      color-mix(in oklch, var(--brand-cyan) 10%, transparent) 100%);
+    border-color: color-mix(in oklch, var(--primary) 25%, transparent);
+    box-shadow: 
+      0 2px 12px color-mix(in oklch, var(--primary) 20%, transparent),
+      0 0 24px color-mix(in oklch, var(--brand-cyan) 8%, transparent),
+      inset 0 1px 1px color-mix(in oklch, white 8%, transparent);
+  }
+
+  .dark .logo-container:hover {
+    background: linear-gradient(135deg, 
+      color-mix(in oklch, var(--primary) 16%, transparent) 0%, 
+      color-mix(in oklch, var(--brand-cyan) 14%, transparent) 100%);
+    box-shadow: 
+      0 4px 16px color-mix(in oklch, var(--primary) 25%, transparent),
+      0 0 32px color-mix(in oklch, var(--brand-cyan) 12%, transparent),
+      inset 0 1px 1px color-mix(in oklch, white 12%, transparent);
+  }
+}
