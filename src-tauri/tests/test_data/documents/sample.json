@@ -1,0 +1,11 @@
+{
+  "title": "Sample JSON",
+  "items": [
+    {"id": 1, "name": "alpha"},
+    {"id": 2, "name": "beta"}
+  ],
+  "meta": {
+    "version": 1,
+    "tags": ["sample", "test"]
+  }
+}

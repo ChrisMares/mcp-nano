@@ -1,4 +1,23 @@
+//! Website controller commands.
+//!
+//! `crawl_website` runs the BFS crawler directly in the controller (no
+//! job queue) and returns the URL list — crawling is fast enough that the
+//! IPC response is sufficient.
+//!
+//! `embed_website` enqueues a `process_website_scrape` job row in
+//! `job_status` for the worker to claim; the worker dispatches to
+//! `IngestionService::process_website_embed`, which scrapes each URL,
+//! chunks the result, embeds it via the dense model, and upserts to
+//! Qdrant.
+
+use serde_json::json;
+use tauri::{AppHandle, Manager};
+use uuid::Uuid;
+
+use crate::db::DbState;
 use crate::models::response::{CrawlResponse, EmbedWebsiteResponse};
+use crate::services::ingestion;
+use crate::worker::progress::now_iso;
 
 #[tauri::command]
 pub async fn crawl_website(
@@ -6,15 +25,47 @@ pub async fn crawl_website(
     depth: Option<i64>,
     same_domain_only: Option<bool>,
 ) -> Result<CrawlResponse, String> {
-    println!("crawl_website: url={url}, depth={depth:?}, same_domain_only={same_domain_only:?}");
-    Ok(CrawlResponse::default())
+    let depth = depth.unwrap_or(1).max(0) as usize;
+    let same_domain = same_domain_only.unwrap_or(true);
+    let urls = ingestion::website::crawl_website(&url, depth, same_domain)
+        .await
+        .map_err(|e| format!("crawling {url}: {e:#}"))?;
+    let count = urls.len() as i64;
+    Ok(CrawlResponse { urls, count })
 }
 
 #[tauri::command]
 pub async fn embed_website(
+    app: AppHandle,
     urls: Vec<String>,
     group: Option<String>,
 ) -> Result<EmbedWebsiteResponse, String> {
-    println!("embed_website: urls={urls:?}, group={group:?}");
-    Ok(EmbedWebsiteResponse::default())
+    let group_str = group.unwrap_or_else(|| "default".to_string());
+    let pool = match app.try_state::<DbState>() {
+        Some(state) => state.pool.clone(),
+        None => return Err("SQLite not initialized yet".to_string()),
+    };
+    let job_id = Uuid::new_v4().to_string();
+    let now = now_iso();
+    let task_params = json!({
+        "urls": urls,
+        "group": group_str,
+    });
+    let params_str = serde_json::to_string(&task_params).unwrap_or_else(|_| "{}".to_string());
+    sqlx::query(
+        "INSERT INTO job_status (job_id, status, created_at, updated_at, progress_percentage, task_name, task_params) \
+         VALUES (?, 'PENDING', ?, ?, 0, ?, ?)",
+    )
+    .bind(&job_id)
+    .bind(&now)
+    .bind(&now)
+    .bind("process_website_scrape")
+    .bind(&params_str)
+    .execute(&pool)
+    .await
+    .map_err(|e| format!("inserting job_status: {e}"))?;
+    Ok(EmbedWebsiteResponse {
+        job_id,
+        url_count: urls.len() as i64,
+    })
 }

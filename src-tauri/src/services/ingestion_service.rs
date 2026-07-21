@@ -8,8 +8,9 @@ use tokenizers::Tokenizer;
 use uuid::Uuid;
 
 use crate::models::request::EmbeddingOptions;
-use crate::services::embedders::{EncodeDocuments, EncodeQuery};
+use crate::services::embedders::EncodeDocuments;
 use crate::services::embedder_state::EmbedderState;
+use crate::services::ingestion;
 use crate::services::qdrant_service::QdrantService;
 use crate::worker::{ProgressCallback, TaskRegistry};
 
@@ -17,6 +18,9 @@ use crate::worker::{ProgressCallback, TaskRegistry};
 const DEFAULT_CHUNK_SIZE: usize = 768;
 /// Default overlap between chunks (matches the Python `DOC_CHUNK_OVERLAP = 50`).
 const DEFAULT_CHUNK_OVERLAP: usize = 50;
+/// Default chunk size in tokens for code chunks before splitting oversized
+/// chunks (matches Python `CODE_CHUNK_SIZE = 1024`).
+const CODE_CHUNK_SIZE: usize = 1024;
 /// Batch size for Qdrant upserts.
 const UPSERT_BATCH_SIZE: usize = 250;
 /// Batch size for dense embedding forward passes.
@@ -33,6 +37,9 @@ pub struct IngestionService {
     embedders: Arc<EmbedderState>,
     qdrant: QdrantService,
     splitter: TextSplitter<Tokenizer>,
+    /// Second splitter used by `split_oversized_code_chunks`; mirrors the
+    /// Python `CODE_CHUNK_SIZE=1024, chunk_overlap=64` config.
+    code_splitter: TextSplitter<Tokenizer>,
 }
 
 impl IngestionService {
@@ -44,10 +51,22 @@ impl IngestionService {
             .with_overlap(DEFAULT_CHUNK_OVERLAP)
             .context("building chunk config")?;
         let splitter = TextSplitter::new(config);
+
+        // Code-splitter: separate `Tokenizer` instance (TextSplitter borrows
+        // it via `Arc<Tokenizer>`); use a fresh clone of the same file.
+        let code_tokenizer = Tokenizer::from_file(models_dir.join("arctic-embed-xs/tokenizer.json"))
+            .map_err(|e| anyhow!("loading code tokenizer: {e}"))?;
+        let code_config = ChunkConfig::new(CODE_CHUNK_SIZE)
+            .with_sizer(code_tokenizer)
+            .with_overlap(64)
+            .context("building code chunk config")?;
+        let code_splitter = TextSplitter::new(code_config);
+
         Ok(Self {
             embedders,
             qdrant,
             splitter,
+            code_splitter,
         })
     }
 
@@ -214,18 +233,36 @@ impl IngestionService {
         Ok(format!("Processed {n} chunk(s)."))
     }
 
-    /// Website embedding is Phase 5 work (requires the `reqwest`+`scraper`
-    /// crawler). Returns an explicit error so the worker marks the job FAILED
-    /// rather than silently no-op'ing.
+    /// Website embedding: scrape + chunk + embed + upsert. Mirrors the
+    /// Python `process_website_embed`.
     pub async fn process_website_embed(
         &self,
-        _params: serde_json::Value,
+        params: serde_json::Value,
         progress: crate::worker::ProgressCallback,
     ) -> Result<String> {
-        progress(0, Some("Website embedding not yet implemented".to_string())).await;
-        Err(anyhow!(
-            "process_website_embed is not implemented until Phase 5 (website crawler)"
-        ))
+        let p: ProcessWebsiteParams = serde_json::from_value(params)
+            .context("deserializing process_website_embed params")?;
+        progress(5, Some(format!("Scraping {} pages", p.urls.len()))).await;
+
+        let mut base_metadata = serde_json::Map::new();
+        base_metadata.insert("group".into(), serde_json::Value::String(p.group.clone()));
+        if let Some(user_id) = p.user_id {
+            base_metadata.insert("user_id".into(), serde_json::Value::String(user_id));
+        }
+        for (k, v) in p.metadata.unwrap_or_default().as_object().into_iter().flatten() {
+            base_metadata.insert(k.clone(), v.clone());
+        }
+
+        let chunks = ingestion::website::process_website(&p.urls, &base_metadata)
+            .await
+            .context("scraping + chunking website pages")?;
+        if chunks.is_empty() {
+            return Err(anyhow!("No content extracted from any URL"));
+        }
+        progress(30, Some(format!("Embedding {} chunks", chunks.len()))).await;
+        let n = self.embed_and_upsert_documents(&chunks, "general", None, &progress, 30, 100).await?;
+        progress(100, Some("Website embedding complete".to_string())).await;
+        Ok(format!("Embedded {n} chunks from {} page(s)", p.urls.len()))
     }
 
     /// Build the production task registry binding the four ingestion entry
@@ -260,8 +297,9 @@ impl IngestionService {
     }
 
     /// Shared chunk + embed + upsert path. Returns the number of chunks
-    /// upserted. Phase 3 reads files as UTF-8 text only; Phase 5 swaps in
-    /// language-aware code chunkers and document loaders (PDF/DOCX/XLSX).
+    /// upserted. Dispatches code files (by extension) through the language-
+    /// specific chunkers; everything else goes through `document_loaders`
+    /// then the text-splitter.
     async fn ingest_text_file(
         &self,
         path: &Path,
@@ -270,12 +308,6 @@ impl IngestionService {
         options: &EmbeddingOptions,
         progress: &crate::worker::ProgressCallback,
     ) -> Result<usize> {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("reading {} as UTF-8 text", path.display()))?;
-        if text.trim().is_empty() {
-            return Ok(0);
-        }
-
         let file_name = path
             .file_name()
             .and_then(|n| n.to_str())
@@ -287,55 +319,177 @@ impl IngestionService {
             .unwrap_or("txt")
             .to_lowercase();
 
-        let chunks: Vec<String> = self.splitter.chunks(&text).map(String::from).collect();
+        // Code chunker dispatch: returns DocumentChunks with per-language
+        // metadata baked into the `metadata` field.
+        let chunks: Vec<ingestion::DocumentChunk> = if ingestion::code_chunker::is_code_file(path) {
+            ingestion::code_chunker::chunk_file_to_documents(
+                path,
+                repo_name.unwrap_or(""),
+                strip_job_prefix(&file_name).as_deref(),
+                &self.code_splitter,
+                CODE_CHUNK_SIZE,
+            )
+        } else {
+            // Document loaders return 1+ chunks per file. Tokenize further
+            // using the doc splitter if a single chunk exceeds the limit.
+            let loaded = ingestion::document_loaders::load_document(path)
+                .with_context(|| format!("loading document {}", path.display()))?;
+            split_document_chunks(loaded, &self.splitter)
+        };
         if chunks.is_empty() {
             return Ok(0);
         }
 
-        let chunk_refs: Vec<&str> = chunks.iter().map(|s| s.as_str()).collect();
-        let embeddings = self
-            .embedders
-            .dense
-            .encode_documents(&chunk_refs, EMBED_BATCH_SIZE)
-            .context("encoding document chunks")?;
+        let extra_meta = build_base_metadata(&file_name, &doc_type, repo_name, options);
+        let n = self
+            .embed_and_upsert_documents_inner(&chunks, collection, extra_meta, progress, 0, 100)
+            .await?;
+        Ok(n)
+    }
 
-        let base_meta = build_base_metadata(&file_name, &doc_type, repo_name, options);
+    /// Embed a list of prebuilt `DocumentChunk`s into Qdrant. Used by the
+    /// website embedder where the chunks come directly from
+    /// `ingestion::website::process_website`. The progress range is mapped
+    /// onto `[range_start, range_end]` percent.
+    async fn embed_and_upsert_documents(
+        &self,
+        chunks: &[ingestion::DocumentChunk],
+        collection: &str,
+        _repo_name: Option<&str>,
+        progress: &crate::worker::ProgressCallback,
+        range_start: i32,
+        range_end: i32,
+    ) -> Result<usize> {
+        let extra = serde_json::Value::Object(serde_json::Map::new());
+        self.embed_and_upsert_documents_inner(chunks, collection, extra, progress, range_start, range_end)
+            .await
+    }
+
+    async fn embed_and_upsert_documents_inner(
+        &self,
+        chunks: &[ingestion::DocumentChunk],
+        collection: &str,
+        extra_meta: serde_json::Value,
+        progress: &crate::worker::ProgressCallback,
+        range_start: i32,
+        range_end: i32,
+    ) -> Result<usize> {
+        if chunks.is_empty() {
+            return Ok(0);
+        }
+        let span = (range_end - range_start).max(0);
+
+        let texts: Vec<String> = chunks
+            .iter()
+            .map(|c| c.chunk_embedding_text())
+            .collect();
+        let documents: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
+        let chunk_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+
+        let total_batches = (((chunks.len() + EMBED_BATCH_SIZE - 1) / EMBED_BATCH_SIZE) as i32).max(1);
+        let mut embeddings_list: Vec<Vec<f32>> = Vec::with_capacity(chunks.len());
+        for batch_index in 0..total_batches {
+            let batch_start = (batch_index as usize) * EMBED_BATCH_SIZE;
+            let batch_end = (batch_start + EMBED_BATCH_SIZE).min(chunks.len());
+            let batch_texts: Vec<&str> = chunk_refs[batch_start..batch_end].to_vec();
+            let batch_embeddings = self
+                .embedders
+                .dense
+                .encode_documents(&batch_texts, EMBED_BATCH_SIZE)
+                .with_context(|| format!("encoding batch {}/{}", batch_index + 1, total_batches))?;
+            for e in batch_embeddings {
+                embeddings_list.push(e);
+            }
+            let pct = range_start + (span * (batch_index + 1) / total_batches);
+            progress(
+                pct.min(100),
+                Some(format!(
+                    "Embedding batches {}/{}",
+                    batch_index + 1,
+                    total_batches
+                )),
+            )
+            .await;
+        }
+
         let metadatas: Vec<serde_json::Value> = chunks
             .iter()
             .enumerate()
-            .map(|(i, chunk)| {
-                let mut meta = base_meta.clone();
-                if let serde_json::Value::Object(map) = &mut meta {
-                    map.insert("chunk_index".to_string(), serde_json::Value::from(i));
-                    map.insert("content".to_string(), serde_json::Value::String(chunk.clone()));
+            .map(|(i, c)| {
+                let mut meta = c.chunk_metadata();
+                if let serde_json::Value::Object(extra_map) = &extra_meta {
+                    for (k, v) in extra_map {
+                        meta.insert(k.clone(), v.clone());
+                    }
                 }
-                meta
+                if !meta.contains_key("chunk_index") {
+                    meta.insert("chunk_index".into(), serde_json::Value::from(i as i64));
+                }
+                serde_json::Value::Object(meta)
             })
             .collect();
 
-        let ids: Vec<Uuid> = (0..chunks.len()).map(|_| Uuid::new_v4()).collect();
+        let ids: Vec<Uuid> = chunks
+            .iter()
+            .map(|c| Uuid::parse_str(&c.id).unwrap_or_else(|_| Uuid::new_v4()))
+            .collect();
 
-        progress(
-            80,
-            Some(format!("Upserting {} chunks to Qdrant", chunks.len())),
-        )
-        .await;
+        progress(range_end, Some(format!("Upserting {} chunks to Qdrant", chunks.len()))).await;
 
         self.qdrant
             .upsert_items(
                 collection,
                 &ids,
-                &chunks,
-                &embeddings,
+                &documents,
+                &embeddings_list,
                 &metadatas,
                 &self.embedders.bm25,
                 UPSERT_BATCH_SIZE,
             )
             .await
             .context("upserting chunks to Qdrant")?;
-
         Ok(chunks.len())
     }
+}
+
+/// Re-tokenize a list of `DocumentChunk`s using the doc text-splitter. Each
+/// input chunk whose `content` exceeds the splitter's chunk size becomes a
+/// sequence of smaller chunks inheriting the same metadata. Used by
+/// `IngestionService::ingest_text_file` for non-code uploads.
+pub fn split_document_chunks(
+    chunks: Vec<ingestion::DocumentChunk>,
+    splitter: &TextSplitter<Tokenizer>,
+) -> Vec<ingestion::DocumentChunk> {
+    if chunks.is_empty() {
+        return chunks;
+    }
+    let mut out: Vec<ingestion::DocumentChunk> = Vec::new();
+    for chunk in chunks {
+        let parts: Vec<String> = splitter.chunks(&chunk.content).map(String::from).collect();
+        if parts.len() <= 1 {
+            out.push(chunk);
+            continue;
+        }
+        for (i, sub) in parts.into_iter().enumerate() {
+            let mut child = chunk.clone();
+            child.id = Uuid::new_v4().to_string();
+            child.content = sub;
+            child.chunk_index = chunk.chunk_index + i as i64;
+            out.push(child);
+        }
+    }
+    out
+}
+
+/// Strip the job-id UUID prefix from a temp filename (mirrors the Python
+/// `embedding_utils.strip_job_prefix`).
+pub fn strip_job_prefix(name: &str) -> Option<String> {
+    let re = regex::Regex::new(
+        r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}_",
+    )
+    .ok()?;
+    let stripped = re.replace(name, "").to_string();
+    Some(stripped)
 }
 
 /// Build the base metadata payload (file_name, doc_type, repo_name, group,
@@ -440,6 +594,14 @@ struct ProcessCodeFileParams {
     path: String,
     collection: String,
     repo_name: Option<String>,
+    metadata: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct ProcessWebsiteParams {
+    urls: Vec<String>,
+    group: String,
+    user_id: Option<String>,
     metadata: Option<serde_json::Value>,
 }
 

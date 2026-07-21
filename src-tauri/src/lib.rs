@@ -104,7 +104,7 @@ pub fn run() {
                     "Starting background worker: tasks={} concurrency=2",
                     registry.names().join(", "),
                 );
-                let _join = worker::start(pool, registry, cancel);
+                let _join = worker::start(pool, registry, cancel, Some(app_handle.clone()));
             });
             Ok(())
         })

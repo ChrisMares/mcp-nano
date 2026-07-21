@@ -3,7 +3,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use anyhow::Result;
+use serde::Serialize;
 use sqlx::SqlitePool;
+use tauri::{AppHandle, Emitter};
+use tokio::sync::Mutex;
 
 /// A future returned by a [`ProgressCallback`] that, when awaited, persists
 /// the progress update to `job_status`.
@@ -20,13 +23,24 @@ pub type ProgressFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 pub type ProgressCallback =
     Arc<dyn Fn(i32, Option<String>) -> ProgressFuture + Send + Sync>;
 
+/// Event payload emitted alongside each row update when an `AppHandle` is
+/// attached. The UI subscribes to `job_progress` once at startup and reacts
+/// to these events instead of polling `get_job_status`.
+#[derive(Debug, Clone, Serialize)]
+pub struct JobProgressEvent {
+    pub job_id: String,
+    pub percentage: i32,
+    pub message: Option<String>,
+}
+
 /// A no-op progress callback for tests / tasks that don't report progress.
 pub fn noop_progress() -> ProgressCallback {
     Arc::new(|_pct, _msg| Box::pin(async {}))
 }
 
 /// Build a progress callback bound to a specific `job_id` that updates the
-/// `job_status` row on every invocation.
+/// `job_status` row on every invocation. No UI event emission — used by tests
+/// and any task that runs without a Tauri `AppHandle`.
 pub fn progress_for_job(pool: SqlitePool, job_id: String) -> ProgressCallback {
     Arc::new(move |pct, msg| {
         let pool = pool.clone();
@@ -34,6 +48,36 @@ pub fn progress_for_job(pool: SqlitePool, job_id: String) -> ProgressCallback {
         Box::pin(async move {
             if let Err(e) = update_job_progress(&pool, &job_id, pct, msg.as_deref()).await {
                 eprintln!("progress update failed for job {job_id}: {e:#}");
+            }
+        })
+    })
+}
+
+/// Build a progress callback bound to a specific `job_id` that also pushes
+/// a `job_progress` Tauri event via the supplied `AppHandle`. The UI
+/// listens for this event once at startup and updates progress bars live
+/// without polling — the user-facing replacement for `get_job_status`
+/// polling.
+pub fn progress_for_job_with_app(
+    pool: SqlitePool,
+    job_id: String,
+    app: AppHandle,
+) -> ProgressCallback {
+    Arc::new(move |pct, msg| {
+        let pool = pool.clone();
+        let job_id = job_id.clone();
+        let app = app.clone();
+        Box::pin(async move {
+            if let Err(e) = update_job_progress(&pool, &job_id, pct, msg.as_deref()).await {
+                eprintln!("progress update failed for job {job_id}: {e:#}");
+            }
+            let event = JobProgressEvent {
+                job_id: job_id.clone(),
+                percentage: pct,
+                message: msg.clone(),
+            };
+            if let Err(e) = app.emit("job_progress", event) {
+                eprintln!("emit job_progress failed for job {job_id}: {e:#}");
             }
         })
     })

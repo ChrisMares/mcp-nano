@@ -1,0 +1,2 @@
+const char* token = "<|endoftext|>";
+int main() { return 0; }

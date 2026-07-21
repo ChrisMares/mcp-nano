@@ -5,7 +5,7 @@ pub mod rag;
 pub mod website;
 
 pub use data::{DeleteResponse, FileMetadataDto, UserFilesResponse, WebsitesResponse};
-pub use jobs::{ActiveJobsResponse, UploadResponse};
+pub use jobs::{ActiveJobsResponse, UploadJobEntry, UploadResponse};
 pub use mcpconfig::{
     ConnectionInfo, MessageResponse, ServerResponse, ServersResponse, ToolResponse,
 };

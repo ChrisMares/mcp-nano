@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<root>
+  <title>Sample XML</title>
+  <list>
+    <item>Alpha</item>
+    <item>Beta</item>
+    <item>Gamma</item>
+  </list>
+  <description>Small document for loader tests.</description>
+</root>

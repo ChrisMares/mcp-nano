@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use sqlx::SqlitePool;
+use tauri::{AppHandle, Emitter};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -31,17 +32,27 @@ const STALE_TIMEOUT_MINUTES: i64 = 15;
 ///
 /// The loop owns its own `SqlitePool` clone and `TaskRegistry` clone (both
 /// are cheap to clone — pool is `Arc` internally, registry is `Arc`-backed).
+///
+/// When `app` is `Some`, every progress callback emits a `job_progress`
+/// Tauri event that the UI listens to live (no polling of `get_job_status`).
+/// Tests pass `None` so progress callbacks only update the SQLite row.
 pub fn start(
     pool: SqlitePool,
     registry: TaskRegistry,
     cancel: CancellationToken,
+    app: Option<AppHandle>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        run_loop(pool, registry, cancel).await;
+        run_loop(pool, registry, cancel, app).await;
     })
 }
 
-async fn run_loop(pool: SqlitePool, registry: TaskRegistry, cancel: CancellationToken) {
+async fn run_loop(
+    pool: SqlitePool,
+    registry: TaskRegistry,
+    cancel: CancellationToken,
+    app: Option<AppHandle>,
+) {
     use tokio::sync::Semaphore;
     let sem = Arc::new(Semaphore::new(MAX_CONCURRENT_JOBS));
     let mut inflight: Vec<JoinHandle<()>> = Vec::new();
@@ -73,10 +84,11 @@ async fn run_loop(pool: SqlitePool, registry: TaskRegistry, cancel: Cancellation
                         let pool = pool.clone();
                         let registry = registry.clone();
                         let sem = sem.clone();
+                        let app = app.clone();
                         let task = tokio::spawn(async move {
                             // Hold the permit for the lifetime of the task.
                             let _permit = sem.acquire_owned().await.expect("sem closed");
-                            run_job(&pool, &registry, job).await;
+                            run_job(&pool, &registry, job, app).await;
                         });
                         inflight.push(task);
                     }
@@ -106,12 +118,32 @@ async fn run_loop(pool: SqlitePool, registry: TaskRegistry, cancel: Cancellation
 /// Execute a single claimed job: dispatch to the registered task, update
 /// `job_status` with progress / terminal state, and update `file_metadata`
 /// status if `task_params.storage_object_id` is present.
-async fn run_job(pool: &SqlitePool, registry: &TaskRegistry, job: JobStatus) {
+///
+/// When `app` is `Some`, the progress callback additionally emits a
+/// `job_progress` Tauri event for the UI to consume live (replaces
+/// `get_job_status` polling), plus a `job_finished` or `job_failed` event
+/// at terminal state.
+async fn run_job(
+    pool: &SqlitePool,
+    registry: &TaskRegistry,
+    job: JobStatus,
+    app: Option<AppHandle>,
+) {
     let job_id = job.job_id.clone();
     let task_name = match &job.task_name {
         Some(n) => n.clone(),
         None => {
             let _ = set_job_status(pool, &job_id, "FAILED", None, Some("missing task_name")).await;
+            if let Some(app) = app.as_ref() {
+                let _ = app.emit(
+                    "job_failed",
+                    progress::JobProgressEvent {
+                        job_id: job_id.clone(),
+                        percentage: 100,
+                        message: Some("missing task_name".to_string()),
+                    },
+                );
+            }
             return;
         }
     };
@@ -121,6 +153,16 @@ async fn run_job(pool: &SqlitePool, registry: &TaskRegistry, job: JobStatus) {
         None => {
             let msg = format!("unknown task: {task_name}");
             let _ = set_job_status(pool, &job_id, "FAILED", None, Some(&msg)).await;
+            if let Some(app) = app.as_ref() {
+                let _ = app.emit(
+                    "job_failed",
+                    progress::JobProgressEvent {
+                        job_id: job_id.clone(),
+                        percentage: 100,
+                        message: Some(msg.clone()),
+                    },
+                );
+            }
             return;
         }
     };
@@ -131,7 +173,10 @@ async fn run_job(pool: &SqlitePool, registry: &TaskRegistry, job: JobStatus) {
         .and_then(|s| serde_json::from_str(s).ok())
         .unwrap_or(serde_json::Value::Null);
 
-    let progress = progress_for_job(pool.clone(), job_id.clone());
+    let progress = match app.clone() {
+        Some(app) => progress::progress_for_job_with_app(pool.clone(), job_id.clone(), app),
+        None => progress_for_job(pool.clone(), job_id.clone()),
+    };
 
     let result = task_fn(params.clone(), progress).await;
     match result {
@@ -143,6 +188,16 @@ async fn run_job(pool: &SqlitePool, registry: &TaskRegistry, job: JobStatus) {
             if let Err(e) = update_job_progress(pool, &job_id, 100, None).await {
                 eprintln!("final progress update failed for {job_id}: {e:#}");
             }
+            if let Some(app) = app.as_ref() {
+                let _ = app.emit(
+                    "job_finished",
+                    progress::JobProgressEvent {
+                        job_id: job_id.clone(),
+                        percentage: 100,
+                        message: Some(msg.clone()),
+                    },
+                );
+            }
             let _ = set_job_status(pool, &job_id, "FINISHED", Some(&msg), None).await;
             if let Err(e) = post_process_file_status(pool, &params, "completed", None).await {
                 eprintln!("file_metadata status update failed for {job_id}: {e:#}");
@@ -150,6 +205,16 @@ async fn run_job(pool: &SqlitePool, registry: &TaskRegistry, job: JobStatus) {
         }
         Err(e) => {
             let msg = format!("{e:#}");
+            if let Some(app) = app.as_ref() {
+                let _ = app.emit(
+                    "job_failed",
+                    progress::JobProgressEvent {
+                        job_id: job_id.clone(),
+                        percentage: 100,
+                        message: Some(msg.clone()),
+                    },
+                );
+            }
             let _ = set_job_status(pool, &job_id, "FAILED", None, Some(&msg)).await;
             if let Err(e) = post_process_file_status(pool, &params, "failed", Some(&msg)).await {
                 eprintln!("file_metadata status update failed for {job_id}: {e:#}");
@@ -328,7 +393,7 @@ mod tests {
         let job_id = insert_pending_job(&pool, "noop", "{}").await;
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
-        let handle = start(pool.clone(), reg, cancel);
+        let handle = start(pool.clone(), reg, cancel, None);
 
         // Wait for the job to reach FINISHED (poll up to 5s).
         let mut final_status = String::new();
@@ -359,7 +424,7 @@ mod tests {
         let job_id = insert_pending_job(&pool, "unknown_task", "{}").await;
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
-        let handle = start(pool.clone(), reg, cancel);
+        let handle = start(pool.clone(), reg, cancel, None);
 
         let mut final_status = String::new();
         for _ in 0..50 {

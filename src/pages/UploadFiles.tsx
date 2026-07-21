@@ -1,7 +1,8 @@
 import React, { useState, useMemo, useCallback, useEffect, useRef } from "react";
 import { useLocalUpload } from "@/hooks/use-local-upload";
 import { useAuth } from "@/hooks/useAuth";
-import { getActiveJobs, getJobStatus, crawlWebsite, embedWebsite, getMetadataValues } from "@/utils/apicalls";
+import { useJobEvents, type JobProgressEvent } from "@/hooks/use-job-events";
+import { getActiveJobs, crawlWebsite, embedWebsite, getMetadataValues } from "@/utils/apicalls";
 import { CheckCircle } from "lucide-react";
 import PageHead from "@/components/shared/PageHead";
 import {
@@ -18,7 +19,6 @@ import WebsiteProcessingStep from "@/components/uploadfiles/WebsiteProcessingSte
 import JobStatusPanel from "@/components/uploadfiles/JobStatusPanel";
 import type { EmbedJob } from "@/types/embed";
 
-const POLL_INTERVAL = 5000;
 const isZipFile = (f: File) => f.name.toLowerCase().endsWith(".zip");
 
 const urlToGroupName = (raw: string): string => {
@@ -93,60 +93,106 @@ const UploadFiles: React.FC = () => {
   const [processing] = useState(false);
   const [lastSubmittedCount, setLastSubmittedCount] = useState(0);
   const trackedJobsRef = useRef<Map<string, EmbedJob>>(new Map());
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // -- Job polling --
-  const pollActiveJobs = useCallback(async () => {
-    try {
-      const res = await getActiveJobs();
-      const polledJobs: EmbedJob[] = res.jobs ?? [];
-      const polledIds = new Set(polledJobs.map((j) => j.job_id));
-      const prevTracked = trackedJobsRef.current;
-
-      const vanishedIds = Array.from(prevTracked.keys()).filter((id) => !polledIds.has(id));
-      const confirmed: EmbedJob[] = [];
-
-      const markDone = (id: string, status: "COMPLETED" | "FAILED") => {
-        const prev = prevTracked.get(id);
-        confirmed.push({ job_id: id, status, progress_percentage: 100, file_name: prev?.file_name ?? null, created_at: prev?.created_at ?? null });
-      };
-
-      // Verify each vanished job's actual status before marking complete
-      for (const id of vanishedIds) {
-        try {
-          const s = (await getJobStatus(id))?.status;
-          if (s === "FINISHED" || s === "FAILED") markDone(id, s === "FINISHED" ? "COMPLETED" : "FAILED");
-        } catch {
-          /* ignore */
-        }
+  // -- Initial fetch: grab any active jobs the worker is already processing
+  //    (e.g. jobs queued before the user opened the UploadFiles view or
+  //    still-running jobs from a previous session that were reset to
+  //    PENDING on shutdown). The live progress events from the worker then
+  //    keep this list in sync without further polling.
+  useEffect(() => {
+    let cancelled = false;
+    const fetchInitial = async () => {
+      try {
+        const res = await getActiveJobs();
+        if (cancelled) return;
+        const jobs = res.jobs ?? [];
+        setActiveJobs(jobs);
+        trackedJobsRef.current = new Map(jobs.map((j) => [j.job_id, j]));
+      } catch {
+        // The SQLite/Qdrant sidecars may not be ready yet on first mount; a
+        // future event from the worker will refresh `activeJobs` as soon as
+        // the corresponding job_status row exists.
       }
-
-      const doneInPoll = polledJobs.filter((j) => j.progress_percentage >= 100);
-      if (confirmed.length || doneInPoll.length) {
-        setCompletedJobs((prev) => {
-          const existingIds = new Set(prev.map((j) => j.job_id));
-          const newlyDone = [...confirmed, ...doneInPoll].filter((j) => !existingIds.has(j.job_id));
-          return [...prev, ...newlyDone];
-        });
-      }
-
-      const confirmedIds = new Set(confirmed.map((j) => j.job_id));
-      const stillRunning = polledJobs.filter((j) => j.progress_percentage < 100);
-      const unresolved = vanishedIds
-        .filter((id) => !confirmedIds.has(id) && prevTracked.has(id))
-        .map((id) => prevTracked.get(id)!);
-
-      trackedJobsRef.current = new Map([...stillRunning, ...unresolved].map((j) => [j.job_id, j]));
-      setActiveJobs([...stillRunning, ...unresolved]);
-    } catch {
-      /* ignore */
-    }
+    };
+    void fetchInitial();
+    return () => {
+      cancelled = true;
+    };
   }, []);
+
+  // -- Live push: subscribe once to the three job lifecycle Tauri events.
+  //    The Rust worker emits `job_progress` on every progress update,
+  //    `job_finished` at status=FINISHED, and `job_failed` at status=FAILED.
+  //    This replaces the previous `setInterval(getActiveJobs, 5000)` polling
+  //    loop — the user sees progress bar ticks within milliseconds of the
+  //    worker emitting them, with zero network round-trips between updates.
+  useJobEvents({
+    onProgress: (e: JobProgressEvent) => {
+      setActiveJobs((prev) => {
+        const existing = prev.find((j) => j.job_id === e.job_id);
+        if (!existing) {
+          // New job we haven't seen before (queued by another view); add it
+          // to the tracked set so subsequent progress events update it
+          // in place.
+          const fresh: EmbedJob = {
+            job_id: e.job_id,
+            status: "RUNNING",
+            progress_percentage: e.percentage,
+            file_name: null,
+            created_at: new Date().toISOString(),
+          };
+          trackedJobsRef.current.set(e.job_id, fresh);
+          return [...prev, fresh];
+        }
+        if (existing.progress_percentage === e.percentage) return prev;
+        const updated: EmbedJob = { ...existing, progress_percentage: e.percentage, status: "RUNNING" };
+        trackedJobsRef.current.set(e.job_id, updated);
+        return prev.map((j) => (j.job_id === e.job_id ? updated : j));
+      });
+    },
+    onFinished: (e: JobProgressEvent) => {
+      const prev = trackedJobsRef.current.get(e.job_id);
+      trackedJobsRef.current.delete(e.job_id);
+      setActiveJobs((prevJobs) => prevJobs.filter((j) => j.job_id !== e.job_id));
+      setCompletedJobs((prevDone) => {
+        if (prevDone.find((j) => j.job_id === e.job_id)) return prevDone;
+        return [
+          ...prevDone,
+          {
+            job_id: e.job_id,
+            status: "COMPLETED",
+            progress_percentage: 100,
+            file_name: prev?.file_name ?? null,
+            created_at: prev?.created_at ?? new Date().toISOString(),
+          },
+        ];
+      });
+    },
+    onFailed: (e: JobProgressEvent) => {
+      const prev = trackedJobsRef.current.get(e.job_id);
+      trackedJobsRef.current.delete(e.job_id);
+      setActiveJobs((prevJobs) => prevJobs.filter((j) => j.job_id !== e.job_id));
+      setCompletedJobs((prevDone) => {
+        if (prevDone.find((j) => j.job_id === e.job_id)) return prevDone;
+        return [
+          ...prevDone,
+          {
+            job_id: e.job_id,
+            status: "FAILED",
+            progress_percentage: 100,
+            file_name: prev?.file_name ?? null,
+            created_at: prev?.created_at ?? new Date().toISOString(),
+          },
+        ];
+      });
+    },
+  });
 
   const handleUploadSuccess = useCallback((submittedCount: number) => {
     setLastSubmittedCount(submittedCount);
-    pollActiveJobs();
-  }, [pollActiveJobs]);
+    // The worker will emit `job_progress` events for the queued jobs as
+    // soon as it claims them; no polling kick needed.
+  }, []);
 
   const handleWebsiteSubmit = useCallback(async () => {
     setWebsiteCrawlError(false);
@@ -185,12 +231,6 @@ const UploadFiles: React.FC = () => {
       console.error("Failed to start website embedding:", err);
     }
   }, [websiteUrl]);
-
-  useEffect(() => {
-    pollActiveJobs();
-    pollRef.current = setInterval(pollActiveJobs, POLL_INTERVAL);
-    return () => { if (pollRef.current) clearInterval(pollRef.current); };
-  }, [pollActiveJobs]);
 
   // Fetch repo names when codebase is selected
   useEffect(() => {

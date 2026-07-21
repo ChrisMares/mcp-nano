@@ -1,5 +1,6 @@
 pub mod embedder_state;
 pub mod embedders;
+pub mod ingestion;
 pub mod ingestion_service;
 pub mod qdrant_service;
 

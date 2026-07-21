@@ -180,7 +180,7 @@ async fn end_to_end_job_pipeline_upserts_to_qdrant() {
     // Start the worker.
     let cancel = CancellationToken::new();
     let cancel_clone = cancel.clone();
-    let handle = worker::start(pool.clone(), registry, cancel);
+    let handle = worker::start(pool.clone(), registry, cancel, None);
 
     // Wait for FINISHED (up to 15s — ingestion involves a model forward pass).
     let mut final_status = String::new();
