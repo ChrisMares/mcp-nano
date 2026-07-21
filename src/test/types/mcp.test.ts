@@ -69,7 +69,6 @@ describe('mcp type helpers', () => {
     it('extracts form data from a tool definition', () => {
       const tool: ToolDefinition = {
         id: 't1',
-        user_id: 'u1',
         mcp_server_id: 's1',
         name: 'search_code',
         description: 'Find code',
@@ -94,7 +93,7 @@ describe('mcp type helpers', () => {
 
     it('handles null description', () => {
       const tool: ToolDefinition = {
-        id: 't1', user_id: 'u1', mcp_server_id: 's1', name: 'tool',
+        id: 't1', mcp_server_id: 's1', name: 'tool',
         description: null, active: true, created_at: '', updated_at: '',
         code_search_scopes: [], document_search_scopes: [],
       }
@@ -103,7 +102,7 @@ describe('mcp type helpers', () => {
 
     it('splits website group_ids into selectedWebsites when provided website list', () => {
       const tool: ToolDefinition = {
-        id: 't2', user_id: 'u1', mcp_server_id: 's1', name: 'mixed',
+        id: 't2', mcp_server_id: 's1', name: 'mixed',
         description: '', active: true, created_at: '', updated_at: '',
         code_search_scopes: [],
         document_search_scopes: [

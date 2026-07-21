@@ -1,6 +1,7 @@
 use serde::Serialize;
+use sqlx::FromRow;
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Serialize, FromRow)]
 pub struct JobStatus {
     pub id: i64,
     pub job_id: String,
@@ -10,7 +11,6 @@ pub struct JobStatus {
     pub result: Option<String>,
     pub error_message: Option<String>,
     pub progress_percentage: i64,
-    pub user_id: Option<String>,
     pub file_name: Option<String>,
     pub storage_object_id: Option<String>,
     pub task_name: Option<String>,

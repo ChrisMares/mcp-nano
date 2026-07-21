@@ -1,4 +1,5 @@
 mod controllers;
+mod db;
 mod models;
 pub mod qdrant;
 
@@ -21,6 +22,12 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 if let Err(error) = qdrant::init(handle, http_port, grpc_port).await {
                     eprintln!("Qdrant initialization failed: {error}");
+                }
+            });
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(error) = db::init(handle).await {
+                    eprintln!("SQLite initialization failed: {error}");
                 }
             });
             Ok(())

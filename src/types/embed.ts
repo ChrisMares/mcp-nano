@@ -17,7 +17,6 @@ export interface JobStatus {
   result: string | null;
   error_message: string | null;
   progress_percentage: number;
-  user_id: string | null;
   file_name: string | null;
   storage_object_id: string | null;
   task_name: string | null;

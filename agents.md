@@ -28,7 +28,7 @@ after installation.
 | `src-tauri/src/controllers/` | Thin `#[tauri::command]` wrappers over Rust core services. |
 | `src-tauri/src/models/` | Serde request, response, business, and future SQLite entity types. |
 | `src-tauri/src/embed/` | Planned embedding, reranking, BM25, and chunking implementation. |
-| `src-tauri/src/db/` | Planned SQLite access and migrations. |
+| `src-tauri/src/db/` | SQLite pool setup and access; migrations in `src-tauri/migrations/`. |
 | `src-tauri/src/worker/` | Planned background job worker and task execution. |
 | `src-tauri/src/qdrant.rs` | Qdrant sidecar lifecycle, client connect/retry, and startup collection/index init. |
 | `src-tauri/src/mcp/` | Planned localhost Axum and rmcp endpoint. |
@@ -40,6 +40,13 @@ after installation.
   connects with retry, ensures the `codebase`/`general` collections (dense 384
   Cosine + sparse BM25 vectors) and payload indexes exist, and registers
   `QdrantState` in Tauri managed state.
+- SQLite is wired: `setup()` spawns `db::init`, which opens
+  `app_local_data_dir()/app.db` (foreign keys on), runs the sqlx migrations in
+  `src-tauri/migrations/`, and registers `DbState` in Tauri managed state. The
+  schema mirrors the VectorFlow tables (`file_metadata`, `job_status`,
+  `mcp_servers`, `tool_definitions`, `tool_code_search`,
+  `tool_document_search`) with all `user_id` columns and indexes dropped for
+  single-user local mode.
 - Rust controllers currently return placeholder responses. Models and required
   Cargo dependencies are scaffolded, but core backend behavior is not yet
   implemented.
@@ -112,9 +119,10 @@ npm run tauri dev
 
 - Run the focused checks affected by a change. Run both frontend and Rust checks
   for cross-boundary contract changes.
-- `npm run test` is currently expected to fail until tests are migrated from
-  `@/utils/api` to `@/utils/apicalls`; report that existing limitation rather
-  than masking it.
+- Frontend tests live in `src/test/` (vitest). `tsconfig.json` excludes
+  `src/test` from `tsc -b` type-checking, matching the pre-move behavior;
+  several test files have latent type errors if that exclusion is ever
+  removed.
 - Do not modify the original VectorFlow repository while using it as reference.
 - Keep changes small, idiomatic, and focused. Avoid speculative compatibility
   layers, unnecessary abstractions, and comments that merely restate code.

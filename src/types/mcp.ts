@@ -1,6 +1,5 @@
 export interface McpServer {
   id: string;
-  user_id: string;
   name: string;
   description: string | null;
   active: boolean;
@@ -11,7 +10,6 @@ export interface McpServer {
 
 export interface ToolDefinition {
   id: string;
-  user_id: string;
   mcp_server_id: string;
   name: string;
   description: string | null;
