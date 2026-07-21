@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use serde_json::json;
 use sqlx::Row;
 use tauri::{AppHandle, Manager};
+use tracing::info;
 use uuid::Uuid;
 
 use crate::db::DbState;
@@ -31,6 +32,7 @@ pub async fn upload_repo_zip(
     paths: Vec<String>,
     embedding_options: EmbeddingOptions,
 ) -> Result<UploadResponse, String> {
+    info!("upload_repo_zip: {} file(s), collection={:?}", paths.len(), embedding_options.collection);
     enqueue_upload_jobs(
         &app,
         &paths,
@@ -51,6 +53,7 @@ pub async fn upload_documents(
     paths: Vec<String>,
     embedding_options: EmbeddingOptions,
 ) -> Result<UploadResponse, String> {
+    info!("upload_documents: {} file(s), group={:?}", paths.len(), embedding_options.group);
     enqueue_upload_jobs(
         &app,
         &paths,
@@ -72,6 +75,7 @@ pub async fn upload_code_files(
     paths: Vec<String>,
     embedding_options: EmbeddingOptions,
 ) -> Result<UploadResponse, String> {
+    info!("upload_code_files: {} file(s), repo={:?}", paths.len(), embedding_options.repo_name);
     enqueue_upload_jobs(
         &app,
         &paths,
@@ -111,6 +115,71 @@ pub async fn get_job_status(app: AppHandle, job_id: String) -> Result<JobStatus,
         .fetch_one(&pool)
         .await
         .map_err(|e| format!("querying job_status: {e}"))
+}
+
+#[tauri::command]
+pub async fn get_all_jobs(app: AppHandle) -> Result<Vec<JobStatus>, String> {
+    let pool = pool_from_state(&app)?;
+    sqlx::query_as::<_, JobStatus>("SELECT * FROM job_status ORDER BY created_at DESC")
+        .fetch_all(&pool)
+        .await
+        .map_err(|e| format!("querying all jobs: {e}"))
+}
+
+#[tauri::command]
+pub async fn retry_job(app: AppHandle, job_id: String) -> Result<(), String> {
+    let pool = pool_from_state(&app)?;
+    let now = now_iso();
+    let result = sqlx::query(
+        "UPDATE job_status SET status = 'PENDING', updated_at = ?, error_message = NULL, result = NULL WHERE job_id = ? AND (status = 'FAILED' OR status = 'PENDING')",
+    )
+    .bind(&now)
+    .bind(&job_id)
+    .execute(&pool)
+    .await
+    .map_err(|e| format!("retrying job: {e}"))?;
+    if result.rows_affected() == 0 {
+        return Err("Job not found or not in a retryable state".to_string());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn delete_pending_jobs(app: AppHandle) -> Result<(), String> {
+    let pool = pool_from_state(&app)?;
+    sqlx::query("DELETE FROM job_status WHERE status = 'PENDING'")
+        .execute(&pool)
+        .await
+        .map_err(|e| format!("deleting pending jobs: {e}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn delete_all_jobs(app: AppHandle) -> Result<(), String> {
+    let pool = pool_from_state(&app)?;
+    sqlx::query("DELETE FROM job_status")
+        .execute(&pool)
+        .await
+        .map_err(|e| format!("deleting all jobs: {e}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_worker_status(app: AppHandle) -> Result<String, String> {
+    let pool = pool_from_state(&app)?;
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM job_status WHERE status = 'PENDING'",
+    )
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| format!("count pending: {e}"))?;
+    let running: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM job_status WHERE status = 'RUNNING'",
+    )
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| format!("count running: {e}"))?;
+    Ok(format!("{{ \"pending\": {pending}, \"running\": {running} }}"))
 }
 
 /// Resolve the SqlitePool from managed state. Returns a useful error

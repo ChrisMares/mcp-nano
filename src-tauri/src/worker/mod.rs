@@ -12,6 +12,7 @@ use sqlx::SqlitePool;
 use tauri::{AppHandle, Emitter};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use tracing::{error, warn};
 
 use crate::models::entities::JobStatus;
 
@@ -66,7 +67,7 @@ async fn run_loop(
         inflight = still_running;
         for h in finished {
             if let Err(panic) = h.await {
-                eprintln!("worker task panicked: {panic}");
+                error!("worker task panicked: {panic}");
             }
         }
 
@@ -93,7 +94,7 @@ async fn run_loop(
                         inflight.push(task);
                     }
                 }
-                Err(e) => eprintln!("claim_jobs failed: {e:#}"),
+                Err(e) => error!("claim_jobs failed: {e:#}"),
             }
         }
 
@@ -106,12 +107,12 @@ async fn run_loop(
 
     // Graceful shutdown: reset any still-RUNNING jobs to PENDING so the next
     // launch can pick them up.
-    eprintln!("worker shutting down: awaiting {} inflight tasks", inflight.len());
+    warn!("worker shutting down: awaiting {} inflight tasks", inflight.len());
     for h in inflight {
         let _ = h.await;
     }
     if let Err(e) = reset_running_to_pending(&pool).await {
-        eprintln!("reset_running_to_pending failed: {e:#}");
+        error!("reset_running_to_pending failed: {e:#}");
     }
 }
 
@@ -186,7 +187,7 @@ async fn run_job(
             // FINISHED. Awaits the update so the row reflects 100 before the
             // status flip is observed.
             if let Err(e) = update_job_progress(pool, &job_id, 100, None).await {
-                eprintln!("final progress update failed for {job_id}: {e:#}");
+                error!("final progress update failed for {job_id}: {e:#}");
             }
             if let Some(app) = app.as_ref() {
                 let _ = app.emit(
@@ -200,7 +201,7 @@ async fn run_job(
             }
             let _ = set_job_status(pool, &job_id, "FINISHED", Some(&msg), None).await;
             if let Err(e) = post_process_file_status(pool, &params, "completed", None).await {
-                eprintln!("file_metadata status update failed for {job_id}: {e:#}");
+                error!("file_metadata status update failed for {job_id}: {e:#}");
             }
         }
         Err(e) => {
@@ -217,7 +218,7 @@ async fn run_job(
             }
             let _ = set_job_status(pool, &job_id, "FAILED", None, Some(&msg)).await;
             if let Err(e) = post_process_file_status(pool, &params, "failed", Some(&msg)).await {
-                eprintln!("file_metadata status update failed for {job_id}: {e:#}");
+                error!("file_metadata status update failed for {job_id}: {e:#}");
             }
         }
     }

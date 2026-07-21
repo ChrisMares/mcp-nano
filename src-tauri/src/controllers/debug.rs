@@ -117,11 +117,11 @@ pub async fn open_sqlite_pool(dir: &Path) -> SqlitePool {
 pub fn load_embedders() -> Option<Arc<EmbedderState>> {
     let dir = models_dir();
     if !dir.join("arctic-embed-xs/model.safetensors").exists() {
-        eprintln!("skipping: arctic-embed-xs not downloaded; run scripts/download-models.sh");
+        tracing::warn!("skipping: arctic-embed-xs not downloaded; run scripts/download-models.sh");
         return None;
     }
     if !dir.join("minilm-l6-v2/model.safetensors").exists() {
-        eprintln!("skipping: minilm-l6-v2 not downloaded; run scripts/download-models.sh");
+        tracing::warn!("skipping: minilm-l6-v2 not downloaded; run scripts/download-models.sh");
         return None;
     }
     Some(Arc::new(
@@ -153,7 +153,7 @@ pub fn reranker_ready() -> Option<Reranker> {
     match Reranker::load(&dir) {
         Ok(r) => Some(r),
         Err(e) => {
-            eprintln!("Reranker::load failed: {e:#}");
+            tracing::warn!("Reranker::load failed: {e:#}");
             None
         }
     }

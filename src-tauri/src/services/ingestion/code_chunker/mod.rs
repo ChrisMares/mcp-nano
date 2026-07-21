@@ -202,7 +202,7 @@ fn chunk_with_language(file_path: &Path, lang: Language) -> Vec<CodeChunk> {
     let source_bytes = processed_source.into_bytes();
     let mut parser = Parser::new();
     if let Err(e) = parser.set_language(&lang.tree_sitter_language()) {
-        eprintln!("tree-sitter parser init failed for {}: {e}", file_path.display());
+        tracing::error!("tree-sitter parser init failed for {}: {e}", file_path.display());
         return Vec::new();
     }
     let Some(tree) = parser.parse(&source_bytes, None) else {

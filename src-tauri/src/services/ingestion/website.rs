@@ -491,7 +491,7 @@ pub async fn process_website(urls: &[String], metadata: &Map<String, Value>) -> 
         let (page_title, sections) = match scrape_website(url).await {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("Warning: failed to scrape {url}: {e:#}");
+                tracing::warn!("failed to scrape {url}: {e:#}");
                 continue;
             }
         };

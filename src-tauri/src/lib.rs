@@ -1,20 +1,57 @@
 pub mod controllers;
 pub mod db;
+pub mod mcp;
 pub mod models;
 pub mod qdrant;
 pub mod services;
 pub mod worker;
 
-use services::{EmbedderState, IngestionService, QdrantService};
+use std::sync::Arc;
+
+use flexi_logger::{Cleanup, Criterion, Duplicate, Logger, Naming, WriteMode};
+use services::{EmbedderState, IngestionService, QdrantService, RagService};
 use tauri::Manager;
 use tokio_util::sync::CancellationToken;
+use tracing::{error, info};
 
 use controllers::{data, jobs, mcpconfig, rag, website};
+use mcp::{McpAppState, McpState};
 
-// Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-#[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
+fn init_logging(app: &tauri::AppHandle) {
+    if let Ok(data_dir) = app.path().app_local_data_dir() {
+        let log_dir = data_dir.join("logs");
+        if std::fs::create_dir_all(&log_dir).is_ok() {
+            match Logger::try_with_str("info")
+                .unwrap()
+                .log_to_file(
+                    flexi_logger::FileSpec::default()
+                        .directory(log_dir)
+                        .basename("mcp-nano")
+                        .suffix("log"),
+                )
+                .append()
+                .rotate(
+                    Criterion::Size(5_000_000),
+                    Naming::Numbers,
+                    Cleanup::KeepLogFiles(3),
+                )
+                .write_mode(WriteMode::Async)
+                .duplicate_to_stderr(Duplicate::Warn)
+                .start()
+            {
+                Ok(_) => info!(
+                    "Log directory: {}",
+                    data_dir.join("logs").display()
+                ),
+                Err(e) => eprintln!("Logger init failed: {e}"),
+            }
+            return;
+        }
+    }
+    let _ = Logger::try_with_str("info")
+        .unwrap()
+        .duplicate_to_stderr(Duplicate::Info)
+        .start();
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -23,45 +60,37 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
         .setup(|app| {
+            init_logging(app.handle());
+
             let (http_port, grpc_port) = qdrant::start(app.handle())?;
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 if let Err(error) = qdrant::init(handle, http_port, grpc_port).await {
-                    eprintln!("Qdrant initialization failed: {error}");
+                    error!("Qdrant initialization failed: {error}");
                 }
             });
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 if let Err(error) = db::init(handle).await {
-                    eprintln!("SQLite initialization failed: {error}");
+                    error!("SQLite initialization failed: {error}");
                 }
             });
-            // Load embedder + reranker models (mmap'd, ~174 MB) and register
-            // them as managed state (wrapped in Arc for cheap sharing across
-            // worker tasks and command handlers). The worker spawn below
-            // reads this back via `app.try_state::<Arc<EmbedderState>>()`.
             match EmbedderState::models_dir(app.handle()) {
                 Ok(dir) => match EmbedderState::load(&dir) {
                     Ok(state) => {
-                        println!("Embedder models loaded from {}", dir.display());
-                        app.manage(std::sync::Arc::new(state));
+                        info!("Embedder models loaded from {}", dir.display());
+                        app.manage(Arc::new(state));
                     }
                     Err(error) => {
-                        eprintln!(
+                        error!(
                             "Embedder model load failed from {}: {error:#}",
                             dir.display()
                         );
                     }
                 },
-                Err(error) => eprintln!("Embedder models_dir resolution failed: {error}"),
+                Err(error) => error!("Embedder models_dir resolution failed: {error}"),
             }
 
-            // Spawn the background worker poll loop. The worker needs:
-            //   - SQLite pool (for claiming jobs + updating status)
-            //   - Task registry (binding ingestion_service methods)
-            //   - QdrantService + EmbedderState (via IngestionService)
-            // DB and Qdrant init are async; we spawn a follow-up task that
-            // polls for them to be registered, then starts the worker.
             let cancel = CancellationToken::new();
             app.manage(cancel.clone());
             let app_handle = app.handle().clone();
@@ -71,36 +100,49 @@ pub fn run() {
                 let (pool, qdrant_client) = match (pool, qdrant_client) {
                     (Some(p), Some(q)) => (p, q),
                     _ => {
-                        eprintln!(
-                            "Worker not started: missing required state (db/qdrant)"
-                        );
+                        error!("Worker/MCP not started: missing required state (db/qdrant)");
                         return;
                     }
                 };
-                let embedders = match app_handle.try_state::<std::sync::Arc<EmbedderState>>() {
+                let embedders = match app_handle.try_state::<Arc<EmbedderState>>() {
                     Some(s) => s.inner().clone(),
                     None => {
-                        eprintln!("Worker not started: EmbedderState not registered");
+                        error!("Worker/MCP not started: EmbedderState not registered");
                         return;
                     }
                 };
                 let models_dir = match EmbedderState::models_dir(&app_handle) {
                     Ok(d) => d,
                     Err(e) => {
-                        eprintln!("Worker not started: models_dir resolution failed: {e}");
+                        error!("Worker/MCP not started: models_dir resolution failed: {e}");
                         return;
                     }
                 };
                 let qdrant_service = QdrantService::new(qdrant_client);
+                let rag = Arc::new(RagService::new(embedders.clone(), qdrant_service.clone()));
+                app_handle.manage(rag.clone());
+
+                let mcp_state = Arc::new(McpAppState::new(pool.clone(), rag));
+                match mcp::start(mcp_state, cancel.child_token()).await {
+                    Ok((port, _handle)) => {
+                        app_handle.manage(McpState {
+                            port,
+                            cancel: cancel.child_token(),
+                        });
+                        info!("MCP endpoint started on port {port}");
+                    }
+                    Err(e) => error!("MCP endpoint failed to start: {e}"),
+                }
+
                 let ingestion = match IngestionService::new(embedders, qdrant_service, &models_dir) {
-                    Ok(s) => std::sync::Arc::new(s),
+                    Ok(s) => Arc::new(s),
                     Err(e) => {
-                        eprintln!("Worker not started: IngestionService init failed: {e:#}");
+                        error!("Worker not started: IngestionService init failed: {e:#}");
                         return;
                     }
                 };
                 let registry = ingestion.build_task_registry();
-                println!(
+                info!(
                     "Starting background worker: tasks={} concurrency=2",
                     registry.names().join(", "),
                 );
@@ -109,14 +151,21 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            greet,
             rag::rag_query,
             rag::get_metadata_values,
+            rag::get_collections,
+            rag::get_metadata_keys,
+            rag::get_embedders_status,
             jobs::upload_repo_zip,
             jobs::upload_documents,
             jobs::upload_code_files,
             jobs::get_active_jobs,
             jobs::get_job_status,
+            jobs::get_all_jobs,
+            jobs::retry_job,
+            jobs::delete_pending_jobs,
+            jobs::delete_all_jobs,
+            jobs::get_worker_status,
             data::get_files,
             data::delete_repo,
             data::delete_document,
@@ -129,6 +178,8 @@ pub fn run() {
             mcpconfig::get_mcp_servers,
             mcpconfig::create_mcp_server,
             mcpconfig::get_mcp_server,
+            mcpconfig::update_mcp_server,
+            mcpconfig::toggle_mcp_server,
             mcpconfig::delete_mcp_server,
             mcpconfig::create_mcp_tool,
             mcpconfig::update_mcp_tool,

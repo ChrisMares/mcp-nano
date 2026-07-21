@@ -13,3 +13,16 @@ pub struct RagResponse {
 pub struct MetadataValuesResponse {
     pub values: Vec<String>,
 }
+
+#[derive(Debug, Default, Serialize)]
+pub struct CollectionsResponse {
+    pub collections: Vec<String>,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct EmbedderStatusResponse {
+    pub dense_loaded: bool,
+    pub reranker_loaded: bool,
+    pub bm25_loaded: bool,
+    pub models_dir: String,
+}

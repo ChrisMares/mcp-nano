@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
 use tauri::{AppHandle, Manager};
+use tracing::info;
 
 pub struct DbState {
     pub pool: SqlitePool,
@@ -22,7 +23,7 @@ pub async fn init(app: AppHandle) -> Result<(), String> {
     let path = db_path(&app)?;
     let pool = connect(&path).await?;
     app.manage(DbState { pool });
-    println!("SQLite initialized at {}", path.display());
+    info!("SQLite initialized at {}", path.display());
     Ok(())
 }
 

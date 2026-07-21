@@ -8,6 +8,8 @@ use qdrant_client::qdrant::{
 use qdrant_client::{Payload, Qdrant};
 use uuid::Uuid;
 
+use tracing::{debug, info};
+
 use crate::models::VecDbResult;
 use crate::services::embedders::{Bm25Embedder, SparseEmbed};
 
@@ -165,6 +167,7 @@ impl QdrantService {
             return Ok(());
         }
         let bs = if batch_size == 0 { 250 } else { batch_size };
+        debug!("upserting {} items to {collection} in batches of {bs}", ids.len());
 
         for chunk_start in (0..ids.len()).step_by(bs) {
             let chunk_end = (chunk_start + bs).min(ids.len());
@@ -227,6 +230,7 @@ impl QdrantService {
     ) -> Result<VecDbResult> {
         let limit = n_results as u64;
 
+        debug!("query {collection}: limit={n_results} hybrid={}", query_text.is_some());
         let builder = if let (Some(text), Some(bm25)) = (query_text, bm25) {
             // Hybrid RRF: dense + sparse prefetch, fused.
             let sparse_vecs = bm25
@@ -342,6 +346,7 @@ impl QdrantService {
     ) -> Result<()> {
         if let Some(ids) = ids {
             if !ids.is_empty() {
+                info!("deleting {} points from {collection} by id", ids.len());
                 let point_ids: Vec<PointId> = ids.iter().copied().map(PointId::from).collect();
                 self.client
                     .delete_points(

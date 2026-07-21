@@ -7,6 +7,7 @@ use serde::Serialize;
 use sqlx::SqlitePool;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::Mutex;
+use tracing::error;
 
 /// A future returned by a [`ProgressCallback`] that, when awaited, persists
 /// the progress update to `job_status`.
@@ -47,7 +48,7 @@ pub fn progress_for_job(pool: SqlitePool, job_id: String) -> ProgressCallback {
         let job_id = job_id.clone();
         Box::pin(async move {
             if let Err(e) = update_job_progress(&pool, &job_id, pct, msg.as_deref()).await {
-                eprintln!("progress update failed for job {job_id}: {e:#}");
+                error!("progress update failed for job {job_id}: {e:#}");
             }
         })
     })
@@ -69,7 +70,7 @@ pub fn progress_for_job_with_app(
         let app = app.clone();
         Box::pin(async move {
             if let Err(e) = update_job_progress(&pool, &job_id, pct, msg.as_deref()).await {
-                eprintln!("progress update failed for job {job_id}: {e:#}");
+                error!("progress update failed for job {job_id}: {e:#}");
             }
             let event = JobProgressEvent {
                 job_id: job_id.clone(),
@@ -77,7 +78,7 @@ pub fn progress_for_job_with_app(
                 message: msg.clone(),
             };
             if let Err(e) = app.emit("job_progress", event) {
-                eprintln!("emit job_progress failed for job {job_id}: {e:#}");
+                error!("emit job_progress failed for job {job_id}: {e:#}");
             }
         })
     })

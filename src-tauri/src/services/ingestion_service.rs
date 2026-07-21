@@ -7,6 +7,8 @@ use text_splitter::{ChunkConfig, TextSplitter};
 use tokenizers::Tokenizer;
 use uuid::Uuid;
 
+use tracing::{debug, error, info};
+
 use crate::models::request::EmbeddingOptions;
 use crate::services::embedders::EncodeDocuments;
 use crate::services::embedder_state::EmbedderState;
@@ -78,12 +80,18 @@ impl IngestionService {
         progress: crate::worker::ProgressCallback,
     ) -> Result<String> {
         let p: ProcessZipParams = serde_json::from_value(params)
+            .map_err(|e| {
+                error!("process_zip_upload: invalid params: {e:#}");
+                anyhow!("invalid params: {e:#}")
+            })
             .context("deserializing process_zip_upload params")?;
+        info!("process_zip_upload: zip={} collection={:?}", p.zip_path, p.embedding_options.collection);
         progress(5, Some("Starting zip extraction".to_string())).await;
 
         let extract_dir = PathBuf::from(format!("{}_extracted", strip_zip_ext(&p.zip_path)));
         unzip_to(&p.zip_path, &extract_dir)
             .with_context(|| format!("unzipping {}", p.zip_path))?;
+        info!("extracted zip to {}", extract_dir.display());
         progress(20, Some("Zip extraction complete".to_string())).await;
 
         let collection = p
@@ -165,10 +173,16 @@ impl IngestionService {
         progress: crate::worker::ProgressCallback,
     ) -> Result<String> {
         let p: ProcessDocParams = serde_json::from_value(params)
+            .map_err(|e| {
+                error!("process_documents_upload: invalid params: {e:#}");
+                anyhow!("invalid params: {e:#}")
+            })
             .context("deserializing process_documents_upload params")?;
+        info!("process_documents_upload: path={} group={:?}", p.path, p.group);
         progress(1, Some("Starting document processing".to_string())).await;
 
         if !Path::new(&p.path).exists() {
+            error!("process_documents_upload: path does not exist: {}", p.path);
             return Err(anyhow!("Path {} does not exist", p.path));
         }
         let collection = p.collection.unwrap_or_else(|| "general".to_string());
@@ -204,10 +218,16 @@ impl IngestionService {
         progress: crate::worker::ProgressCallback,
     ) -> Result<String> {
         let p: ProcessCodeFileParams = serde_json::from_value(params)
+            .map_err(|e| {
+                error!("process_code_file_upload: invalid params: {e:#}");
+                anyhow!("invalid params: {e:#}")
+            })
             .context("deserializing process_code_file_upload params")?;
+        info!("process_code_file_upload: path={} collection={}", p.path, p.collection);
         progress(1, Some("Starting code file processing".to_string())).await;
 
         if !Path::new(&p.path).exists() {
+            error!("process_code_file_upload: path does not exist: {}", p.path);
             return Err(anyhow!("Path {} does not exist", p.path));
         }
         self.qdrant.ensure_collection(&p.collection).await?;
@@ -241,7 +261,12 @@ impl IngestionService {
         progress: crate::worker::ProgressCallback,
     ) -> Result<String> {
         let p: ProcessWebsiteParams = serde_json::from_value(params)
+            .map_err(|e| {
+                error!("process_website_embed: invalid params: {e:#}");
+                anyhow!("invalid params: {e:#}")
+            })
             .context("deserializing process_website_embed params")?;
+        info!("process_website_embed: {} urls, group={}", p.urls.len(), p.group);
         progress(5, Some(format!("Scraping {} pages", p.urls.len()))).await;
 
         let mut base_metadata = serde_json::Map::new();
@@ -377,6 +402,7 @@ impl IngestionService {
         if chunks.is_empty() {
             return Ok(0);
         }
+        debug!("embed_and_upsert: {} chunks → {collection} [{range_start}..{range_end}]", chunks.len());
         let span = (range_end - range_start).max(0);
 
         let texts: Vec<String> = chunks

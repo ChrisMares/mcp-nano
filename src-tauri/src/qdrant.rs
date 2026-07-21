@@ -8,6 +8,7 @@ use qdrant_client::qdrant::{
 use qdrant_client::Qdrant;
 use tauri::{AppHandle, Manager};
 use tauri_plugin_shell::{process::CommandEvent, ShellExt};
+use tracing::{error, info, warn};
 
 // Must match the dense embedder output size (Snowflake/snowflake-arctic-embed-xs).
 pub const EMBEDDING_DIM: u64 = 384;
@@ -71,8 +72,8 @@ pub fn start(app: &AppHandle) -> Result<(u16, u16), String> {
         .spawn()
         .map_err(|error| format!("failed to start Qdrant: {error}"))?;
 
-    println!(
-        "Started Qdrant (pid {}) at http://127.0.0.1:{http_port}; storage: {}",
+    info!(
+        "Qdrant started (pid {}) at http://127.0.0.1:{http_port}; storage: {}",
         child.pid(),
         storage.display()
     );
@@ -81,14 +82,14 @@ pub fn start(app: &AppHandle) -> Result<(u16, u16), String> {
         while let Some(event) = events.recv().await {
             match event {
                 CommandEvent::Stdout(line) => {
-                    println!("qdrant: {}", String::from_utf8_lossy(&line).trim_end());
+                    info!("qdrant: {}", String::from_utf8_lossy(&line).trim_end());
                 }
                 CommandEvent::Stderr(line) => {
-                    eprintln!("qdrant: {}", String::from_utf8_lossy(&line).trim_end());
+                    warn!("qdrant: {}", String::from_utf8_lossy(&line).trim_end());
                 }
-                CommandEvent::Error(error) => eprintln!("qdrant process error: {error}"),
+                CommandEvent::Error(error) => error!("qdrant process error: {error}"),
                 CommandEvent::Terminated(status) => {
-                    eprintln!(
+                    warn!(
                         "qdrant exited: code={:?}, signal={:?}",
                         status.code, status.signal
                     );
@@ -105,7 +106,7 @@ pub fn start(app: &AppHandle) -> Result<(u16, u16), String> {
 /// exist, then register `QdrantState` in Tauri managed state.
 pub async fn init(app: AppHandle, http_port: u16, grpc_port: u16) -> Result<(), String> {
     let client = connect_with_retry(grpc_port).await?;
-    println!("Qdrant connected on gRPC port {grpc_port}");
+    info!("Qdrant connected on gRPC port {grpc_port}");
 
     ensure_collections(&client).await?;
 
@@ -114,7 +115,7 @@ pub async fn init(app: AppHandle, http_port: u16, grpc_port: u16) -> Result<(), 
         http_port,
         grpc_port,
     });
-    println!("Qdrant initialization complete");
+    info!("Qdrant initialization complete");
     Ok(())
 }
 
@@ -131,7 +132,7 @@ pub async fn connect_with_retry(grpc_port: u16) -> Result<Qdrant, String> {
             Err(error) => {
                 if attempt + 1 < MAX_RETRIES {
                     let wait = 2 * (attempt as u64 + 1);
-                    eprintln!("Qdrant not ready ({error}). Retrying in {wait}s...");
+                    warn!("Qdrant not ready ({error}). Retrying in {wait}s...");
                     tokio::time::sleep(Duration::from_secs(wait)).await;
                 } else {
                     return Err(format!(
@@ -153,11 +154,11 @@ pub async fn ensure_collections(client: &Qdrant) -> Result<(), String> {
         .into_iter()
         .map(|collection| collection.name)
         .collect();
-    println!("Qdrant collections found: {existing:?}");
+    info!("Qdrant collections found: {existing:?}");
 
     for name in COLLECTIONS {
         if existing.iter().any(|collection| collection == name) {
-            println!("   [OK] Collection '{name}' exists.");
+            info!("Collection '{name}' exists.");
             continue;
         }
 
@@ -195,7 +196,7 @@ pub async fn ensure_collections(client: &Qdrant) -> Result<(), String> {
             )
             .await
             .map_err(|error| format!("failed to create collection '{name}': {error}"))?;
-        println!("Created collection '{name}' with dimension {EMBEDDING_DIM}");
+        info!("Created collection '{name}' with dimension {EMBEDDING_DIM}");
     }
 
     for (collection, field, field_type) in PAYLOAD_INDEXES {
@@ -205,8 +206,8 @@ pub async fn ensure_collections(client: &Qdrant) -> Result<(), String> {
             ))
             .await
         {
-            Ok(_) => println!("Created index '{field}' on '{collection}'"),
-            Err(error) => eprintln!("Index '{field}' on '{collection}' skipped: {error}"),
+            Ok(_) => info!("Created index '{field}' on '{collection}'"),
+            Err(error) => warn!("Index '{field}' on '{collection}' skipped: {error}"),
         }
     }
 

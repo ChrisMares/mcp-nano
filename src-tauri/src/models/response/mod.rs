@@ -9,5 +9,5 @@ pub use jobs::{ActiveJobsResponse, UploadJobEntry, UploadResponse};
 pub use mcpconfig::{
     ConnectionInfo, MessageResponse, ServerResponse, ServersResponse, ToolResponse,
 };
-pub use rag::{MetadataValuesResponse, RagResponse};
+pub use rag::{CollectionsResponse, EmbedderStatusResponse, MetadataValuesResponse, RagResponse};
 pub use website::{CrawlResponse, EmbedWebsiteResponse};
