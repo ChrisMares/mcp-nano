@@ -18,10 +18,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use qdrant_client::qdrant::{
-    vectors_config, CreateCollectionBuilder, Distance, SparseIndexConfig, SparseVectorConfig,
-    SparseVectorParams, VectorParams, VectorParamsMap, VectorsConfig,
-};
 use qdrant_client::Qdrant;
 use sqlx::SqlitePool;
 
@@ -171,43 +167,17 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
-/// Create a Qdrant collection configured for hybrid (dense + sparse) vectors
-/// with the given dense dimension. Idempotent — ignores "already exists".
+/// Create a Qdrant collection configured for hybrid (dense + sparse IDF) vectors.
 pub async fn create_test_collection(
     client: &Qdrant,
     collection: &str,
     dense_dim: usize,
 ) -> Result<()> {
-    let mut dense_map = std::collections::HashMap::new();
-    dense_map.insert(
-        "dense".to_string(),
-        VectorParams {
-            size: dense_dim as u64,
-            distance: Distance::Cosine as i32,
-            ..Default::default()
-        },
-    );
-    let mut sparse_map = std::collections::HashMap::new();
-    sparse_map.insert(
-        "sparse".to_string(),
-        SparseVectorParams {
-            index: Some(SparseIndexConfig {
-                on_disk: Some(false),
-                ..Default::default()
-            }),
-            ..Default::default()
-        },
-    );
     client
-        .create_collection(
-            CreateCollectionBuilder::new(collection)
-                .vectors_config(VectorsConfig {
-                    config: Some(vectors_config::Config::ParamsMap(VectorParamsMap {
-                        map: dense_map,
-                    })),
-                })
-                .sparse_vectors_config(SparseVectorConfig { map: sparse_map }),
-        )
+        .create_collection(crate::qdrant::hybrid_collection_builder(
+            collection,
+            dense_dim as u64,
+        ))
         .await
         .context("create_collection")?;
     Ok(())

@@ -58,6 +58,21 @@ export interface EmbedWebsiteResponse {
   url_count: number;
 }
 
+export interface BackendStatus {
+  qdrant_ready: boolean;
+  qdrant_error: string | null;
+  http_port: number | null;
+  grpc_port: number | null;
+  db_ready: boolean;
+  embedders_ready: boolean;
+  embedding_device: string | null;
+  worker_ready: boolean;
+}
+
+export async function getBackendStatus(): Promise<BackendStatus> {
+  return invoke("get_backend_status");
+}
+
 export async function ragQuery(payload: RagQueryPayload): Promise<RagResponse> {
   return invoke("rag_query", { payload });
 }
@@ -70,31 +85,31 @@ export async function getMetadataValues(
 }
 
 export async function uploadRepoZip(
-  files: File[],
+  paths: string[],
   embeddingOptions: EmbeddingOptions
 ): Promise<UploadResponse> {
   return invoke("upload_repo_zip", {
-    paths: files.map((f) => f.name),
+    paths,
     embeddingOptions,
   });
 }
 
 export async function uploadDocuments(
-  files: File[],
+  paths: string[],
   embeddingOptions: EmbeddingOptions
 ): Promise<UploadResponse> {
   return invoke("upload_documents", {
-    paths: files.map((f) => f.name),
+    paths,
     embeddingOptions,
   });
 }
 
 export async function uploadCodeFiles(
-  files: File[],
+  paths: string[],
   embeddingOptions: EmbeddingOptions
 ): Promise<UploadResponse> {
   return invoke("upload_code_files", {
-    paths: files.map((f) => f.name),
+    paths,
     embeddingOptions,
   });
 }

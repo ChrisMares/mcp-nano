@@ -14,7 +14,7 @@ use crate::services::embedders::EncodeDocuments;
 use crate::services::embedder_state::EmbedderState;
 use crate::services::ingestion;
 use crate::services::qdrant_service::QdrantService;
-use crate::worker::{ProgressCallback, TaskRegistry};
+use crate::worker::TaskRegistry;
 
 /// Default chunk size in tokens (matches the Python `DOC_CHUNK_SIZE = 768`).
 const DEFAULT_CHUNK_SIZE: usize = 768;

@@ -15,7 +15,6 @@
 use std::path::{Path, PathBuf};
 
 use serde_json::json;
-use sqlx::Row;
 use tauri::{AppHandle, Manager};
 use tracing::info;
 use uuid::Uuid;
@@ -32,17 +31,23 @@ pub async fn upload_repo_zip(
     paths: Vec<String>,
     embedding_options: EmbeddingOptions,
 ) -> Result<UploadResponse, String> {
-    info!("upload_repo_zip: {} file(s), collection={:?}", paths.len(), embedding_options.collection);
+    info!(
+        "upload_repo_zip: {} file(s), collection={:?}",
+        paths.len(),
+        embedding_options.collection
+    );
     enqueue_upload_jobs(
         &app,
         &paths,
         &embedding_options,
         "process_zip",
-        |orig_name, dest_path| json!({
-            "zip_path": dest_path.to_string_lossy(),
-            "zip_filename": orig_name,
-            "embedding_options": embedding_options,
-        }),
+        |orig_name, dest_path| {
+            json!({
+                "zip_path": dest_path.to_string_lossy(),
+                "zip_filename": orig_name,
+                "embedding_options": embedding_options,
+            })
+        },
     )
     .await
 }
@@ -53,18 +58,24 @@ pub async fn upload_documents(
     paths: Vec<String>,
     embedding_options: EmbeddingOptions,
 ) -> Result<UploadResponse, String> {
-    info!("upload_documents: {} file(s), group={:?}", paths.len(), embedding_options.group);
+    info!(
+        "upload_documents: {} file(s), group={:?}",
+        paths.len(),
+        embedding_options.group
+    );
     enqueue_upload_jobs(
         &app,
         &paths,
         &embedding_options,
         "process_documents_upload",
-        |_orig_name, dest_path| json!({
-            "path": dest_path.to_string_lossy(),
-            "collection": embedding_options.collection.clone(),
-            "group": embedding_options.group.clone(),
-            "metadata": embedding_options.metadata.clone(),
-        }),
+        |_orig_name, dest_path| {
+            json!({
+                "path": dest_path.to_string_lossy(),
+                "collection": embedding_options.collection.clone(),
+                "group": embedding_options.group.clone(),
+                "metadata": embedding_options.metadata.clone(),
+            })
+        },
     )
     .await
 }
@@ -75,18 +86,24 @@ pub async fn upload_code_files(
     paths: Vec<String>,
     embedding_options: EmbeddingOptions,
 ) -> Result<UploadResponse, String> {
-    info!("upload_code_files: {} file(s), repo={:?}", paths.len(), embedding_options.repo_name);
+    info!(
+        "upload_code_files: {} file(s), repo={:?}",
+        paths.len(),
+        embedding_options.repo_name
+    );
     enqueue_upload_jobs(
         &app,
         &paths,
         &embedding_options,
         "process_code_file_upload",
-        |_orig_name, dest_path| json!({
-            "path": dest_path.to_string_lossy(),
-            "collection": embedding_options.collection.clone(),
-            "repo_name": embedding_options.repo_name.clone(),
-            "metadata": embedding_options.metadata.clone(),
-        }),
+        |_orig_name, dest_path| {
+            json!({
+                "path": dest_path.to_string_lossy(),
+                "collection": embedding_options.collection.clone(),
+                "repo_name": embedding_options.repo_name.clone(),
+                "metadata": embedding_options.metadata.clone(),
+            })
+        },
     )
     .await
 }
@@ -167,19 +184,19 @@ pub async fn delete_all_jobs(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 pub async fn get_worker_status(app: AppHandle) -> Result<String, String> {
     let pool = pool_from_state(&app)?;
-    let pending: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM job_status WHERE status = 'PENDING'",
-    )
-    .fetch_one(&pool)
-    .await
-    .map_err(|e| format!("count pending: {e}"))?;
-    let running: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM job_status WHERE status = 'RUNNING'",
-    )
-    .fetch_one(&pool)
-    .await
-    .map_err(|e| format!("count running: {e}"))?;
-    Ok(format!("{{ \"pending\": {pending}, \"running\": {running} }}"))
+    let pending: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM job_status WHERE status = 'PENDING'")
+            .fetch_one(&pool)
+            .await
+            .map_err(|e| format!("count pending: {e}"))?;
+    let running: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM job_status WHERE status = 'RUNNING'")
+            .fetch_one(&pool)
+            .await
+            .map_err(|e| format!("count running: {e}"))?;
+    Ok(format!(
+        "{{ \"pending\": {pending}, \"running\": {running} }}"
+    ))
 }
 
 /// Resolve the SqlitePool from managed state. Returns a useful error
@@ -222,7 +239,6 @@ async fn enqueue_upload_jobs(
     task_params_for: impl Fn(&str, &Path) -> serde_json::Value + Sync,
 ) -> Result<UploadResponse, String> {
     let pool = pool_from_state(app)?;
-    let uploads_dir = uploads_dir(app)?;
     let now = now_iso();
     let collection = embedding_options
         .collection
@@ -232,6 +248,7 @@ async fn enqueue_upload_jobs(
     let mut entries: Vec<UploadJobEntry> = Vec::with_capacity(paths.len());
     let mut errors: Vec<String> = Vec::new();
     for p in paths {
+        let uploads_dir = uploads_dir(app)?;
         let source = PathBuf::from(p);
         let orig_name = source
             .file_name()
@@ -242,10 +259,7 @@ async fn enqueue_upload_jobs(
         let dest_name = format!("{}_{orig_name}", job_id.simple());
         let dest_path = uploads_dir.join(&dest_name);
         if let Err(e) = std::fs::copy(&source, &dest_path) {
-            errors.push(format!(
-                "copy {p} to {}: {e}",
-                dest_path.display()
-            ));
+            errors.push(format!("copy {p} to {}: {e}", dest_path.display()));
             continue;
         }
         let task_params = task_params_for(&orig_name, &dest_path);

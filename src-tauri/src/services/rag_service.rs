@@ -55,13 +55,16 @@ impl RagService {
                 _ => None,
             };
 
+            // Overfetch candidates for the cross-encoder (prefetch overfetch is
+            // handled inside query_items for RRF).
+            let retrieve_n = (limit as usize).saturating_mul(4).max(1);
             let vec_result = self
                 .qdrant
                 .query_items(
                     &req.collection,
                     &dense,
                     Some(&req.query),
-                    (limit as usize).saturating_mul(4).max(1),
+                    retrieve_n,
                     filter,
                     Include::all(),
                     Some(&self.embedders.bm25),

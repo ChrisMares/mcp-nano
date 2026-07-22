@@ -224,7 +224,6 @@ fn load_spreadsheet(path: &Path, file_name: &str, doc_type: &str) -> anyhow::Res
         let Ok(range) = workbook.worksheet_range(&sheet_name) else { continue };
         let mut rendered = String::new();
         rendered.push_str(&format!("Sheet: {sheet_name}\n"));
-        let mut row_idx = 0usize;
         for row in range.rows() {
             let cells: Vec<String> = row
                 .iter()
@@ -242,7 +241,6 @@ fn load_spreadsheet(path: &Path, file_name: &str, doc_type: &str) -> anyhow::Res
                 .collect();
             rendered.push_str(&cells.join("\t"));
             rendered.push('\n');
-            row_idx += 1;
         }
         if !rendered.trim().is_empty() {
             let mut chunk = DocumentChunk::new(uuid::Uuid::new_v4().to_string(), file_name, rendered, doc_type, idx);

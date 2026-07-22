@@ -77,43 +77,11 @@ impl QdrantService {
         if existing.iter().any(|c| c == name) {
             return Ok(true);
         }
-        // Collection create is handled at startup by `qdrant::ensure_collections`,
-        // so reaching here in normal operation is unusual. We still create the
-        // collection on demand to remain a faithful port of the Python service.
-        use qdrant_client::qdrant::{
-            vectors_config, CreateCollectionBuilder, Distance, SparseIndexConfig,
-            SparseVectorConfig, SparseVectorParams, VectorParams, VectorParamsMap, VectorsConfig,
-        };
-        let mut dense_map = HashMap::new();
-        dense_map.insert(
-            "dense".to_string(),
-            VectorParams {
-                size: crate::qdrant::EMBEDDING_DIM,
-                distance: Distance::Cosine as i32,
-                ..Default::default()
-            },
-        );
-        let mut sparse_map = HashMap::new();
-        sparse_map.insert(
-            "sparse".to_string(),
-            SparseVectorParams {
-                index: Some(SparseIndexConfig {
-                    on_disk: Some(false),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-        );
         self.client
-            .create_collection(
-                CreateCollectionBuilder::new(name)
-                    .vectors_config(VectorsConfig {
-                        config: Some(vectors_config::Config::ParamsMap(VectorParamsMap {
-                            map: dense_map,
-                        })),
-                    })
-                    .sparse_vectors_config(SparseVectorConfig { map: sparse_map }),
-            )
+            .create_collection(crate::qdrant::hybrid_collection_builder(
+                name,
+                crate::qdrant::EMBEDDING_DIM,
+            ))
             .await
             .with_context(|| format!("create_collection({name})"))?;
         Ok(true)
@@ -217,6 +185,10 @@ impl QdrantService {
 
     /// Hybrid query: dense prefetch + BM25 sparse prefetch fused with RRF.
     /// Falls back to dense-only when `query_text` is `None`.
+    ///
+    /// Prefetch limit is `n_results * PREFETCH_OVERFETCH` so RRF has a larger
+    /// candidate pool. Filters are applied on **each prefetch** and the outer
+    /// query so scoped search does not waste the candidate budget.
     #[allow(clippy::too_many_arguments)]
     pub async fn query_items(
         &self,
@@ -228,45 +200,50 @@ impl QdrantService {
         include: Include,
         bm25: Option<&Bm25Embedder>,
     ) -> Result<VecDbResult> {
-        let limit = n_results as u64;
+        let limit = n_results.max(1) as u64;
+        let prefetch_limit = limit.saturating_mul(crate::qdrant::PREFETCH_OVERFETCH).max(limit);
 
-        debug!("query {collection}: limit={n_results} hybrid={}", query_text.is_some());
+        debug!(
+            "query {collection}: limit={n_results} prefetch={prefetch_limit} hybrid={}",
+            query_text.is_some()
+        );
         let builder = if let (Some(text), Some(bm25)) = (query_text, bm25) {
-            // Hybrid RRF: dense + sparse prefetch, fused.
             let sparse_vecs = bm25
                 .embed_sparse(&[text])
                 .context("BM25 sparse embed during query")?;
             let sparse = sparse_vecs.into_iter().next().unwrap_or_default();
             let sparse_tuples = sparse.to_tuples();
 
+            let mut dense_pf = PrefetchQueryBuilder::default()
+                .query(query_dense.to_vec())
+                .using("dense")
+                .limit(prefetch_limit);
+            let mut sparse_pf = PrefetchQueryBuilder::default()
+                .query(sparse_tuples)
+                .using("sparse")
+                .limit(prefetch_limit);
+            if let Some(f) = filter.clone() {
+                dense_pf = dense_pf.filter(f.clone());
+                sparse_pf = sparse_pf.filter(f);
+            }
+
             let mut b = QueryPointsBuilder::new(collection)
-                .add_prefetch(
-                    PrefetchQueryBuilder::default()
-                        .query(query_dense.to_vec())
-                        .using("dense")
-                        .limit(limit),
-                )
-                .add_prefetch(
-                    PrefetchQueryBuilder::default()
-                        .query(sparse_tuples)
-                        .using("sparse")
-                        .limit(limit),
-                )
+                .add_prefetch(dense_pf)
+                .add_prefetch(sparse_pf)
                 .query(Fusion::Rrf)
                 .limit(limit)
                 .with_payload(true);
-            if let Some(f) = filter.clone() {
+            if let Some(f) = filter {
                 b = b.filter(f);
             }
             b
         } else {
-            // Dense-only fallback.
             let mut b = QueryPointsBuilder::new(collection)
                 .query(query_dense.to_vec())
                 .using("dense")
                 .limit(limit)
                 .with_payload(true);
-            if let Some(f) = filter.clone() {
+            if let Some(f) = filter {
                 b = b.filter(f);
             }
             b

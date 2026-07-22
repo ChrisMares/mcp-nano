@@ -6,7 +6,6 @@ use anyhow::Result;
 use serde::Serialize;
 use sqlx::SqlitePool;
 use tauri::{AppHandle, Emitter};
-use tokio::sync::Mutex;
 use tracing::error;
 
 /// A future returned by a [`ProgressCallback`] that, when awaited, persists

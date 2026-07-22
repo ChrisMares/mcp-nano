@@ -45,9 +45,6 @@ const IGNORED_DOMAINS: &[&str] = &[
     "sharethis.com", "disqus.com",
 ];
 
-/// Tags whose content is treated as noise and removed before scraping.
-const NOISE_TAGS: &[&str] = &["script", "style", "nav", "footer", "header", "aside"];
-
 /// Tag names that emit a leaf text section.
 const LEAF_TEXT_TAGS: &[&str] = &[
     "p", "li", "h3", "h4", "h5", "h6", "td", "th", "blockquote", "figcaption",

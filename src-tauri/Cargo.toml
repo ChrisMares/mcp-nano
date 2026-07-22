@@ -14,6 +14,12 @@ edition = "2021"
 name = "mcp_nano_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+default = []
+# Requires the CUDA toolkit at build time. At runtime the application falls
+# back to CPU when no compatible NVIDIA device/driver is available.
+cuda = ["candle-core/cuda"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -81,4 +87,3 @@ tempfile = "3.27.0"
 portpicker = "0.1.1"
 
 [dev-dependencies]
-

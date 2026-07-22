@@ -19,7 +19,7 @@ import WebsiteProcessingStep from "@/components/uploadfiles/WebsiteProcessingSte
 import JobStatusPanel from "@/components/uploadfiles/JobStatusPanel";
 import type { EmbedJob } from "@/types/embed";
 
-const isZipFile = (f: File) => f.name.toLowerCase().endsWith(".zip");
+const isZipFile = (f: { name: string }) => f.name.toLowerCase().endsWith(".zip");
 
 const urlToGroupName = (raw: string): string => {
   try {

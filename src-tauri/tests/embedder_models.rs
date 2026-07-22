@@ -14,6 +14,7 @@ mod common;
 
 use common::{cosine, dense_ready, reranker_ready};
 use mcp_nano_lib::services::embedders::{EncodeDocuments, EncodeQuery};
+use mcp_nano_lib::services::embedder_state::EmbedderState;
 
 #[test]
 fn encode_query_returns_expected_dimension_vector() {
@@ -114,4 +115,20 @@ fn empty_documents_returns_empty_scores() {
     };
     let scores = r.rerank("anything", &[], 4).expect("rerank empty");
     assert!(scores.is_empty());
+}
+
+#[test]
+fn embedder_state_reports_selected_device() {
+    let models_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/models");
+    if !models_dir.join("arctic-embed-xs/model.safetensors").exists()
+        || !models_dir.join("minilm-l6-v2/model.safetensors").exists()
+    {
+        eprintln!("skipping: embedding models not downloaded; run scripts/download-models.sh");
+        return;
+    }
+
+    let state = EmbedderState::load(&models_dir).expect("load embedder state");
+    assert!(state.device_mode().starts_with("CPU") || state.device_mode() == "CUDA (GPU)");
+    let embedding = state.dense.encode_query("GPU device selection test").expect("encode query");
+    assert_eq!(embedding.len(), state.dense.dim());
 }

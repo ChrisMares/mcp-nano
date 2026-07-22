@@ -26,3 +26,15 @@ pub struct EmbedderStatusResponse {
     pub bm25_loaded: bool,
     pub models_dir: String,
 }
+
+#[derive(Debug, Default, Serialize)]
+pub struct BackendStatusResponse {
+    pub qdrant_ready: bool,
+    pub qdrant_error: Option<String>,
+    pub http_port: Option<u16>,
+    pub grpc_port: Option<u16>,
+    pub db_ready: bool,
+    pub embedders_ready: bool,
+    pub embedding_device: Option<String>,
+    pub worker_ready: bool,
+}

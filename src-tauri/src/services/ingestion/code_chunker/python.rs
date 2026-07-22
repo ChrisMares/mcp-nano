@@ -21,7 +21,7 @@ const DECLARATION_NODE_TYPES: &[&str] = &[
 pub fn extract_dependencies<'a>(root: Node<'a>, source: &[u8]) -> Vec<String> {
     let mut deps: Vec<String> = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    let mut add = |dep: String, deps: &mut Vec<String>, seen: &mut std::collections::HashSet<String>| {
+    let add = |dep: String, deps: &mut Vec<String>, seen: &mut std::collections::HashSet<String>| {
         if !dep.is_empty() && seen.insert(dep.clone()) {
             deps.push(dep);
         }
@@ -492,7 +492,7 @@ fn is_pep_613_alias<'a>(node: &Node<'a>, source: &[u8]) -> bool {
         .unwrap_or(false)
 }
 
-fn is_named_lambda_assignment<'a>(node: &Node<'a>, source: &[u8]) -> bool {
+fn is_named_lambda_assignment<'a>(node: &Node<'a>, _source: &[u8]) -> bool {
     let Some(assignment) = assignment(node) else { return false };
     let left = assignment.child_by_field_name("left");
     let right = assignment.child_by_field_name("right");

@@ -99,8 +99,7 @@ fn collect_references<'a>(
     seen: &mut HashSet<String>,
 ) {
     if node.kind() == "object_reference" {
-        if let Some(parent) = node.parent() {
-            // Find the previous named sibling of the parent's children.
+        if node.parent().is_some() {
             if let Some(prev) = prev_named_sibling(node) {
                 if prev.kind() == "keyword_references" {
                     if let Some(name) = extract_object_name(node, source) {

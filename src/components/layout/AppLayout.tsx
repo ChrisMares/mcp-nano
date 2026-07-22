@@ -1,6 +1,7 @@
 import { SidebarProvider, useSidebar } from "@/contexts/SidebarContext";
 import { Outlet } from "react-router-dom";
 import AppHeader from "./AppHeader";
+import BackendStatusBanner from "./BackendStatusBanner";
 import Backdrop from "./Backdrop";
 import AppSidebar from "./AppSidebar";
 
@@ -19,6 +20,7 @@ const LayoutContent: React.FC = () => {
         } ${isMobileOpen ? "ml-0" : ""}`}
       >
         <AppHeader />
+        <BackendStatusBanner />
         <div className="p-4 mx-auto max-w-(--breakpoint-2xl) md:p-6">
           <Outlet />
         </div>
