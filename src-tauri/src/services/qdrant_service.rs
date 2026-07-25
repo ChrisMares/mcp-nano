@@ -144,9 +144,18 @@ impl QdrantService {
                 .iter()
                 .map(|s| s.as_str())
                 .collect();
-            let sparse_vecs = bm25
-                .embed_sparse(&doc_refs)
-                .context("BM25 sparse embed during upsert")?;
+            let sparse_vecs = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                bm25.embed_sparse(&doc_refs)
+            }))
+            .map_err(|_| anyhow!("BM25 sparse embed panicked during upsert"))?
+            .context("BM25 sparse embed during upsert")?;
+            if sparse_vecs.len() != doc_refs.len() {
+                return Err(anyhow!(
+                    "BM25 sparse embed length mismatch: got {} for {} docs",
+                    sparse_vecs.len(),
+                    doc_refs.len()
+                ));
+            }
 
             let mut points = Vec::with_capacity(chunk_end - chunk_start);
             for (i, sparse) in sparse_vecs.iter().enumerate() {

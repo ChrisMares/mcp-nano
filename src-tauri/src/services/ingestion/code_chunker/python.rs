@@ -547,7 +547,7 @@ fn type_alias_name<'a>(node: &Node<'a>, source: &[u8]) -> String {
 }
 
 fn source_text<'a>(node: &Node<'a>, source: &[u8]) -> String {
-    String::from_utf8_lossy(&source[node.start_byte()..node.end_byte()]).into_owned()
+    node_text(&node, source)
 }
 
 #[allow(clippy::too_many_arguments)]

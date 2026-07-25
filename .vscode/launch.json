@@ -16,7 +16,8 @@
       "cwd": "${workspaceFolder}",
       "preLaunchTask": "ui:dev",
       "env": {
-        "RUST_LOG": "info",
+        "RUST_LOG": "info,mcp_nano_lib=debug",
+        "RUST_BACKTRACE": "1",
         "ORT_CUDA_VERSION": "12"
       }
     },
@@ -33,7 +34,8 @@
       "cwd": "${workspaceFolder}",
       "preLaunchTask": "ui:dev",
       "env": {
-        "RUST_LOG": "info",
+        "RUST_LOG": "info,mcp_nano_lib=debug",
+        "RUST_BACKTRACE": "1",
         "MCP_NANO_DEVICE": "cpu"
       }
     },
@@ -53,7 +55,8 @@
       "cwd": "${workspaceFolder}",
       "preLaunchTask": "ui:build",
       "env": {
-        "RUST_LOG": "info",
+        "RUST_LOG": "info,mcp_nano_lib=debug",
+        "RUST_BACKTRACE": "1",
         "ORT_CUDA_VERSION": "12"
       }
     }

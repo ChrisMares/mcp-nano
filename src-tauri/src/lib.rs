@@ -17,25 +17,165 @@ use controllers::{data, jobs, mcpconfig, rag, website};
 use mcp::{McpAppState, McpState};
 
 // ---------------------------------------------------------------------------
-// Logging: debug builds → synchronous stderr (visible in terminal);
+// Logging: debug builds → stderr + rotating file under app data `logs/`;
 //          release builds → async flexi_logger to file (unchanged).
 // ---------------------------------------------------------------------------
 
+/// Directory used for app logs and crash breadcrumbs. Set during `init_logging`.
+static LOG_DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+pub fn log_dir() -> Option<&'static std::path::PathBuf> {
+    LOG_DIR.get()
+}
+
+/// Write a single-line breadcrumb that survives panics (flushed). Overwrites
+/// `logs/ingest-current.txt` so the last in-flight stage is always visible.
+pub fn write_ingest_breadcrumb(stage: &str, detail: &str) {
+    let Some(dir) = LOG_DIR.get() else {
+        return;
+    };
+    let path = dir.join("ingest-current.txt");
+    let line = format!(
+        "{}\t{}\t{}\n",
+        chrono_lite_now(),
+        stage,
+        detail.replace('\n', " ")
+    );
+    if let Ok(mut f) = std::fs::File::create(&path) {
+        use std::io::Write;
+        let _ = f.write_all(line.as_bytes());
+        let _ = f.flush();
+    }
+}
+
+fn chrono_lite_now() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("{secs}")
+}
+
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown".into());
+        let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "unknown panic payload".into()
+        };
+        let thread = std::thread::current();
+        let thread_name = thread.name().unwrap_or("<unnamed>");
+        let breadcrumb = LOG_DIR
+            .get()
+            .and_then(|d| std::fs::read_to_string(d.join("ingest-current.txt")).ok())
+            .unwrap_or_default();
+        let bt = std::backtrace::Backtrace::force_capture();
+        let dump = format!(
+            "=== mcp-nano panic ===\n\
+             time_unix={}\n\
+             thread={thread_name}\n\
+             location={location}\n\
+             payload={payload}\n\
+             ingest_breadcrumb:\n{breadcrumb}\n\
+             backtrace:\n{bt}\n",
+            chrono_lite_now()
+        );
+        eprintln!("{dump}");
+        if let Some(dir) = LOG_DIR.get() {
+            let path = dir.join("last-panic.log");
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                use std::io::Write;
+                let _ = writeln!(f, "{dump}");
+                let _ = f.flush();
+            }
+        }
+        default_hook(info);
+    }));
+}
+
 #[cfg(debug_assertions)]
-fn init_logging(_app: &tauri::AppHandle) {
-    use std::sync::OnceLock;
+fn init_logging(app: &tauri::AppHandle) {
+    use std::fs::OpenOptions;
+    use std::io::{self, Write};
+    use std::sync::{Arc, Mutex, OnceLock};
     use tracing_subscriber::{fmt, EnvFilter};
 
     static INIT: OnceLock<()> = OnceLock::new();
     INIT.get_or_init(|| {
         let log_level =
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "debug".to_string());
+            std::env::var("RUST_LOG").unwrap_or_else(|_| "info,mcp_nano_lib=debug".to_string());
+
+        let mut file_writer: Option<Arc<Mutex<std::fs::File>>> = None;
+        if let Ok(data_dir) = app.path().app_local_data_dir() {
+            let log_dir = data_dir.join("logs");
+            if std::fs::create_dir_all(&log_dir).is_ok() {
+                let _ = LOG_DIR.set(log_dir.clone());
+                let log_path = log_dir.join("mcp-nano-debug.log");
+                match OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&log_path)
+                {
+                    Ok(f) => {
+                        file_writer = Some(Arc::new(Mutex::new(f)));
+                        eprintln!(
+                            "[mcp-nano] debug log file: {} (level={log_level})",
+                            log_path.display()
+                        );
+                    }
+                    Err(e) => eprintln!("[mcp-nano] failed to open debug log file: {e}"),
+                }
+            }
+        }
+
+        install_panic_hook();
+
+        #[derive(Clone)]
+        struct TeeWriter {
+            file: Option<Arc<Mutex<std::fs::File>>>,
+        }
+
+        impl Write for TeeWriter {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                let _ = io::stderr().write_all(buf);
+                if let Some(f) = &self.file {
+                    if let Ok(mut g) = f.lock() {
+                        let _ = g.write_all(buf);
+                    }
+                }
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                let _ = io::stderr().flush();
+                if let Some(f) = &self.file {
+                    if let Ok(mut g) = f.lock() {
+                        let _ = g.flush();
+                    }
+                }
+                Ok(())
+            }
+        }
+
+        let make = TeeWriter { file: file_writer };
         fmt()
             .with_env_filter(EnvFilter::new(&log_level))
             .with_timer(fmt::time::SystemTime)
-            .with_writer(std::io::stderr)
+            .with_writer(move || make.clone())
+            .with_ansi(false)
             .init();
-        let _ = eprintln!("[mcp-nano] logging initialized (level={log_level})");
+        info!("logging initialized (debug, dual stderr+file)");
     });
 }
 
@@ -59,6 +199,8 @@ mod prod_logging {
         if let Ok(data_dir) = app.path().app_local_data_dir() {
             let log_dir = data_dir.join("logs");
             if std::fs::create_dir_all(&log_dir).is_ok() {
+                let _ = crate::LOG_DIR.set(log_dir.clone());
+                crate::install_panic_hook();
                 match Logger::try_with_str("info")
                     .unwrap()
                     .log_to_file(
@@ -88,6 +230,7 @@ mod prod_logging {
                 return;
             }
         }
+        crate::install_panic_hook();
         if let Ok(handle) = Logger::try_with_str("info")
             .unwrap()
             .format_for_stderr(flexi_logger::detailed_format)

@@ -79,7 +79,7 @@ fn extract_impl<'a>(
         let class_name = find_enclosing_class_name(node, source).or(qualified_class);
         let namespace = find_nearest_namespace(node, source);
         let code =
-            String::from_utf8_lossy(&source[node.start_byte()..node.end_byte()]).into_owned();
+            node_text(&node, source);
 
         chunks.push(make_chunk(
             file_path,
@@ -111,8 +111,7 @@ fn extract_impl<'a>(
                 if let Some(sibling_id) = sibling_id {
                     let type_name = Some(node_text(&sibling_id, source));
                     let namespace = find_nearest_namespace(node, source);
-                    let code = String::from_utf8_lossy(&source[parent.start_byte()..parent.end_byte()])
-                        .into_owned();
+                    let code = node_text(&parent, source);
                     chunks.push(make_chunk(
                         file_path,
                         None,
@@ -138,7 +137,7 @@ fn extract_impl<'a>(
         let type_name = name_node.map(|n| node_text(&n, source));
         let namespace = find_nearest_namespace(node, source);
         let code =
-            String::from_utf8_lossy(&source[node.start_byte()..node.end_byte()]).into_owned();
+            node_text(&node, source);
         if let Some(type_name) = type_name.filter(|s| !s.is_empty()) {
             chunks.push(make_chunk(
                 file_path,

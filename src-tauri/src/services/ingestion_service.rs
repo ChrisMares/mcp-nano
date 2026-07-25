@@ -1,7 +1,9 @@
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
+use futures_util::FutureExt;
 use serde::Deserialize;
 use text_splitter::{ChunkConfig, TextSplitter};
 use tokenizers::Tokenizer;
@@ -30,6 +32,41 @@ const MAX_CHUNK_CHARS: usize = 6_000;
 const UPSERT_BATCH_SIZE: usize = 250;
 /// Batch size for dense embedding forward passes.
 const EMBED_BATCH_SIZE: usize = 16;
+
+fn panic_payload_to_string(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
+    }
+}
+
+/// Run a sync closure, converting panics into `Err` so batch jobs can skip
+/// one bad unit of work instead of aborting the whole task.
+fn catch_sync_panic<T>(label: &str, f: impl FnOnce() -> T) -> Result<T> {
+    std::panic::catch_unwind(AssertUnwindSafe(f)).map_err(|payload| {
+        let msg = panic_payload_to_string(&payload);
+        error!("{label} panicked: {msg}");
+        anyhow!("{label} panicked: {msg}")
+    })
+}
+
+/// Await a future, converting panics into `Err`.
+async fn catch_async_panic<F, T>(label: &str, fut: F) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    match AssertUnwindSafe(fut).catch_unwind().await {
+        Ok(result) => result,
+        Err(payload) => {
+            let msg = panic_payload_to_string(&payload);
+            error!("{label} panicked: {msg}");
+            Err(anyhow!("{label} panicked: {msg}"))
+        }
+    }
+}
 
 /// Map a 0-based batch index into `[range_start, range_end]` percent.
 pub fn map_batch_progress(
@@ -175,6 +212,19 @@ impl IngestionService {
         file_paths.sort();
 
         let total_files = file_paths.len().max(1);
+        info!(
+            "process_zip_upload: {} ingestible file(s) under {}",
+            file_paths.len(),
+            extract_dir.display()
+        );
+        crate::write_ingest_breadcrumb(
+            "zip_scan_complete",
+            &format!(
+                "files={} extract_dir={}",
+                file_paths.len(),
+                extract_dir.display()
+            ),
+        );
         let mut processed = 0usize;
         let mut errors: Vec<String> = Vec::new();
         for (idx, path) in file_paths.iter().enumerate() {
@@ -183,7 +233,30 @@ impl IngestionService {
                 .and_then(|n| n.to_str())
                 .unwrap_or("unknown")
                 .to_string();
+            let rel = path
+                .strip_prefix(&extract_dir)
+                .unwrap_or(path.as_path())
+                .display()
+                .to_string();
             let (file_start, file_end) = zip_file_progress_bounds(idx, total_files);
+            info!(
+                "process_zip_upload: file {}/{} pct={}-{} path={}",
+                idx + 1,
+                total_files,
+                file_start,
+                file_end,
+                rel
+            );
+            crate::write_ingest_breadcrumb(
+                "zip_file_start",
+                &format!(
+                    "{}/{} pct={} path={}",
+                    idx + 1,
+                    total_files,
+                    file_start,
+                    rel
+                ),
+            );
             progress(
                 file_start,
                 Some(format!(
@@ -195,8 +268,10 @@ impl IngestionService {
             )
             .await;
 
-            let result = self
-                .ingest_text_file_with_range(
+            // One bad file must not abort the whole zip job.
+            let result = catch_async_panic(
+                &format!("ingest {rel}"),
+                self.ingest_text_file_with_range(
                     path,
                     &collection,
                     repo_name_for_dispatch,
@@ -204,13 +279,40 @@ impl IngestionService {
                     &progress,
                     file_start,
                     file_end,
-                )
-                .await;
+                ),
+            )
+            .await;
             match result {
-                Ok(n) => processed += n,
-                Err(e) => errors.push(format!("{file_name}: {e:#}")),
+                Ok(n) => {
+                    processed += n;
+                    debug!(
+                        "process_zip_upload: ok file={rel} chunks={n} running_total={processed}"
+                    );
+                }
+                Err(e) => {
+                    error!("process_zip_upload: skip file={rel}: {e:#}");
+                    crate::write_ingest_breadcrumb(
+                        "zip_file_error",
+                        &format!("{rel}: {e:#}"),
+                    );
+                    errors.push(format!("{rel}: {e:#}"));
+                    progress(
+                        file_end.min(99),
+                        Some(format!(
+                            "Skipped {} ({}/{})",
+                            file_name,
+                            idx + 1,
+                            total_files
+                        )),
+                    )
+                    .await;
+                }
             }
         }
+        crate::write_ingest_breadcrumb(
+            "zip_complete",
+            &format!("processed_chunks={processed} errors={}", errors.len()),
+        );
         progress(100, Some("Processing complete".to_string())).await;
 
         // Cleanup extraction dir + zip.
@@ -254,8 +356,9 @@ impl IngestionService {
         let collection = p.collection.unwrap_or_else(|| "general".to_string());
         self.qdrant.ensure_collection(&collection).await?;
 
-        let n = self
-            .ingest_text_file_with_range(
+        let n = catch_async_panic(
+            &format!("document {}", p.path),
+            self.ingest_text_file_with_range(
                 Path::new(&p.path),
                 &collection,
                 None,
@@ -268,8 +371,9 @@ impl IngestionService {
                 &progress,
                 10,
                 95,
-            )
-            .await?;
+            ),
+        )
+        .await?;
 
         let _ = std::fs::remove_file(&p.path);
 
@@ -302,8 +406,9 @@ impl IngestionService {
         }
         self.qdrant.ensure_collection(&p.collection).await?;
 
-        let n = self
-            .ingest_text_file_with_range(
+        let n = catch_async_panic(
+            &format!("code file {}", p.path),
+            self.ingest_text_file_with_range(
                 Path::new(&p.path),
                 &p.collection,
                 p.repo_name.as_deref(),
@@ -316,8 +421,9 @@ impl IngestionService {
                 &progress,
                 10,
                 95,
-            )
-            .await?;
+            ),
+        )
+        .await?;
 
         let _ = std::fs::remove_file(&p.path);
         progress(100, Some("Code file processing complete".to_string())).await;
@@ -346,14 +452,24 @@ impl IngestionService {
             base_metadata.insert(k.clone(), v.clone());
         }
 
-        let chunks = ingestion::website::process_website(&p.urls, &base_metadata)
-            .await
-            .context("scraping + chunking website pages")?;
+        let chunks = catch_async_panic(
+            "website scrape",
+            async {
+                ingestion::website::process_website(&p.urls, &base_metadata)
+                    .await
+                    .context("scraping + chunking website pages")
+            },
+        )
+        .await?;
         if chunks.is_empty() {
             return Err(anyhow!("No content extracted from any URL"));
         }
         progress(30, Some(format!("Embedding {} chunks", chunks.len()))).await;
-        let n = self.embed_and_upsert_documents(&chunks, "general", None, &progress, 30, 100).await?;
+        let n = catch_async_panic(
+            "website embed",
+            self.embed_and_upsert_documents(&chunks, "general", None, &progress, 30, 100),
+        )
+        .await?;
         progress(100, Some("Website embedding complete".to_string())).await;
         Ok(format!("Embedded {n} chunks from {} page(s)", p.urls.len()))
     }
@@ -430,31 +546,59 @@ impl IngestionService {
         .await;
 
         let path_buf = path.to_path_buf();
+        let path_display = path.display().to_string();
         let is_code = ingestion::code_chunker::is_code_file(path);
         let chunks: Vec<ingestion::DocumentChunk> = if is_code {
             progress(chunk_pct, Some(format!("Chunking code in {display}"))).await;
-            let code_chunks = ingestion::code_chunker::chunk_file_to_documents(
-                &path_buf,
-                repo_name.unwrap_or(""),
-                strip_job_prefix(&file_name).as_deref(),
-                &self.code_splitter,
-                CODE_CHUNK_SIZE,
+            crate::write_ingest_breadcrumb("chunk_code", &path_display);
+            let repo = repo_name.unwrap_or("");
+            let name_override = strip_job_prefix(&file_name);
+            let code_chunks = catch_sync_panic(&format!("code chunker {path_display}"), || {
+                ingestion::code_chunker::chunk_file_to_documents(
+                    &path_buf,
+                    repo,
+                    name_override.as_deref(),
+                    &self.code_splitter,
+                    CODE_CHUNK_SIZE,
+                )
+            })?;
+            debug!(
+                "ingest: chunked code {} -> {} chunk(s)",
+                path_display,
+                code_chunks.len()
             );
             enforce_max_chunk_chars(code_chunks)
         } else {
-            // pdftotext / docx / etc. are sync and can block for a long time.
+            crate::write_ingest_breadcrumb("load_document", &path_display);
+            let path_for_load = path_buf.clone();
             let loaded = tokio::task::spawn_blocking(move || {
-                ingestion::document_loaders::load_document(&path_buf)
-                    .with_context(|| format!("loading document {}", path_buf.display()))
+                catch_sync_panic(
+                    &format!("document loader {}", path_for_load.display()),
+                    || ingestion::document_loaders::load_document(&path_for_load),
+                )
+                .and_then(|r| {
+                    r.with_context(|| format!("loading document {}", path_for_load.display()))
+                })
             })
             .await
-            .map_err(|e| anyhow!("load task join error: {e}"))??;
+            .map_err(|e| {
+                if e.is_panic() {
+                    let msg = panic_payload_to_string(&e.into_panic());
+                    anyhow!("load task panicked for {path_display}: {msg}")
+                } else {
+                    anyhow!("load task join error for {path_display}: {e}")
+                }
+            })??;
 
             progress(chunk_pct, Some(format!("Chunking text from {display}"))).await;
-            split_document_chunks(loaded, &self.splitter)
+            crate::write_ingest_breadcrumb("chunk_text", &path_display);
+            catch_sync_panic(&format!("text splitter {path_display}"), || {
+                split_document_chunks(loaded, &self.splitter)
+            })?
         };
 
         if chunks.is_empty() {
+            debug!("ingest: no chunks for {path_display}");
             return Ok(0);
         }
 
@@ -466,6 +610,10 @@ impl IngestionService {
             )),
         )
         .await;
+        crate::write_ingest_breadcrumb(
+            "embed_start",
+            &format!("path={path_display} chunks={}", chunks.len()),
+        );
 
         let extra_meta = build_base_metadata(&file_name, &doc_type, repo_name, options);
         let n = self
@@ -477,7 +625,12 @@ impl IngestionService {
                 range_start,
                 range_end,
             )
-            .await?;
+            .await
+            .with_context(|| format!("embed/upsert failed for {path_display}"))?;
+        crate::write_ingest_breadcrumb(
+            "embed_done",
+            &format!("path={path_display} chunks={n}"),
+        );
         Ok(n)
     }
 
@@ -511,7 +664,10 @@ impl IngestionService {
         if chunks.is_empty() {
             return Ok(0);
         }
-        debug!("embed_and_upsert: {} chunks → {collection} [{range_start}..{range_end}]", chunks.len());
+        info!(
+            "embed_and_upsert: {} chunks → {collection} [{range_start}..{range_end}]",
+            chunks.len()
+        );
 
         let texts: Vec<String> = chunks
             .iter()
@@ -526,11 +682,33 @@ impl IngestionService {
             let batch_start = (batch_index as usize) * EMBED_BATCH_SIZE;
             let batch_end = (batch_start + EMBED_BATCH_SIZE).min(chunks.len());
             let batch_texts: Vec<&str> = chunk_refs[batch_start..batch_end].to_vec();
-            let batch_embeddings = self
-                .embedders
-                .dense
-                .encode_documents(&batch_texts, EMBED_BATCH_SIZE)
-                .with_context(|| format!("encoding batch {}/{}", batch_index + 1, total_batches))?;
+            crate::write_ingest_breadcrumb(
+                "embed_batch",
+                &format!(
+                    "collection={collection} batch={}/{} size={}",
+                    batch_index + 1,
+                    total_batches,
+                    batch_texts.len()
+                ),
+            );
+            let batch_embeddings = catch_sync_panic(
+                &format!("dense encode batch {}/{}", batch_index + 1, total_batches),
+                || {
+                    self.embedders
+                        .dense
+                        .encode_documents(&batch_texts, EMBED_BATCH_SIZE)
+                },
+            )?
+            .with_context(|| format!("encoding batch {}/{}", batch_index + 1, total_batches))?;
+            if batch_embeddings.len() != batch_texts.len() {
+                return Err(anyhow!(
+                    "dense encode batch {}/{}: got {} vectors for {} texts",
+                    batch_index + 1,
+                    total_batches,
+                    batch_embeddings.len(),
+                    batch_texts.len()
+                ));
+            }
             for e in batch_embeddings {
                 embeddings_list.push(e);
             }
@@ -569,6 +747,10 @@ impl IngestionService {
             .collect();
 
         progress(range_end, Some(format!("Upserting {} chunks to Qdrant", chunks.len()))).await;
+        crate::write_ingest_breadcrumb(
+            "upsert",
+            &format!("collection={collection} chunks={}", chunks.len()),
+        );
 
         self.qdrant
             .upsert_items(
@@ -649,7 +831,8 @@ fn hard_split_chars(text: &str, max_chars: usize) -> Vec<String> {
     out
 }
 
-/// Paths we never want in the vector DB (vendor, maps, binaries, minified).
+/// Paths we never want in the vector DB (vendor, maps, binaries, minified,
+/// test fixtures). Used for zip walks and single-file guards.
 pub fn should_skip_ingest_path(path: &Path) -> bool {
     if is_image_ext(path) {
         return true;
@@ -665,7 +848,6 @@ pub fn should_skip_ingest_path(path: &Path) -> bool {
         .unwrap_or("")
         .to_ascii_lowercase();
 
-    // Source maps, fonts, binaries, lockfiles, package metadata noise.
     const SKIP_EXTS: &[&str] = &[
         "map", "css", "scss", "sass", "less", "woff", "woff2", "ttf", "otf", "eot",
         "ico", "svg", "gif", "webp", "bmp", "mp3", "mp4", "wav", "zip", "gz", "tar",
@@ -674,7 +856,6 @@ pub fn should_skip_ingest_path(path: &Path) -> bool {
     if SKIP_EXTS.contains(&ext.as_str()) {
         return true;
     }
-    // Minified JS/CSS bundles (even if extension is .js).
     if name.ends_with(".min.js")
         || name.ends_with(".min.mjs")
         || name.ends_with(".min.cjs")
@@ -683,7 +864,6 @@ pub fn should_skip_ingest_path(path: &Path) -> bool {
     {
         return true;
     }
-    // Common junk filenames.
     if matches!(
         name.as_str(),
         "package-lock.json"
@@ -697,24 +877,38 @@ pub fn should_skip_ingest_path(path: &Path) -> bool {
     ) {
         return true;
     }
-    // Path segment filters.
-    let path_l = path.to_string_lossy().to_ascii_lowercase();
+
+    // Normalize separators so segment checks work on Windows and Unix paths.
+    let path_l = path
+        .to_string_lossy()
+        .to_ascii_lowercase()
+        .replace('\\', "/");
+    let padded = format!("/{path_l}/");
     for seg in [
         "/node_modules/",
-        "\\node_modules\\",
         "/.git/",
-        "\\/.git\\",
         "/dist/",
-        "\\dist\\",
         "/build/",
-        "\\build\\",
         "/target/",
-        "\\target\\",
         "/.vs/",
         "/bin/",
         "/obj/",
+        // Test / fixture noise dominates large library zips (e.g. Chart.js)
+        // and is rarely useful for code-search RAG.
+        "/test/",
+        "/tests/",
+        "/__tests__/",
+        "/spec/",
+        "/specs/",
+        "/fixtures/",
+        "/.github/",
+        "/coverage/",
+        "/.nyc_output/",
+        "/vendor/",
+        "/third_party/",
+        "/third-party/",
     ] {
-        if path_l.contains(seg) {
+        if padded.contains(seg) {
             return true;
         }
     }
@@ -1081,6 +1275,83 @@ mod tests {
         assert!(!should_skip_ingest_path(Path::new("src/OptionsService.cs")));
         assert!(!should_skip_ingest_path(Path::new("README.md")));
         assert!(!should_skip_ingest_path(Path::new("app.js")));
+    }
+
+    #[test]
+    fn should_skip_test_and_fixture_paths() {
+        assert!(should_skip_ingest_path(Path::new(
+            "Chart.js-4.5.1/test/fixtures/controller.radar/radius/indexable.js"
+        )));
+        assert!(should_skip_ingest_path(Path::new(
+            "repo/tests/unit/foo.rs"
+        )));
+        assert!(should_skip_ingest_path(Path::new(
+            "pkg/__tests__/button.tsx"
+        )));
+        assert!(should_skip_ingest_path(Path::new(
+            "lib/spec/helpers.js"
+        )));
+        assert!(should_skip_ingest_path(Path::new(
+            "proj/.github/workflows/ci.yml"
+        )));
+        assert!(should_skip_ingest_path(Path::new(
+            r"repo\test\fixtures\a.js"
+        )));
+        // Real source must still ingest.
+        assert!(!should_skip_ingest_path(Path::new(
+            "Chart.js-4.5.1/src/core/core.controller.js"
+        )));
+        assert!(!should_skip_ingest_path(Path::new(
+            "src/services/ingestion_service.rs"
+        )));
+    }
+
+    #[test]
+    fn catch_sync_panic_converts_panic_to_err() {
+        let ok = catch_sync_panic("ok", || 42).unwrap();
+        assert_eq!(ok, 42);
+        let err = catch_sync_panic("boom", || -> i32 { panic!("kaboom") }).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("panicked"), "{msg}");
+        assert!(msg.contains("kaboom"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn catch_async_panic_converts_panic_to_err() {
+        let ok = catch_async_panic("ok", async { Ok::<_, anyhow::Error>(7) })
+            .await
+            .unwrap();
+        assert_eq!(ok, 7);
+        let err = catch_async_panic("async-boom", async {
+            panic!("async kaboom");
+            #[allow(unreachable_code)]
+            Ok::<_, anyhow::Error>(0)
+        })
+        .await
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("panicked"), "{msg}");
+        assert!(msg.contains("async kaboom"), "{msg}");
+    }
+
+    #[test]
+    fn hard_split_chars_respects_char_boundaries() {
+        let s = "a😀b😀c";
+        let parts = hard_split_chars(s, 2);
+        assert!(parts.len() >= 2);
+        let rejoined: String = parts.concat();
+        assert_eq!(rejoined, s);
+        for p in &parts {
+            assert!(p.chars().count() <= 2, "piece too long: {p:?}");
+        }
+    }
+
+    #[test]
+    fn map_batch_progress_clamps_and_advances() {
+        assert_eq!(map_batch_progress(0, 100, 0, 4), 25);
+        assert_eq!(map_batch_progress(0, 100, 3, 4), 100);
+        assert_eq!(map_batch_progress(50, 50, 0, 1), 50);
+        assert_eq!(map_batch_progress(10, 20, 0, 0), 20); // total_batches max(1)
     }
 
     #[test]

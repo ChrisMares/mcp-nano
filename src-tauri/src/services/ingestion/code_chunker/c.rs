@@ -296,7 +296,7 @@ fn extract_impl<'a>(
         let parameters = extract_parameters(parameters_node.as_ref(), source);
         let return_type = extract_return_type(node, source);
         let code =
-            String::from_utf8_lossy(&source[node.start_byte()..node.end_byte()]).into_owned();
+            node_text(&node, source);
         chunks.push(make_chunk(
             file_path,
             function_name,

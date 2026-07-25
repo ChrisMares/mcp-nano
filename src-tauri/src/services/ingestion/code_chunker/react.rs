@@ -155,7 +155,7 @@ fn extract_functional_component<'a>(
         collect_hooks(&body, source, &mut hooks_set);
     }
     let hooks_used: Vec<String> = hooks_set.into_iter().collect();
-    let code = String::from_utf8_lossy(&source[node.start_byte()..node.end_byte()]).into_owned();
+    let code = node_text(&node, source);
     chunks.push(create_chunk(
         file_path,
         Some(component_name.clone()),
@@ -198,7 +198,7 @@ fn extract_functional_component_from_declarator<'a>(
         collect_hooks(&body, source, &mut hooks_set);
     }
     let hooks_used: Vec<String> = hooks_set.into_iter().collect();
-    let code = String::from_utf8_lossy(&source[declarator.start_byte()..declarator.end_byte()]).into_owned();
+    let code = node_text(&declarator, source);
     let exported = declarator
         .parent()
         .map(|p| is_exported(&p))
@@ -235,7 +235,7 @@ fn extract_inner_functions<'a>(
                 let func_name = node_text(&name_node, source);
                 let parameters_node = child.child_by_field_name("parameters");
                 let props = extract_props(parameters_node.as_ref(), source);
-                let func_code = String::from_utf8_lossy(&source[child.start_byte()..child.end_byte()]).into_owned();
+                let func_code = node_text(&child, source);
                 let body_node = child.child_by_field_name("body");
                 let mut hooks_set = std::collections::HashSet::new();
                 if let Some(body) = body_node {
@@ -265,7 +265,7 @@ fn extract_inner_functions<'a>(
                     if let (Some(name_node), Some(initializer)) = (name_node, initializer) {
                         if matches!(initializer.kind(), "arrow_function" | "function_expression") {
                             let func_name = node_text(&name_node, source);
-                            let func_code = String::from_utf8_lossy(&source[declarator.start_byte()..declarator.end_byte()]).into_owned();
+                            let func_code = node_text(&declarator, source);
                             let parameters_node = initializer.child_by_field_name("parameters");
                             let props = extract_props(parameters_node.as_ref(), source);
                             let body_node = initializer.child_by_field_name("body");
@@ -314,7 +314,7 @@ fn extract_class_component<'a>(
             }
         }
     }
-    let code = String::from_utf8_lossy(&source[node.start_byte()..node.end_byte()]).into_owned();
+    let code = node_text(&node, source);
     chunks.push(create_chunk(
         file_path,
         Some(component_name),
@@ -383,7 +383,7 @@ fn extract_react<'a>(
                     collect_hooks(&body, source, &mut hooks_set);
                 }
                 let hooks_used: Vec<String> = hooks_set.into_iter().collect();
-                let code = String::from_utf8_lossy(&source[node.start_byte()..node.end_byte()]).into_owned();
+                let code = node_text(&node, source);
                 chunks.push(create_chunk(
                     file_path,
                     Some(name),

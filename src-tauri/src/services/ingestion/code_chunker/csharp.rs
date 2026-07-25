@@ -86,7 +86,7 @@ fn extract_impl<'a>(
     let mut parameters: Vec<Parameter> = Vec::new();
     let mut return_type: Option<String> = None;
     let mut properties: Vec<Parameter> = Vec::new();
-    let mut chunk_code = String::from_utf8_lossy(&source[node.start_byte()..node.end_byte()]).into_owned();
+    let mut chunk_code = node_text(&node, source);
 
     match node.kind() {
         "method_declaration" => {
@@ -134,7 +134,7 @@ fn extract_impl<'a>(
             if let Some(n) = node.child_by_field_name("name") {
                 class_name = Some(node_text(&n, source));
             }
-            let full = String::from_utf8_lossy(&source[node.start_byte()..node.end_byte()]).into_owned();
+            let full = node_text(&node, source);
             let header = match full.find('{') {
                 Some(i) => full[..i].trim().to_string(),
                 None => full.trim().to_string(),
@@ -157,7 +157,7 @@ fn extract_impl<'a>(
                     ) {
                         properties.push(Parameter::new(node_text(&n, source), node_text(&t, source)));
                     }
-                    let pc = String::from_utf8_lossy(&source[child.start_byte()..child.end_byte()]).into_owned();
+                    let pc = node_text(&child, source);
                     property_codes.push(pc);
                 }
             }

@@ -185,7 +185,7 @@ fn extract_impl<'a>(
         };
         let class_name = find_enclosing_class_name(node, source);
         let code =
-            String::from_utf8_lossy(&source[node.start_byte()..node.end_byte()]).into_owned();
+            node_text(&node, source);
         chunks.push(make_chunk(
             file_path,
             function_name,
@@ -204,7 +204,7 @@ fn extract_impl<'a>(
         let name_node = node.child_by_field_name("name");
         let type_name = name_node.map(|n| node_text(&n, source));
         let code =
-            String::from_utf8_lossy(&source[node.start_byte()..node.end_byte()]).into_owned();
+            node_text(&node, source);
         chunks.push(make_chunk(
             file_path,
             None,

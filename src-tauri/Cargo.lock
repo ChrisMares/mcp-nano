@@ -3302,6 +3302,7 @@ dependencies = [
  "docx-lite",
  "dotenvy",
  "flexi_logger",
+ "futures-util",
  "globset",
  "libchm",
  "ort",

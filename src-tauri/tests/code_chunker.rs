@@ -677,3 +677,42 @@ fn generic_fallback_and_oversized_split() {
     assert_eq!(passthrough[0].id, "small-1");
 }
 
+// ---------------------------------------------------------------------------
+// Chart.js fixture that previously hung/panicked mid zip ingest (file 585/1068)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn chartjs_radar_radius_indexable_chunks_without_panic() {
+    let path = sample("chartjs_radar_radius_indexable.js");
+    assert!(path.is_file(), "missing fixture {}", path.display());
+
+    let code_chunks = chunk_file(&path, "Chart.js-4.5.1");
+    assert!(
+        !code_chunks.is_empty(),
+        "expected at least one code chunk from chartjs fixture"
+    );
+    assert!(code_chunks.iter().all(|c| c.repo_name == "Chart.js-4.5.1"));
+    assert!(code_chunks
+        .iter()
+        .all(|c| c.file_name == "chartjs_radar_radius_indexable.js"));
+
+    let docs = code_chunker::chunk_file_to_documents(
+        &path,
+        "Chart.js-4.5.1",
+        None,
+        &code_splitter(),
+        768,
+    );
+    assert!(!docs.is_empty(), "chunk_file_to_documents returned no docs");
+    let joined: String = docs.iter().map(|d| d.content.as_str()).collect();
+    assert!(joined.contains("radar"), "missing radar marker: {joined}");
+    assert!(
+        joined.contains("pointRadius"),
+        "missing pointRadius marker: {joined}"
+    );
+    assert!(
+        joined.contains("module.exports"),
+        "missing module.exports marker: {joined}"
+    );
+}
+

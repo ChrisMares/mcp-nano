@@ -406,16 +406,23 @@ pub fn build_remainder_code(source_bytes: &[u8], spans: &[(usize, usize)]) -> St
     if spans.is_empty() {
         return String::from_utf8_lossy(source_bytes).into_owned();
     }
+    let len = source_bytes.len();
     let merged = merge_spans(spans);
     let mut parts: Vec<&[u8]> = Vec::new();
     let mut last_end = 0usize;
     for &(start, end) in &merged {
+        let start = start.min(len);
+        let end = end.min(len);
+        if start < last_end {
+            last_end = last_end.max(end);
+            continue;
+        }
         if start > last_end {
             parts.push(&source_bytes[last_end..start]);
         }
         last_end = last_end.max(end);
     }
-    if last_end < source_bytes.len() {
+    if last_end < len {
         parts.push(&source_bytes[last_end..]);
     }
     let combined: Vec<u8> = parts.concat();
@@ -453,10 +460,18 @@ pub fn make_remainder_chunk(
     Some(chunk)
 }
 
+/// Lossy UTF-8 decode of `source[start..end]`. Returns empty string when the
+/// range is invalid (never panics on OOB tree-sitter spans).
+pub fn byte_slice_text(source: &[u8], start: usize, end: usize) -> String {
+    if start > end || end > source.len() {
+        return String::new();
+    }
+    String::from_utf8_lossy(&source[start..end]).into_owned()
+}
+
 /// Decode a tree-sitter node's text as UTF-8 (lossy). Mirrors `node_text`.
 pub fn node_text<'a>(node: &Node<'a>, source_bytes: &[u8]) -> String {
-    let bytes = &source_bytes[node.start_byte()..node.end_byte()];
-    String::from_utf8_lossy(bytes).into_owned()
+    byte_slice_text(source_bytes, node.start_byte(), node.end_byte())
 }
 
 /// For JS/TS `variable_declarator` nodes, expand the removal span to the
@@ -593,6 +608,23 @@ mod tests {
         let spans = vec![(5, 9), (13, 17)];
         let remainder = build_remainder_code(source, &spans);
         assert_eq!(remainder, "AAAAACCCC");
+    }
+
+    #[test]
+    fn build_remainder_tolerates_out_of_bounds_spans() {
+        let source = b"hello";
+        let remainder = build_remainder_code(source, &[(0, 2), (100, 200), (3, 999)]);
+        assert_eq!(remainder, "l");
+    }
+
+    #[test]
+    fn byte_slice_text_never_panics_on_bad_ranges() {
+        let src = b"abcdef";
+        assert_eq!(byte_slice_text(src, 0, 3), "abc");
+        assert_eq!(byte_slice_text(src, 3, 3), "");
+        assert_eq!(byte_slice_text(src, 4, 2), "");
+        assert_eq!(byte_slice_text(src, 0, 100), "");
+        assert_eq!(byte_slice_text(src, 50, 60), "");
     }
 
     #[test]

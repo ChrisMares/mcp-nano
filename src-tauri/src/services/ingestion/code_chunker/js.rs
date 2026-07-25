@@ -163,7 +163,7 @@ fn extract_impl<'a>(
             let function_name = node_text(&name_node, source);
             let parameters_node = node.child_by_field_name("parameters");
             let parameters = extract_parameters(parameters_node.as_ref(), source);
-            let code = String::from_utf8_lossy(&source[node.start_byte()..node.end_byte()]).into_owned();
+            let code = node_text(node, source);
             chunks.push(make_chunk(
                 file_path,
                 Some(function_name),
@@ -186,7 +186,7 @@ fn extract_impl<'a>(
             let parameters_node = node.child_by_field_name("parameters");
             let parameters = extract_parameters(parameters_node.as_ref(), source);
             let class_name = find_enclosing_class_name(node, source);
-            let code = String::from_utf8_lossy(&source[node.start_byte()..node.end_byte()]).into_owned();
+            let code = node_text(node, source);
             chunks.push(make_chunk(
                 file_path,
                 Some(function_name),
@@ -211,7 +211,7 @@ fn extract_impl<'a>(
                 let function_name = node_text(&name_node, source);
                 let parameters_node = init.child_by_field_name("parameters");
                 let parameters = extract_parameters(parameters_node.as_ref(), source);
-                let code = String::from_utf8_lossy(&source[node.start_byte()..node.end_byte()]).into_owned();
+                let code = node_text(node, source);
                 chunks.push(make_chunk(
                     file_path,
                     Some(function_name),

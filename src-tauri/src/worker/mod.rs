@@ -15,7 +15,7 @@ use sqlx::SqlitePool;
 use tauri::AppHandle;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use crate::models::entities::JobStatus;
 
@@ -110,6 +110,17 @@ async fn run_loop(
                                 .unwrap_or(serde_json::Value::Null);
                             let pool_for_fail = pool.clone();
                             let app_for_fail = app.clone();
+                            info!(
+                                "worker starting job_id={job_id} task={:?} file={:?}",
+                                job.task_name, job.file_name
+                            );
+                            crate::write_ingest_breadcrumb(
+                                "job_start",
+                                &format!(
+                                    "job_id={job_id} task={:?} file={:?}",
+                                    job.task_name, job.file_name
+                                ),
+                            );
                             let inner = tokio::spawn(async move {
                                 run_job(&pool, &registry, job, app).await;
                             });
@@ -122,6 +133,10 @@ async fn run_loop(
                                     format!("task cancelled: {join_err}")
                                 };
                                 error!("worker task panicked for {job_id}: {msg}");
+                                crate::write_ingest_breadcrumb(
+                                    "job_panic",
+                                    &format!("job_id={job_id} {msg}"),
+                                );
                                 if let Some(app) = app_for_fail.as_ref() {
                                     progress::emit_job_event(
                                         app,
@@ -410,7 +425,6 @@ pub async fn reset_running_to_pending(pool: &SqlitePool) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::worker::progress::noop_progress;
     use sqlx::Row;
 
     /// Open a SqlitePool against a fresh tempdir + run migrations.

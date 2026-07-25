@@ -207,7 +207,7 @@ fn extract_impl<'a>(
         let class_name = find_enclosing_impl_type(node, source);
         let namespace = find_nearest_module(node, source);
         let code =
-            String::from_utf8_lossy(&source[node.start_byte()..node.end_byte()]).into_owned();
+            node_text(&node, source);
         chunks.push(make_chunk(
             file_path,
             function_name,
@@ -227,7 +227,7 @@ fn extract_impl<'a>(
         let type_name = name_node.map(|n| node_text(&n, source));
         let namespace = find_nearest_module(node, source);
         let code =
-            String::from_utf8_lossy(&source[node.start_byte()..node.end_byte()]).into_owned();
+            node_text(&node, source);
         chunks.push(make_chunk(
             file_path,
             None,

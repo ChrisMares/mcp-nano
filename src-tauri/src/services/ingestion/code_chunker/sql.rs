@@ -13,7 +13,7 @@ use std::collections::HashSet;
 use regex::Regex;
 use tree_sitter::Node;
 
-use super::helpers::{build_remainder_code, generate_chunk_id, node_text};
+use super::helpers::{build_remainder_code, generate_chunk_id, node_text, byte_slice_text};
 use crate::services::ingestion::types::{CodeChunk, CodeChunkKind, SqlFields};
 
 // Tree-sitter statement types that get their own chunk (Phase 1).
@@ -273,7 +273,7 @@ fn extract_chunks_impl<'a>(
     if node.kind() == "ERROR" {
         if let Some(parent) = node.parent() {
             if parent.kind() == "program" {
-                let code = String::from_utf8_lossy(&source[node.start_byte()..node.end_byte()]).into_owned();
+                let code = node_text(&node, source);
                 let stmt_type = infer_statement_type(&code);
                 let (schema, obj_name) = infer_schema_and_object_name(&code);
                 let id = generate_chunk_id(file_path, &obj_name.clone().unwrap_or("unknown".to_string()));
@@ -325,7 +325,7 @@ fn emit_chunk<'a>(
             end_byte = next_sib.end_byte();
         }
     }
-    let code = String::from_utf8_lossy(&source[stmt_node.start_byte()..end_byte]).into_owned();
+    let code = byte_slice_text(source, stmt_node.start_byte(), end_byte);
 
     let mut schema_name: Option<String> = None;
     let mut object_name: Option<String> = None;

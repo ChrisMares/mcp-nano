@@ -427,7 +427,10 @@ pub fn chunk_file_to_documents(
     splitter: &text_splitter::TextSplitter<tokenizers::Tokenizer>,
     max_chunk_tokens: usize,
 ) -> Vec<DocumentChunk> {
-    let chunks = chunk_single_code_file(file_path, repo_name, file_name_override, splitter, max_chunk_tokens);
+    // Callers (zip ingest) wrap this in catch_unwind so a language-parser
+    // panic becomes a per-file error rather than killing the whole job.
+    let chunks =
+        chunk_single_code_file(file_path, repo_name, file_name_override, splitter, max_chunk_tokens);
     let split = oversized::split_oversized_code_chunks(chunks, splitter);
     code_chunks_to_document_chunks(split)
 }
