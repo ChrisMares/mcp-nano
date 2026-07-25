@@ -11,7 +11,7 @@ use tree_sitter::Node;
 
 use super::helpers::{
     generate_chunk_id, get_declarator_removal_span, make_remainder_chunk, node_text,
-    strip_js_import_source,
+    strip_js_import_source, walk_preorder,
 };
 use crate::services::ingestion::types::{CodeChunk, CodeChunkKind, JavaScriptFields, Parameter};
 
@@ -22,8 +22,7 @@ const METHOD_TYPES: &[&str] = &["method_definition"];
 pub fn extract_dependencies<'a>(root: Node<'a>, source: &[u8]) -> Vec<String> {
     let mut deps: Vec<String> = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    let mut stack: Vec<Node<'a>> = vec![root];
-    while let Some(node) = stack.pop() {
+    walk_preorder(root, |node| {
         if node.kind() == "import_statement" || node.kind() == "import_declaration" {
             if let Some(src) = node.child_by_field_name("source") {
                 let dep = strip_js_import_source(&node_text(&src, source).trim());
@@ -32,11 +31,7 @@ pub fn extract_dependencies<'a>(root: Node<'a>, source: &[u8]) -> Vec<String> {
                 }
             }
         }
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            stack.push(child);
-        }
-    }
+    });
     deps
 }
 

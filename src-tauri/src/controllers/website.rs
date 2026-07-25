@@ -17,7 +17,7 @@ use uuid::Uuid;
 use crate::db::DbState;
 use crate::models::response::{CrawlResponse, EmbedWebsiteResponse};
 use crate::services::ingestion;
-use crate::worker::progress::now_iso;
+use crate::worker::progress::{emit_job_event, now_iso, JobProgressEvent};
 
 #[tauri::command]
 pub async fn crawl_website(
@@ -47,23 +47,39 @@ pub async fn embed_website(
     };
     let job_id = Uuid::new_v4().to_string();
     let now = now_iso();
+    let display_name = urls
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "website".to_string());
     let task_params = json!({
         "urls": urls,
         "group": group_str,
     });
     let params_str = serde_json::to_string(&task_params).unwrap_or_else(|_| "{}".to_string());
     sqlx::query(
-        "INSERT INTO job_status (job_id, status, created_at, updated_at, progress_percentage, task_name, task_params) \
-         VALUES (?, 'PENDING', ?, ?, 0, ?, ?)",
+        "INSERT INTO job_status (job_id, status, created_at, updated_at, progress_percentage, task_name, task_params, file_name) \
+         VALUES (?, 'PENDING', ?, ?, 0, ?, ?, ?)",
     )
     .bind(&job_id)
     .bind(&now)
     .bind(&now)
     .bind("process_website_scrape")
     .bind(&params_str)
+    .bind(&display_name)
     .execute(&pool)
     .await
     .map_err(|e| format!("inserting job_status: {e}"))?;
+    emit_job_event(
+        &app,
+        "job_queued",
+        &JobProgressEvent::new(
+            job_id.clone(),
+            0,
+            "PENDING",
+            Some(display_name),
+            Some("Queued".to_string()),
+        ),
+    );
     Ok(EmbedWebsiteResponse {
         job_id,
         url_count: urls.len() as i64,

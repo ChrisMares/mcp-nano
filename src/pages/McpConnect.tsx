@@ -1,5 +1,4 @@
 import React, { useState, useEffect, useCallback } from "react";
-import { useAuth } from "@/hooks/useAuth";
 import { getMcpServers, getMcpConnectionInfo } from "@/utils/apicalls";
 import { Loader2 } from "lucide-react";
 import ExpandableCard from "@/components/mcp/ExpandableCard";
@@ -9,7 +8,6 @@ import type { McpServer, ConnectionInfo } from "@/types/mcp";
 import { card, alertError, loader } from "@/styles/classes";
 
 const McpConnect: React.FC = () => {
-  const { user } = useAuth();
   const [servers, setServers] = useState<McpServer[]>([]);
   const [expandedServerId, setExpandedServerId] = useState<string | null>(null);
   const [connectionInfoMap, setConnectionInfoMap] = useState<Record<string, ConnectionInfo>>({});
@@ -17,12 +15,11 @@ const McpConnect: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!user) return;
     getMcpServers()
       .then((res) => setServers(res?.servers || []))
       .catch(() => setError("Failed to load servers"))
       .finally(() => setLoading(false));
-  }, [user]);
+  }, []);
 
   // Auto-expand and fetch connection info when there's exactly one server
   useEffect(() => {
@@ -55,8 +52,6 @@ const McpConnect: React.FC = () => {
       }
     }
   }, [expandedServerId, connectionInfoMap]);
-
-  if (!user) return null;
 
   return (
     <div className={card}>

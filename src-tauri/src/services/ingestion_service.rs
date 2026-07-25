@@ -21,12 +21,37 @@ const DEFAULT_CHUNK_SIZE: usize = 768;
 /// Default overlap between chunks (matches the Python `DOC_CHUNK_OVERLAP = 50`).
 const DEFAULT_CHUNK_OVERLAP: usize = 50;
 /// Default chunk size in tokens for code chunks before splitting oversized
-/// chunks (matches Python `CODE_CHUNK_SIZE = 1024`).
-const CODE_CHUNK_SIZE: usize = 1024;
+/// chunks (matches Python `CODE_CHUNK_SIZE = 768`).
+const CODE_CHUNK_SIZE: usize = 768;
+/// Hard ceiling on stored chunk text. Token splitters can still emit huge
+/// pieces for single-line minified blobs; we force-split by characters after.
+const MAX_CHUNK_CHARS: usize = 6_000;
 /// Batch size for Qdrant upserts.
 const UPSERT_BATCH_SIZE: usize = 250;
 /// Batch size for dense embedding forward passes.
 const EMBED_BATCH_SIZE: usize = 16;
+
+/// Map a 0-based batch index into `[range_start, range_end]` percent.
+pub fn map_batch_progress(
+    range_start: i32,
+    range_end: i32,
+    batch_index: i32,
+    total_batches: i32,
+) -> i32 {
+    let span = (range_end - range_start).max(0);
+    let total = total_batches.max(1);
+    (range_start + (span * (batch_index + 1) / total)).clamp(0, 100)
+}
+
+/// Overall zip progress for file `idx` of `total_files` within the post-extract
+/// band `[20, 100)`.
+pub fn zip_file_progress_bounds(idx: usize, total_files: usize) -> (i32, i32) {
+    let n = total_files.max(1) as i32;
+    let i = idx as i32;
+    let start = 20 + (80 * i) / n;
+    let end = 20 + (80 * (i + 1)) / n;
+    (start, end.max(start + 1).min(99))
+}
 
 /// End-to-end ingestion pipeline: chunk text, embed via the dense model,
 /// and upsert into Qdrant with hybrid (dense + BM25 sparse) vectors.
@@ -40,7 +65,7 @@ pub struct IngestionService {
     qdrant: QdrantService,
     splitter: TextSplitter<Tokenizer>,
     /// Second splitter used by `split_oversized_code_chunks`; mirrors the
-    /// Python `CODE_CHUNK_SIZE=1024, chunk_overlap=64` config.
+    /// Python `CODE_CHUNK_SIZE=768, chunk_overlap=64` config.
     code_splitter: TextSplitter<Tokenizer>,
 }
 
@@ -101,14 +126,37 @@ impl IngestionService {
             .unwrap_or_else(|| "general".to_string());
         self.qdrant.ensure_collection(&collection).await?;
 
-        // For codebase uploads, propagate repo_name; for general uploads,
-        // stamp zip_filename into metadata so Phase 5 can delete-by-zip on
-        // re-upload.
+        // For codebase uploads, default repo_name to the zip basename (minus
+        // `.zip`) when the client did not supply one. Stamp zip_filename into
+        // metadata so re-uploads / deletes can target the zip.
         let mut embedding_options = p.embedding_options;
         if let Some(zf) = &p.zip_filename {
-            let meta = embedding_options.metadata.get_or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+            let meta = embedding_options
+                .metadata
+                .get_or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
             if let serde_json::Value::Object(map) = meta {
-                map.insert("zip_filename".to_string(), serde_json::Value::String(zf.clone()));
+                map.insert(
+                    "zip_filename".to_string(),
+                    serde_json::Value::String(zf.clone()),
+                );
+            }
+        }
+        if collection == "codebase" {
+            let needs_default = embedding_options
+                .repo_name
+                .as_ref()
+                .map(|s| s.trim().is_empty())
+                .unwrap_or(true);
+            if needs_default {
+                if let Some(zf) = p.zip_filename.as_deref().filter(|s| !s.is_empty()) {
+                    let default_name = repo_name_from_zip_filename(zf);
+                    if !default_name.is_empty() {
+                        info!(
+                            "process_zip_upload: defaulting repo_name to {default_name} from zip"
+                        );
+                        embedding_options.repo_name = Some(default_name);
+                    }
+                }
             }
         }
         let repo_name_for_dispatch = if collection == "codebase" {
@@ -117,31 +165,45 @@ impl IngestionService {
             None
         };
 
-        // Walk extracted files and dispatch.
+        let mut file_paths: Vec<PathBuf> = walkdir::WalkDir::new(&extract_dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+            .map(|e| e.into_path())
+            .filter(|p| !should_skip_ingest_path(p))
+            .collect();
+        file_paths.sort();
+
+        let total_files = file_paths.len().max(1);
         let mut processed = 0usize;
         let mut errors: Vec<String> = Vec::new();
-        for entry in walkdir::WalkDir::new(&extract_dir).into_iter().filter_map(|e| e.ok()) {
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let path = entry.path();
-            // Skip images (no OCR in this build).
-            if is_image_ext(path) {
-                continue;
-            }
+        for (idx, path) in file_paths.iter().enumerate() {
             let file_name = path
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("unknown")
                 .to_string();
+            let (file_start, file_end) = zip_file_progress_bounds(idx, total_files);
+            progress(
+                file_start,
+                Some(format!(
+                    "Processing {} ({}/{})",
+                    file_name,
+                    idx + 1,
+                    total_files
+                )),
+            )
+            .await;
 
             let result = self
-                .ingest_text_file(
+                .ingest_text_file_with_range(
                     path,
                     &collection,
                     repo_name_for_dispatch,
                     &embedding_options,
                     &progress,
+                    file_start,
+                    file_end,
                 )
                 .await;
             match result {
@@ -179,7 +241,11 @@ impl IngestionService {
             })
             .context("deserializing process_documents_upload params")?;
         info!("process_documents_upload: path={} group={:?}", p.path, p.group);
-        progress(1, Some("Starting document processing".to_string())).await;
+        let display = Path::new(&p.path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("document");
+        progress(5, Some(format!("Loading {display}"))).await;
 
         if !Path::new(&p.path).exists() {
             error!("process_documents_upload: path does not exist: {}", p.path);
@@ -188,9 +254,8 @@ impl IngestionService {
         let collection = p.collection.unwrap_or_else(|| "general".to_string());
         self.qdrant.ensure_collection(&collection).await?;
 
-        progress(70, Some(format!("Embedding chunks from {}", p.path))).await;
         let n = self
-            .ingest_text_file(
+            .ingest_text_file_with_range(
                 Path::new(&p.path),
                 &collection,
                 None,
@@ -201,10 +266,11 @@ impl IngestionService {
                     metadata: p.metadata.clone(),
                 },
                 &progress,
+                10,
+                95,
             )
             .await?;
 
-        // Cleanup: remove the processed file (matches Python behavior).
         let _ = std::fs::remove_file(&p.path);
 
         progress(100, Some("Document processing complete".to_string())).await;
@@ -224,7 +290,11 @@ impl IngestionService {
             })
             .context("deserializing process_code_file_upload params")?;
         info!("process_code_file_upload: path={} collection={}", p.path, p.collection);
-        progress(1, Some("Starting code file processing".to_string())).await;
+        let display = Path::new(&p.path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("code");
+        progress(5, Some(format!("Loading {display}"))).await;
 
         if !Path::new(&p.path).exists() {
             error!("process_code_file_upload: path does not exist: {}", p.path);
@@ -232,9 +302,8 @@ impl IngestionService {
         }
         self.qdrant.ensure_collection(&p.collection).await?;
 
-        progress(20, Some(format!("Embedding chunks from {}", p.path))).await;
         let n = self
-            .ingest_text_file(
+            .ingest_text_file_with_range(
                 Path::new(&p.path),
                 &p.collection,
                 p.repo_name.as_deref(),
@@ -245,6 +314,8 @@ impl IngestionService {
                     metadata: p.metadata.clone(),
                 },
                 &progress,
+                10,
+                95,
             )
             .await?;
 
@@ -271,9 +342,6 @@ impl IngestionService {
 
         let mut base_metadata = serde_json::Map::new();
         base_metadata.insert("group".into(), serde_json::Value::String(p.group.clone()));
-        if let Some(user_id) = p.user_id {
-            base_metadata.insert("user_id".into(), serde_json::Value::String(user_id));
-        }
         for (k, v) in p.metadata.unwrap_or_default().as_object().into_iter().flatten() {
             base_metadata.insert(k.clone(), v.clone());
         }
@@ -325,49 +393,90 @@ impl IngestionService {
     /// upserted. Dispatches code files (by extension) through the language-
     /// specific chunkers; everything else goes through `document_loaders`
     /// then the text-splitter.
-    async fn ingest_text_file(
+    async fn ingest_text_file_with_range(
         &self,
         path: &Path,
         collection: &str,
         repo_name: Option<&str>,
         options: &EmbeddingOptions,
         progress: &crate::worker::ProgressCallback,
+        range_start: i32,
+        range_end: i32,
     ) -> Result<usize> {
+        if should_skip_ingest_path(path) {
+            return Ok(0);
+        }
         let file_name = path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("unknown")
             .to_string();
+        let display = strip_job_prefix(&file_name)
+            .unwrap_or_else(|| file_name.clone());
         let doc_type = path
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("txt")
             .to_lowercase();
 
-        // Code chunker dispatch: returns DocumentChunks with per-language
-        // metadata baked into the `metadata` field.
-        let chunks: Vec<ingestion::DocumentChunk> = if ingestion::code_chunker::is_code_file(path) {
-            ingestion::code_chunker::chunk_file_to_documents(
-                path,
+        // Load + chunk are CPU-bound and can take minutes on large PDFs.
+        // Report distinct stages so the UI is not frozen on one percentage.
+        let load_pct = (range_start.saturating_sub(5)).max(5).min(range_start);
+        let chunk_pct = load_pct.saturating_add(2).min(range_start);
+        progress(
+            load_pct,
+            Some(format!("Extracting text from {display}")),
+        )
+        .await;
+
+        let path_buf = path.to_path_buf();
+        let is_code = ingestion::code_chunker::is_code_file(path);
+        let chunks: Vec<ingestion::DocumentChunk> = if is_code {
+            progress(chunk_pct, Some(format!("Chunking code in {display}"))).await;
+            let code_chunks = ingestion::code_chunker::chunk_file_to_documents(
+                &path_buf,
                 repo_name.unwrap_or(""),
                 strip_job_prefix(&file_name).as_deref(),
                 &self.code_splitter,
                 CODE_CHUNK_SIZE,
-            )
+            );
+            enforce_max_chunk_chars(code_chunks)
         } else {
-            // Document loaders return 1+ chunks per file. Tokenize further
-            // using the doc splitter if a single chunk exceeds the limit.
-            let loaded = ingestion::document_loaders::load_document(path)
-                .with_context(|| format!("loading document {}", path.display()))?;
+            // pdftotext / docx / etc. are sync and can block for a long time.
+            let loaded = tokio::task::spawn_blocking(move || {
+                ingestion::document_loaders::load_document(&path_buf)
+                    .with_context(|| format!("loading document {}", path_buf.display()))
+            })
+            .await
+            .map_err(|e| anyhow!("load task join error: {e}"))??;
+
+            progress(chunk_pct, Some(format!("Chunking text from {display}"))).await;
             split_document_chunks(loaded, &self.splitter)
         };
+
         if chunks.is_empty() {
             return Ok(0);
         }
 
+        progress(
+            range_start,
+            Some(format!(
+                "Embedding {} chunk(s) from {display}",
+                chunks.len()
+            )),
+        )
+        .await;
+
         let extra_meta = build_base_metadata(&file_name, &doc_type, repo_name, options);
         let n = self
-            .embed_and_upsert_documents_inner(&chunks, collection, extra_meta, progress, 0, 100)
+            .embed_and_upsert_documents_inner(
+                &chunks,
+                collection,
+                extra_meta,
+                progress,
+                range_start,
+                range_end,
+            )
             .await?;
         Ok(n)
     }
@@ -403,7 +512,6 @@ impl IngestionService {
             return Ok(0);
         }
         debug!("embed_and_upsert: {} chunks → {collection} [{range_start}..{range_end}]", chunks.len());
-        let span = (range_end - range_start).max(0);
 
         let texts: Vec<String> = chunks
             .iter()
@@ -426,9 +534,9 @@ impl IngestionService {
             for e in batch_embeddings {
                 embeddings_list.push(e);
             }
-            let pct = range_start + (span * (batch_index + 1) / total_batches);
+            let pct = map_batch_progress(range_start, range_end, batch_index, total_batches);
             progress(
-                pct.min(100),
+                pct,
                 Some(format!(
                     "Embedding batches {}/{}",
                     batch_index + 1,
@@ -482,6 +590,10 @@ impl IngestionService {
 /// input chunk whose `content` exceeds the splitter's chunk size becomes a
 /// sequence of smaller chunks inheriting the same metadata. Used by
 /// `IngestionService::ingest_text_file` for non-code uploads.
+///
+/// After the token splitter, any remaining piece larger than
+/// [`MAX_CHUNK_CHARS`] is hard-split by character count (minified one-liners
+/// often don't break under the token splitter alone).
 pub fn split_document_chunks(
     chunks: Vec<ingestion::DocumentChunk>,
     splitter: &TextSplitter<Tokenizer>,
@@ -492,19 +604,121 @@ pub fn split_document_chunks(
     let mut out: Vec<ingestion::DocumentChunk> = Vec::new();
     for chunk in chunks {
         let parts: Vec<String> = splitter.chunks(&chunk.content).map(String::from).collect();
-        if parts.len() <= 1 {
-            out.push(chunk);
-            continue;
-        }
-        for (i, sub) in parts.into_iter().enumerate() {
-            let mut child = chunk.clone();
-            child.id = Uuid::new_v4().to_string();
-            child.content = sub;
-            child.chunk_index = chunk.chunk_index + i as i64;
-            out.push(child);
+        let parts = if parts.is_empty() {
+            vec![chunk.content.clone()]
+        } else {
+            parts
+        };
+        let mut local_idx = 0i64;
+        for sub in parts {
+            for piece in hard_split_chars(&sub, MAX_CHUNK_CHARS) {
+                let mut child = chunk.clone();
+                child.id = Uuid::new_v4().to_string();
+                child.content = piece;
+                child.chunk_index = chunk.chunk_index + local_idx;
+                local_idx += 1;
+                out.push(child);
+            }
         }
     }
     out
+}
+
+/// Force-split `text` into pieces of at most `max_chars` (char boundary safe).
+fn hard_split_chars(text: &str, max_chars: usize) -> Vec<String> {
+    if max_chars == 0 {
+        return vec![text.to_string()];
+    }
+    if text.chars().count() <= max_chars {
+        return vec![text.to_string()];
+    }
+    let mut out = Vec::new();
+    let mut buf = String::with_capacity(max_chars);
+    let mut n = 0usize;
+    for ch in text.chars() {
+        if n >= max_chars {
+            out.push(std::mem::take(&mut buf));
+            n = 0;
+        }
+        buf.push(ch);
+        n += 1;
+    }
+    if !buf.is_empty() {
+        out.push(buf);
+    }
+    out
+}
+
+/// Paths we never want in the vector DB (vendor, maps, binaries, minified).
+pub fn should_skip_ingest_path(path: &Path) -> bool {
+    if is_image_ext(path) {
+        return true;
+    }
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    // Source maps, fonts, binaries, lockfiles, package metadata noise.
+    const SKIP_EXTS: &[&str] = &[
+        "map", "css", "scss", "sass", "less", "woff", "woff2", "ttf", "otf", "eot",
+        "ico", "svg", "gif", "webp", "bmp", "mp3", "mp4", "wav", "zip", "gz", "tar",
+        "7z", "rar", "bin", "exe", "dll", "so", "dylib", "pdb", "lock", "sum",
+    ];
+    if SKIP_EXTS.contains(&ext.as_str()) {
+        return true;
+    }
+    // Minified JS/CSS bundles (even if extension is .js).
+    if name.ends_with(".min.js")
+        || name.ends_with(".min.mjs")
+        || name.ends_with(".min.cjs")
+        || name.ends_with(".bundle.js")
+        || name.ends_with(".min.css")
+    {
+        return true;
+    }
+    // Common junk filenames.
+    if matches!(
+        name.as_str(),
+        "package-lock.json"
+            | "yarn.lock"
+            | "pnpm-lock.yaml"
+            | "cargo.lock"
+            | "composer.lock"
+            | "go.sum"
+            | ".ds_store"
+            | "thumbs.db"
+    ) {
+        return true;
+    }
+    // Path segment filters.
+    let path_l = path.to_string_lossy().to_ascii_lowercase();
+    for seg in [
+        "/node_modules/",
+        "\\node_modules\\",
+        "/.git/",
+        "\\/.git\\",
+        "/dist/",
+        "\\dist\\",
+        "/build/",
+        "\\build\\",
+        "/target/",
+        "\\target\\",
+        "/.vs/",
+        "/bin/",
+        "/obj/",
+    ] {
+        if path_l.contains(seg) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Strip the job-id UUID prefix from a temp filename (mirrors the Python
@@ -564,8 +778,25 @@ fn build_base_metadata(
 fn strip_zip_ext(zip_path: &str) -> String {
     if let Some(stripped) = zip_path.strip_suffix(".zip") {
         stripped.to_string()
+    } else if let Some(stripped) = zip_path.strip_suffix(".ZIP") {
+        stripped.to_string()
     } else {
         zip_path.to_string()
+    }
+}
+
+/// Default repo name for a codebase zip: basename of the zip file without the
+/// trailing `.zip` (case-insensitive).
+pub fn repo_name_from_zip_filename(zip_filename: &str) -> String {
+    let base = std::path::Path::new(zip_filename)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(zip_filename);
+    let lower = base.to_ascii_lowercase();
+    if let Some(stripped) = lower.strip_suffix(".zip") {
+        base[..stripped.len()].to_string()
+    } else {
+        base.to_string()
     }
 }
 
@@ -574,6 +805,29 @@ fn is_image_ext(path: &Path) -> bool {
         path.extension().and_then(|e| e.to_str()).map(|s| s.to_lowercase()).as_deref(),
         Some("png") | Some("jpg") | Some("jpeg")
     )
+}
+
+fn enforce_max_chunk_chars(
+    chunks: Vec<ingestion::DocumentChunk>,
+) -> Vec<ingestion::DocumentChunk> {
+    let mut out = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        if chunk.content.chars().count() <= MAX_CHUNK_CHARS {
+            out.push(chunk);
+            continue;
+        }
+        for (i, piece) in hard_split_chars(&chunk.content, MAX_CHUNK_CHARS)
+            .into_iter()
+            .enumerate()
+        {
+            let mut child = chunk.clone();
+            child.id = Uuid::new_v4().to_string();
+            child.content = piece;
+            child.chunk_index = chunk.chunk_index + i as i64;
+            out.push(child);
+        }
+    }
+    out
 }
 
 fn unzip_to(zip_path: &str, dest: &Path) -> Result<()> {
@@ -627,7 +881,6 @@ struct ProcessCodeFileParams {
 struct ProcessWebsiteParams {
     urls: Vec<String>,
     group: String,
-    user_id: Option<String>,
     metadata: Option<serde_json::Value>,
 }
 
@@ -640,6 +893,20 @@ mod tests {
     fn strip_zip_ext_removes_zip_suffix() {
         assert_eq!(strip_zip_ext("/tmp/foo.zip"), "/tmp/foo");
         assert_eq!(strip_zip_ext("/tmp/foo.tar"), "/tmp/foo.tar");
+    }
+
+    #[test]
+    fn repo_name_from_zip_filename_strips_extension() {
+        assert_eq!(
+            repo_name_from_zip_filename("OptionsPricing-main.zip"),
+            "OptionsPricing-main"
+        );
+        assert_eq!(repo_name_from_zip_filename("MyRepo.ZIP"), "MyRepo");
+        assert_eq!(
+            repo_name_from_zip_filename("/path/to/repo.zip"),
+            "repo"
+        );
+        assert_eq!(repo_name_from_zip_filename("noext"), "noext");
     }
 
     #[test]
@@ -657,14 +924,14 @@ mod tests {
             collection: Some("general".to_string()),
             repo_name: None,
             group: Some("docs".to_string()),
-            metadata: Some(serde_json::json!({"user_id": "u1"})),
+            metadata: Some(serde_json::json!({"source": "manual"})),
         };
         let meta = build_base_metadata("notes.txt", "txt", None, &opts);
         let map = meta.as_object().expect("metadata is object");
         assert_eq!(map.get("file_name").unwrap().as_str().unwrap(), "notes.txt");
         assert_eq!(map.get("doc_type").unwrap().as_str().unwrap(), "txt");
         assert_eq!(map.get("group").unwrap().as_str().unwrap(), "docs");
-        assert_eq!(map.get("user_id").unwrap().as_str().unwrap(), "u1");
+        assert_eq!(map.get("source").unwrap().as_str().unwrap(), "manual");
         assert!(map.get("created_at").is_some());
         assert!(map.get("repo_name").is_none());
     }
@@ -716,5 +983,112 @@ mod tests {
         let v = serde_json::json!({"zip_path": "/tmp/x.zip"});
         let err: Result<ProcessZipParams, _> = serde_json::from_value(v);
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn map_batch_progress_stays_within_range_and_is_monotonic() {
+        let start = 10;
+        let end = 95;
+        let mut prev = start - 1;
+        for i in 0..5 {
+            let pct = map_batch_progress(start, end, i, 5);
+            assert!(pct >= start, "pct {pct} < start {start}");
+            assert!(pct <= end, "pct {pct} > end {end}");
+            assert!(pct >= prev, "progress decreased: {prev} -> {pct}");
+            prev = pct;
+        }
+        assert_eq!(map_batch_progress(10, 95, 4, 5), 95);
+    }
+
+    #[test]
+    fn map_batch_progress_never_resets_below_prior_milestone() {
+        // Simulates document flow: load at 5/10, then embed 10..95.
+        let milestones = [5, 10];
+        let mut last = 0;
+        for m in milestones {
+            assert!(m >= last);
+            last = m;
+        }
+        for i in 0..8 {
+            let pct = map_batch_progress(10, 95, i, 8);
+            assert!(pct >= 10, "embed batch dropped below 10%: {pct}");
+            assert!(pct >= last);
+            last = pct;
+        }
+        assert!(last <= 95);
+    }
+
+    #[test]
+    fn zip_file_progress_bounds_cover_post_extract_band() {
+        let (s0, e0) = zip_file_progress_bounds(0, 4);
+        let (s3, e3) = zip_file_progress_bounds(3, 4);
+        assert_eq!(s0, 20);
+        assert!(e0 > s0);
+        assert!(s3 >= e0 || s3 >= 20);
+        assert!(e3 <= 99);
+        assert!(s3 < e3);
+    }
+
+    fn test_doc_splitter() -> Option<TextSplitter<Tokenizer>> {
+        let tok_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("resources/models/arctic-embed-xs/tokenizer.json");
+        if !tok_path.exists() {
+            return None;
+        }
+        let tokenizer = Tokenizer::from_file(&tok_path).ok()?;
+        let config = ChunkConfig::new(DEFAULT_CHUNK_SIZE)
+            .with_sizer(tokenizer)
+            .with_overlap(DEFAULT_CHUNK_OVERLAP)
+            .ok()?;
+        Some(TextSplitter::new(config))
+    }
+
+    /// Reproduces the OptionsPricing zip issue: source maps / minified assets
+    /// were stored as ~1MB `document` payloads. After the fix, every chunk
+    /// must stay under the hard char cap.
+    #[test]
+    fn split_document_chunks_caps_huge_minified_blob() {
+        let Some(splitter) = test_doc_splitter() else {
+            eprintln!("skipping: arctic tokenizer not present");
+            return;
+        };
+        // Single-line ~900KB blob (like a .js.map) — no natural newlines.
+        let huge = "a".repeat(900_000);
+        let chunk = ingestion::DocumentChunk::new("id1", "chart.umd.min.js.map", huge, "map", 0);
+        let split = split_document_chunks(vec![chunk], &splitter);
+        assert!(
+            !split.is_empty(),
+            "expected at least one chunk after split"
+        );
+        let max_chars = split.iter().map(|c| c.content.chars().count()).max().unwrap_or(0);
+        assert!(
+            max_chars <= MAX_CHUNK_CHARS,
+            "chunk still oversized: max_chars={max_chars} limit={MAX_CHUNK_CHARS} n_chunks={}",
+            split.len()
+        );
+        let total: usize = split.iter().map(|c| c.content.len()).sum();
+        assert!(total >= 900_000 - 100, "lost content during split: {total}");
+    }
+
+    #[test]
+    fn should_skip_ingest_junk_assets() {
+        assert!(should_skip_ingest_path(Path::new("wwwroot/chart.umd.min.js.map")));
+        assert!(should_skip_ingest_path(Path::new("bootstrap.min.css.map")));
+        assert!(should_skip_ingest_path(Path::new("open-iconic.woff")));
+        assert!(should_skip_ingest_path(Path::new("favicon.ico")));
+        assert!(should_skip_ingest_path(Path::new("lib/jquery.min.js")));
+        assert!(should_skip_ingest_path(Path::new("styles.min.css")));
+        assert!(!should_skip_ingest_path(Path::new("src/OptionsService.cs")));
+        assert!(!should_skip_ingest_path(Path::new("README.md")));
+        assert!(!should_skip_ingest_path(Path::new("app.js")));
+    }
+
+    #[test]
+    fn clamp_text_for_tokenize_limits_chars() {
+        use crate::services::embedders::dense::{clamp_text_for_tokenize, MAX_TOKENIZE_CHARS};
+        let long = "x".repeat(50_000);
+        let clamped = clamp_text_for_tokenize(&long);
+        assert!(clamped.chars().count() <= MAX_TOKENIZE_CHARS);
+        assert_eq!(clamp_text_for_tokenize("short"), "short");
     }
 }

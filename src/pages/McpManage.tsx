@@ -1,6 +1,5 @@
 import React, { useState, useEffect, useCallback } from "react";
 import { useNavigate, Link } from "react-router-dom";
-import { useAuth } from "@/hooks/useAuth";
 import { useScopeOptions } from "@/hooks/useScopeOptions";
 import {
   getMcpServers,
@@ -22,9 +21,8 @@ import { card, badge, btnDanger, btnPrimary, btnSecondary, btnDeleteSmall, alert
 type ManageMode = "list" | "add" | "edit";
 
 const McpManage: React.FC = () => {
-  const { user } = useAuth();
   const navigate = useNavigate();
-  const { repoOptions, groupOptions, websiteOptions } = useScopeOptions(user?.id);
+  const { repoOptions, groupOptions, websiteOptions } = useScopeOptions();
   const [servers, setServers] = useState<McpServer[]>([]);
   const [expandedServerId, setExpandedServerId] = useState<string | null>(null);
   const [manageMode, setManageMode] = useState<ManageMode>("list");
@@ -38,7 +36,6 @@ const McpManage: React.FC = () => {
   const [deleteToolPending, setDeleteToolPending] = useState<ToolDefinition | null>(null);
 
   const fetchServers = useCallback(async () => {
-    if (!user) return;
     try {
       const res = await getMcpServers();
       const list: McpServer[] = res?.servers || [];
@@ -58,7 +55,7 @@ const McpManage: React.FC = () => {
     } finally {
       setLoading(false);
     }
-  }, [user]);
+  }, []);
 
   const fetchServerDetail = useCallback(async (serverId: string) => {
     try {
@@ -69,9 +66,8 @@ const McpManage: React.FC = () => {
   }, []);
 
   useEffect(() => {
-    if (!user) return;
     fetchServers();
-  }, [user, fetchServers]);
+  }, [fetchServers]);
 
   // Auto-expand when there's exactly one server
   useEffect(() => {
@@ -97,7 +93,7 @@ const McpManage: React.FC = () => {
   };
 
   const handleAddTool = useCallback(async (data: ToolFormData) => {
-    if (!user || !expandedServerId) return;
+    if (!expandedServerId) return;
     setSaving(true);
     setError(null);
     setSuccess(false);
@@ -112,10 +108,10 @@ const McpManage: React.FC = () => {
     } finally {
       setSaving(false);
     }
-  }, [user, expandedServerId, fetchServerDetail]);
+  }, [expandedServerId, fetchServerDetail]);
 
   const handleUpdateTool = useCallback(async (data: ToolFormData) => {
-    if (!user || !expandedServerId || !selectedTool) return;
+    if (!expandedServerId || !selectedTool) return;
     setSaving(true);
     setError(null);
     setSuccess(false);
@@ -130,7 +126,7 @@ const McpManage: React.FC = () => {
     } finally {
       setSaving(false);
     }
-  }, [user, expandedServerId, selectedTool, fetchServerDetail]);
+  }, [expandedServerId, selectedTool, fetchServerDetail]);
 
   const handleDeleteTool = useCallback(() => {
     if (!selectedTool) return;
@@ -143,7 +139,7 @@ const McpManage: React.FC = () => {
   }, [servers, expandedServerId]);
 
   const confirmDeleteTool = useCallback(async () => {
-    if (!user || !expandedServerId || !deleteToolPending) return;
+    if (!expandedServerId || !deleteToolPending) return;
     setError(null);
     try {
       await deleteMcpTool(expandedServerId, deleteToolPending.id);
@@ -154,10 +150,10 @@ const McpManage: React.FC = () => {
     } finally {
       setDeleteToolPending(null);
     }
-  }, [user, expandedServerId, deleteToolPending, fetchServerDetail]);
+  }, [expandedServerId, deleteToolPending, fetchServerDetail]);
 
   const handleToggleToolActive = useCallback(async (tool: ToolDefinition) => {
-    if (!user || !expandedServerId) return;
+    if (!expandedServerId) return;
     setError(null);
     try {
       await toggleMcpTool(expandedServerId, tool.id, !tool.active);
@@ -165,7 +161,7 @@ const McpManage: React.FC = () => {
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "Failed to toggle tool");
     }
-  }, [user, expandedServerId, fetchServerDetail]);
+  }, [expandedServerId, fetchServerDetail]);
 
   const handleDeleteServer = useCallback((serverId: string) => {
     setDeleteConfirmServerId(serverId);
@@ -173,7 +169,7 @@ const McpManage: React.FC = () => {
   }, []);
 
   const confirmDeleteServer = useCallback(async () => {
-    if (!user || !deleteConfirmServerId) return;
+    if (!deleteConfirmServerId) return;
     setError(null);
     try {
       await deleteMcpServer(deleteConfirmServerId);
@@ -188,9 +184,7 @@ const McpManage: React.FC = () => {
       setDeleteConfirmServerId(null);
       setDeleteConfirmText("");
     }
-  }, [user, deleteConfirmServerId, expandedServerId, fetchServers]);
-
-  if (!user) return null;
+  }, [deleteConfirmServerId, expandedServerId, fetchServers]);
 
   const expandedServer = servers.find((s) => s.id === expandedServerId);
   const tools = expandedServer?.tools || [];

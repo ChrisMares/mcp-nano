@@ -4,40 +4,58 @@
     {
       "type": "lldb",
       "request": "launch",
-      "name": "Debug Tauri",
+      "name": "Tauri Development Debug (GPU)",
       "cargo": {
         "args": [
           "build",
           "--manifest-path=./src-tauri/Cargo.toml",
-          "--no-default-features"
+          "--features",
+          "gpu"
         ]
       },
+      "cwd": "${workspaceFolder}",
       "preLaunchTask": "ui:dev",
-      "cwd": "${workspaceFolder}"
+      "env": {
+        "RUST_LOG": "info",
+        "ORT_CUDA_VERSION": "12"
+      }
     },
     {
       "type": "lldb",
       "request": "launch",
-      "name": "Debug Tauri (Production)",
+      "name": "Tauri Development Debug (CPU)",
+      "cargo": {
+        "args": [
+          "build",
+          "--manifest-path=./src-tauri/Cargo.toml"
+        ]
+      },
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "ui:dev",
+      "env": {
+        "RUST_LOG": "info",
+        "MCP_NANO_DEVICE": "cpu"
+      }
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Tauri Production Debug (GPU)",
       "cargo": {
         "args": [
           "build",
           "--release",
-          "--manifest-path=./src-tauri/Cargo.toml"
+          "--manifest-path=./src-tauri/Cargo.toml",
+          "--features",
+          "gpu"
         ]
       },
-      "preLaunchTask": "ui:build",
-      "cwd": "${workspaceFolder}"
-    },
-    {
-      "type": "node",
-      "request": "launch",
-      "name": "Debug Vitest",
-      "runtimeExecutable": "${workspaceFolder}/node_modules/.bin/vitest",
-      "args": ["run"],
       "cwd": "${workspaceFolder}",
-      "console": "integratedTerminal",
-      "internalConsoleOptions": "neverOpen"
+      "preLaunchTask": "ui:build",
+      "env": {
+        "RUST_LOG": "info",
+        "ORT_CUDA_VERSION": "12"
+      }
     }
   ]
 }

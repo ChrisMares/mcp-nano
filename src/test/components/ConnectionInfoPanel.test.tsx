@@ -6,10 +6,9 @@ import type { ConnectionInfo } from '@/types/mcp'
 
 const mockInfo: ConnectionInfo = {
   mcp_url: 'http://localhost:18653/mcp',
-  user_id: 'local-user',
-  server_id: 'server-1',
-  server_name: 'TestServer',
-  full_url: 'http://localhost:18653/mcp?server_id=server-1',
+  server_id: 'test_mcp',
+  server_name: 'test_mcp',
+  full_url: 'http://localhost:18653/mcp?server_id=test_mcp',
   config_snippets: {
     claude_desktop: { url: 'http://localhost:18653/mcp' },
     opencode: { url: 'http://localhost:18653/mcp' },

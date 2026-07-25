@@ -364,6 +364,23 @@ pub fn generate_chunk_id(file_path: &str, identifier: &str) -> String {
     format!("{basename}-{identifier}-{suffix}")
 }
 
+/// Pre-order DFS over a tree-sitter node, left-to-right. Used by dependency
+/// extractors so discovery order matches Python's recursive `visit`.
+pub fn walk_preorder<'a, F>(root: Node<'a>, mut visit: F)
+where
+    F: FnMut(Node<'a>),
+{
+    let mut stack: Vec<Node<'a>> = vec![root];
+    while let Some(node) = stack.pop() {
+        visit(node);
+        let mut cursor = node.walk();
+        let children: Vec<Node<'a>> = node.children(&mut cursor).collect();
+        for child in children.into_iter().rev() {
+            stack.push(child);
+        }
+    }
+}
+
 /// Merge overlapping/adjacent byte spans. Mirrors `chunk_helpers.merge_spans`.
 pub fn merge_spans(spans: &[(usize, usize)]) -> Vec<(usize, usize)> {
     if spans.is_empty() {

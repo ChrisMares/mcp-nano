@@ -32,6 +32,7 @@ fn init_logging(_app: &tauri::AppHandle) {
             std::env::var("RUST_LOG").unwrap_or_else(|_| "debug".to_string());
         fmt()
             .with_env_filter(EnvFilter::new(&log_level))
+            .with_timer(fmt::time::SystemTime)
             .with_writer(std::io::stderr)
             .init();
         let _ = eprintln!("[mcp-nano] logging initialized (level={log_level})");
@@ -42,7 +43,9 @@ fn init_logging(_app: &tauri::AppHandle) {
 mod prod_logging {
     use std::sync::OnceLock;
 
-    use flexi_logger::{Cleanup, Criterion, Duplicate, Logger, LoggerHandle, Naming, WriteMode};
+    use flexi_logger::{
+        Cleanup, Criterion, Duplicate, FileSpec, Logger, LoggerHandle, Naming, WriteMode,
+    };
     use tauri::Manager;
     use tracing::info;
 
@@ -59,7 +62,7 @@ mod prod_logging {
                 match Logger::try_with_str("info")
                     .unwrap()
                     .log_to_file(
-                        flexi_logger::FileSpec::default()
+                        FileSpec::default()
                             .directory(&log_dir)
                             .basename("mcp-nano")
                             .suffix("log"),
@@ -71,6 +74,8 @@ mod prod_logging {
                         Cleanup::KeepLogFiles(3),
                     )
                     .write_mode(WriteMode::Async)
+                    .format_for_files(flexi_logger::detailed_format)
+                    .format_for_stderr(flexi_logger::detailed_format)
                     .duplicate_to_stderr(Duplicate::Warn)
                     .start()
                 {
@@ -85,6 +90,7 @@ mod prod_logging {
         }
         if let Ok(handle) = Logger::try_with_str("info")
             .unwrap()
+            .format_for_stderr(flexi_logger::detailed_format)
             .duplicate_to_stderr(Duplicate::Info)
             .start()
         {

@@ -102,7 +102,7 @@ src-tauri/src/
 │   ├── response/    (outgoing envelopes: *Response, ConnectionInfo, UploadJobEntry)
 │   └── entities/    (future sqlite rows: JobStatus, FileMetadata, McpServer,
 │                     ToolDefinition, ToolCodeSearchScope, ToolDocumentSearchScope)
-├── embed/           (candle models, BM25, chunking)      — Phase 2
+├── embed/           (ONNX models, BM25, chunking)        — Phase 2
 ├── worker/          (job poll loop, tasks)               — Phase 3
 ├── qdrant/          (client, sidecar lifecycle)          — Phase 4
 ├── mcp/             (axum + rmcp server)                 — Phase 6
@@ -166,9 +166,10 @@ npm run tauri dev     # dev mode: vite + hot reload + native window
 npm run tauri build   # release build + bundler (.deb/.AppImage/.msi)
 ```
 
-**GPU note:** machine has an RTX 3090 + CUDA toolkit 12.2. `candle-core` has a
-`cuda` feature that can accelerate batch embedding later. Start CPU-only
-(22M-param model is fast on CPU), evaluate the feature flag in Phase 8.
+**GPU note:** machine has an RTX 3090 + CUDA toolkit. ONNX Runtime (`ort`) has a
+`cuda` feature that enables the CUDA execution provider. Default builds are
+CPU-only (22M-param model is fast on CPU); GPU builds use
+`npm run tauri:dev:gpu` / `tauri:build:gpu` and fall back to CPU at runtime.
 
 ---
 
@@ -178,7 +179,7 @@ npm run tauri build   # release build + bundler (.deb/.AppImage/.msi)
 
 | Component | Size |
 |-----------|------|
-| Rust app code + deps (candle, axum, tokio, sqlx, reqwest, scraper) | ~25 MB |
+| Rust app code + deps (ort, axum, tokio, sqlx, reqwest, scraper) | ~25 MB |
 | Tauri shell + IPC | ~5 MB |
 | Frontend (React/Vite/Tailwind compiled) | ~3 MB |
 | Tree-sitter grammars (10 languages) | ~5 MB |
@@ -188,9 +189,9 @@ npm run tauri build   # release build + bundler (.deb/.AppImage/.msi)
 
 | Component | Size |
 |-----------|------|
-| `arctic-embed-xs/model.safetensors` + `tokenizer.json` | 86.9 MB |
-| `MiniLM-L6-v2/model.safetensors` + `tokenizer.json` | 87.4 MB |
-| BM25 tokenizer + stopwords | ~0.1 MB |
+| `arctic-embed-xs/model.onnx` + `tokenizer.json` | ~87 MB |
+| `minilm-l6-v2/model.onnx` + `tokenizer.json` | ~87 MB |
+| BM25 stopwords (in-crate) | ~0.1 MB |
 | **Resources subtotal** | **~174 MB** |
 
 **Sidecar (bundled alongside exe):**
@@ -207,8 +208,8 @@ npm run tauri build   # release build + bundler (.deb/.AppImage/.msi)
 | Compressed download (.deb / .msi / .AppImage) | ~180–200 MB |
 | Runtime memory (models mmap'd + Qdrant) | ~400 MB |
 
-Models are loaded via `memmap` (`VarBuilder::from_mmaped_safetensors`), so the
-174 MB is paged from disk on demand, not copied into RAM.
+Models are loaded as ONNX graphs via ONNX Runtime (`ort`); weights stay on disk
+and are mapped by the runtime as needed.
 
 ---
 
@@ -234,12 +235,13 @@ src-tauri/
 ├── resources/
 │   └── models/                     (git-ignored)
 │       ├── arctic-embed-xs/
-│       │   ├── model.safetensors
-│       │   └── tokenizer.json
-│       ├── minilm-l6-v2/
-│       │   ├── model.safetensors
-│       │   └── tokenizer.json
-│       └── bm25/
+│       │   ├── model.onnx
+│       │   ├── tokenizer.json
+│       │   └── config.json
+│       └── minilm-l6-v2/
+│           ├── model.onnx
+│           ├── tokenizer.json
+│           └── config.json
 └── scripts/download-models.sh      (one-time fetch from HF)
 ```
 
@@ -267,16 +269,15 @@ No hardcoded paths anywhere.
 
 | Role | Model | Architecture | Why |
 |------|-------|-------------|-----|
-| Dense embedding | `Snowflake/snowflake-arctic-embed-xs` | BERT (22M params), 512-token ctx | Tops MTEB for sub-50M models. Candle BERT native |
-| Reranker | `cross-encoder/ms-marco-MiniLM-L6-v2` | BERT SeqClass, 512-token ctx | 85M downloads, battle-tested. Candle BERT native |
-| Sparse (BM25) | Hand-rolled BM25 | Tokenizer + stopwords | ~100 lines of Rust; see note below |
-| Loading | Tauri resources + memmap at startup | Disk | Zero first-run download, fast builds |
+| Dense embedding | `Snowflake/snowflake-arctic-embed-xs` | BERT ONNX (22M params), 512-token ctx | Tops MTEB for sub-50M models. Official HF `onnx/model.onnx` |
+| Reranker | `cross-encoder/ms-marco-MiniLM-L6-v2` | BERT SeqClass ONNX, 512-token ctx | 85M downloads, battle-tested. Official HF `onnx/model.onnx` |
+| Sparse (BM25) | Hand-rolled BM25 | Alphanumeric split + stopwords | ~100 lines of Rust; see note below |
+| Loading | Tauri resources + ONNX Runtime (`ort`) | Disk | Zero first-run download; CUDA EP optional |
 
-**BM25 note:** original plan used the `fastembed` crate — rejected. It drags in
-ONNX Runtime (`ort`) as a heavy build dependency and is oriented around
-downloading its own models. BM25 is simple: tokenize with the `tokenizers`
-crate, maintain term frequencies in a `HashMap`, score with the standard
-BM25 formula. No extra native deps.
+**BM25 note:** original plan used the `fastembed` crate — rejected for bundling
+its own models and download path. BM25 is hand-rolled (simple split + English
+stopwords + TF saturation; IDF left to Qdrant). Dense/rerank inference uses
+`ort` directly with our bundled ONNX exports.
 
 **Context window note:** Both models have a 512-token limit. Chunks from the
 `text-splitter` crate (default 768 tokens) that exceed this will be split into
@@ -587,7 +588,7 @@ installation is required. A REST-only client via `reqwest` remains a fallback.
 ### Phase 2: Rust Core — Models + Embedding
 
 - `scripts/download-models.sh`; models into `src-tauri/resources/models/`
-- Wire up Candle BERT: mmap safetensors load, tokenizer integration, mean pooling
+- Wire up ONNX Runtime (`ort`): load `model.onnx`, tokenizer integration, mean pooling
 - Implement `EncodeQuery` trait (embed a query string into a vector)
 - Implement `EncodeDocuments` trait (embed batch documents)
 - Implement reranker as cross-encoder
@@ -644,7 +645,7 @@ installation is required. A REST-only client via `reqwest` remains a fallback.
 - Qdrant per-platform binaries via `externalBin` target-triple naming
 - **Windows builds happen on Windows (or GitHub Actions)** — cross-compiling
   a Tauri app from Linux to Windows is not supported
-- Evaluate `candle-core/cuda` for batch embedding acceleration
+- Evaluate `ort` CUDA execution provider for batch embedding acceleration
 - OS code signing if desired
 - **Goal:** User downloads one file, double-clicks, it works
 
@@ -664,9 +665,8 @@ installation is required. A REST-only client via `reqwest` remains a fallback.
 | `rmcp` | MCP protocol implementation |
 | `sqlx` | Async SQLite (compile-time checked queries) |
 | `qdrant-client` | Vector DB client (gRPC; generated bindings ship in the pinned release) |
-| `candle-core` + `candle-transformers` | ML model loading + inference (mmap'd safetensors) |
-| `candle-nn` | Neural network building blocks |
-| `tokenizers` (HF) | Tokenizer loading + encoding (dense models + BM25) |
+| `ort` | ONNX Runtime: dense embedding + cross-encoder rerank (optional CUDA EP) |
+| `tokenizers` (HF) | Tokenizer loading + encoding (dense/rerank models) |
 | `serde` + `serde_json` | Serialization (replaces Pydantic) |
 | `tree-sitter` + lang grammars | Code chunking (10 languages) |
 | `text-splitter` | Token-aware text chunking |

@@ -358,7 +358,7 @@ const WebsiteProcessingStep: React.FC<Props> = ({
           <div className="rounded-lg border border-border bg-muted/30 p-4 mb-4">
             <div className="w-full bg-muted rounded-full h-3 overflow-hidden">
               <div
-                className="bg-primary h-full rounded-full transition-all duration-500"
+                className="bg-primary h-full rounded-full transition-[width] duration-300"
                 style={{ width: `${embedJob?.progress_percentage ?? 0}%` }}
               />
             </div>

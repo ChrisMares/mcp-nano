@@ -6,7 +6,7 @@ import {
   uploadDocuments,
   uploadCodeFiles,
 } from "@/utils/apicalls";
-import type { EmbeddingOptions } from "@/types/embed";
+import type { EmbeddingOptions, UploadJobEntry } from "@/types/embed";
 
 type FileError = {
   code: string;
@@ -29,7 +29,7 @@ type UseLocalUploadOptions = {
   groupName?: string;
   maxFileSize?: number;
   maxFiles?: number;
-  onSuccess?: (submittedCount: number) => void | Promise<void>;
+  onSuccess?: (submittedCount: number, jobs: UploadJobEntry[]) => void | Promise<void>;
 };
 
 export type UseLocalUploadReturn = ReturnType<typeof useLocalUpload>;
@@ -62,6 +62,7 @@ export const useLocalUpload = (options: UseLocalUploadOptions) => {
   const [successes, setSuccesses] = useState<string[]>([]);
   const [isDragActive, setIsDragActive] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
+  const isDragActiveRef = useRef(false);
 
   const acceptsZip = collection === "codebase" && codeUploadMode === "zip";
 
@@ -72,6 +73,12 @@ export const useLocalUpload = (options: UseLocalUploadOptions) => {
     const x = position.x / scale;
     const y = position.y / scale;
     return x >= bounds.left && x <= bounds.right && y >= bounds.top && y <= bounds.bottom;
+  }, []);
+
+  const setDragActive = useCallback((active: boolean) => {
+    if (isDragActiveRef.current === active) return;
+    isDragActiveRef.current = active;
+    setIsDragActive(active);
   }, []);
 
   const addPaths = useCallback(
@@ -101,12 +108,14 @@ export const useLocalUpload = (options: UseLocalUploadOptions) => {
     void getCurrentWindow()
       .onDragDropEvent((event) => {
         if (event.payload.type === "enter" || event.payload.type === "over") {
-          setIsDragActive(isOverDropzone(event.payload.position));
+          setDragActive(isOverDropzone(event.payload.position));
         } else if (event.payload.type === "leave") {
-          setIsDragActive(false);
+          setDragActive(false);
         } else if (isOverDropzone(event.payload.position)) {
-          setIsDragActive(false);
+          setDragActive(false);
           addPaths(event.payload.paths);
+        } else {
+          setDragActive(false);
         }
       })
       .then((fn) => {
@@ -115,7 +124,7 @@ export const useLocalUpload = (options: UseLocalUploadOptions) => {
     return () => {
       unlisten?.();
     };
-  }, [addPaths, isOverDropzone]);
+  }, [addPaths, isOverDropzone, setDragActive]);
 
   const isSuccess = useMemo(
     () => errors.length === 0 && successes.length > 0 && successes.length === files.length,
@@ -138,7 +147,10 @@ export const useLocalUpload = (options: UseLocalUploadOptions) => {
       ref: rootRef,
       onClick: (event: MouseEvent<HTMLDivElement>) => {
         props.onClick?.(event);
-        if (!event.defaultPrevented) void selectFiles();
+        if (event.defaultPrevented) return;
+        const target = event.target as HTMLElement | null;
+        if (target?.closest("button, a, input, label, [role='button']")) return;
+        void selectFiles();
       },
     }),
     [selectFiles],
@@ -157,7 +169,12 @@ export const useLocalUpload = (options: UseLocalUploadOptions) => {
       const embeddingOptions: EmbeddingOptions = collection === "codebase"
         ? {
             collection: "codebase",
-            repo_name: codeUploadMode === "individual" ? repoName.trim() : undefined,
+            // Zip mode: backend defaults repo_name to zip basename minus ".zip"
+            // when this is empty. Individual mode uses the user-entered name.
+            repo_name:
+              codeUploadMode === "individual"
+                ? repoName.trim() || undefined
+                : undefined,
             metadata: {},
           }
         : {
@@ -179,7 +196,7 @@ export const useLocalUpload = (options: UseLocalUploadOptions) => {
       const uploaded = validFiles.map((file) => file.name);
       setSuccesses(uploaded);
       setErrors([]);
-      if (onSuccess) await onSuccess(uploaded.length);
+      if (onSuccess) await onSuccess(uploaded.length, response.jobs ?? []);
     } catch (error) {
       const message = error instanceof Error ? error.message : typeof error === "string" ? error : "Upload failed";
       setErrors(files.map((file) => ({ name: file.name, message })));

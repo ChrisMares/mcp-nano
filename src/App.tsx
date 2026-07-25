@@ -1,23 +1,26 @@
-import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
-import { HelmetProvider } from 'react-helmet-async';
-import { AuthProvider } from './contexts/AuthContext';
-import { ThemeProvider } from './contexts/ThemeContext';
-import AppLayout from './components/layout/AppLayout';
-import UploadFiles from './pages/UploadFiles';
-import DataManagement from './pages/DataManagement';
-import FetchContext from './pages/FetchContext';
-import McpCreate from './pages/McpCreate';
-import McpManage from './pages/McpManage';
-import McpConnect from './pages/McpConnect';
-import Account from './pages/Account';
-import Dashboard from './pages/Dashboard';
+import {
+  BrowserRouter as Router,
+  Routes,
+  Route,
+  Navigate,
+} from "react-router-dom";
+import { HelmetProvider } from "react-helmet-async";
+import { ThemeProvider } from "./contexts/ThemeContext";
+import AppLayout from "./components/layout/AppLayout";
+import UploadFiles from "./pages/UploadFiles";
+import DataManagement from "./pages/DataManagement";
+import FetchContext from "./pages/FetchContext";
+import McpCreate from "./pages/McpCreate";
+import McpManage from "./pages/McpManage";
+import McpConnect from "./pages/McpConnect";
+import Account from "./pages/Account";
+import Dashboard from "./pages/Dashboard";
 
 function App() {
   return (
     <HelmetProvider>
-    <Router>
-      <ThemeProvider>
-        <AuthProvider>
+      <Router>
+        <ThemeProvider>
           <Routes>
             <Route element={<AppLayout />}>
               <Route path="/" element={<Navigate to="/dashboard" replace />} />
@@ -32,9 +35,8 @@ function App() {
             </Route>
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
-        </AuthProvider>
-      </ThemeProvider>
-    </Router>
+        </ThemeProvider>
+      </Router>
     </HelmetProvider>
   );
 }

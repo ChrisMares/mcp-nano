@@ -27,24 +27,25 @@ fn pool(app: &AppHandle) -> Result<sqlx::SqlitePool, String> {
 pub async fn get_files(app: AppHandle) -> Result<UserFilesResponse, String> {
     let svc = qdrant_svc(&app)?;
 
-    let repos = match svc
+    // Best-effort backfill for zips uploaded before default repo_name existed.
+    if let Err(e) = svc.repair_empty_repo_names_from_zip("codebase").await {
+        error!("get_files: repo_name repair failed: {e:#}");
+    }
+
+    let mut repo_names: std::collections::BTreeSet<String> = match svc
         .get_metadata_values_by_key("codebase", "repo_name", None)
         .await
     {
         Ok(names) => names
             .into_iter()
             .filter_map(|v| match v {
-                serde_json::Value::String(s) if !s.is_empty() => Some(RepoItem {
-                    repo_name: s,
-                    created_at: None,
-                    storage_object_id: None,
-                }),
+                serde_json::Value::String(s) if !s.is_empty() => Some(s),
                 _ => None,
             })
             .collect(),
         Err(e) => {
             error!("get_files: Qdrant facet repo_name failed: {e:#}");
-            vec![]
+            std::collections::BTreeSet::new()
         }
     };
 
@@ -56,15 +57,28 @@ pub async fn get_files(app: AppHandle) -> Result<UserFilesResponse, String> {
     .await
     .map_err(|e| format!("querying file_metadata: {e}"))?;
 
+    // Also surface repos that only exist in SQLite (or pending→completed
+    // metadata before Qdrant facet catches up).
+    for f in &completed_codebase {
+        if let Some(rn) = f.repo_name.as_ref().filter(|s| !s.is_empty()) {
+            repo_names.insert(rn.clone());
+        }
+    }
+
     let meta_by_repo: std::collections::HashMap<&str, &FileMetadata> = completed_codebase
         .iter()
         .filter_map(|f| f.repo_name.as_ref().map(|n| (n.as_str(), f)))
         .collect();
 
-    let mut enriched_repos: Vec<RepoItem> = repos
+    let mut enriched_repos: Vec<RepoItem> = repo_names
         .into_iter()
-        .map(|mut r| {
-            if let Some(m) = meta_by_repo.get(r.repo_name.as_str()) {
+        .map(|repo_name| {
+            let mut r = RepoItem {
+                repo_name: repo_name.clone(),
+                created_at: None,
+                storage_object_id: None,
+            };
+            if let Some(m) = meta_by_repo.get(repo_name.as_str()) {
                 r.created_at = m.created_at.clone();
                 r.storage_object_id = Some(m.storage_object_id.clone());
             }

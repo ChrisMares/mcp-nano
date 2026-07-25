@@ -1,6 +1,7 @@
 import { Link } from "react-router-dom";
 import { useSidebar } from "@/contexts/SidebarContext";
 import { ThemeToggleButton } from "@/components/common/ThemeToggleButton";
+import EmbeddingDeviceBadge from "@/components/header/EmbeddingDeviceBadge";
 import UserDropdown from "@/components/header/UserDropdown";
 
 const AppHeader: React.FC = () => {
@@ -15,7 +16,7 @@ const AppHeader: React.FC = () => {
   };
 
   return (
-    <header className="sticky top-0 flex w-full h-16 bg-card border-b border-border shadow-sm z-50">
+    <header className="flex h-16 w-full shrink-0 bg-card border-b border-border shadow-sm z-50">
       <div className="flex items-center justify-between w-full px-4 lg:px-6">
         {/* Left side - Toggle button */}
         <div className="flex items-center gap-4">
@@ -61,8 +62,9 @@ const AppHeader: React.FC = () => {
           </Link>
         </div>
 
-        {/* Right side - Theme toggle & User dropdown */}
+        {/* Right side - device badge, theme, account */}
         <div className="flex items-center gap-3">
+          <EmbeddingDeviceBadge />
           <ThemeToggleButton />
           <UserDropdown />
         </div>

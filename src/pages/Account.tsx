@@ -8,7 +8,7 @@ const Account: React.FC = () => {
       <PageHead title="Account" description="Local profile" path="/account" />
       <h2 className="text-xl font-bold text-foreground mb-2">Local Mode</h2>
       <p className="text-sm text-muted-foreground">
-        Authentication and billing are disabled in this simplified single-container build.
+        This app runs entirely on your machine. There is no account or sign-in.
       </p>
     </div>
   );

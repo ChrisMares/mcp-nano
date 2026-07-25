@@ -112,11 +112,11 @@ pub async fn open_sqlite_pool(dir: &Path) -> SqlitePool {
 /// are absent — caller should print a skip message and return.
 pub fn load_embedders() -> Option<Arc<EmbedderState>> {
     let dir = models_dir();
-    if !dir.join("arctic-embed-xs/model.safetensors").exists() {
+    if !dir.join("arctic-embed-xs/model.onnx").exists() {
         tracing::warn!("skipping: arctic-embed-xs not downloaded; run scripts/download-models.sh");
         return None;
     }
-    if !dir.join("minilm-l6-v2/model.safetensors").exists() {
+    if !dir.join("minilm-l6-v2/model.onnx").exists() {
         tracing::warn!("skipping: minilm-l6-v2 not downloaded; run scripts/download-models.sh");
         return None;
     }
@@ -129,7 +129,7 @@ pub fn load_embedders() -> Option<Arc<EmbedderState>> {
 /// isn't downloaded.
 pub fn dense_ready() -> Option<DenseEmbedder> {
     let dir = models_dir().join("arctic-embed-xs");
-    let weights = dir.join("model.safetensors");
+    let weights = dir.join("model.onnx");
     let tokenizer = dir.join("tokenizer.json");
     if !weights.exists() || !tokenizer.exists() {
         return None;
@@ -141,7 +141,7 @@ pub fn dense_ready() -> Option<DenseEmbedder> {
 /// isn't downloaded.
 pub fn reranker_ready() -> Option<Reranker> {
     let dir = models_dir().join("minilm-l6-v2");
-    let weights = dir.join("model.safetensors");
+    let weights = dir.join("model.onnx");
     let tokenizer = dir.join("tokenizer.json");
     if !weights.exists() || !tokenizer.exists() {
         return None;

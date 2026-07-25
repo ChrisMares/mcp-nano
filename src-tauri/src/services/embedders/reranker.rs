@@ -1,88 +1,58 @@
 use std::path::Path;
+use std::sync::Mutex;
+use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
-use candle_core::{DType, Device, Tensor};
-use candle_nn::{linear, Linear, Module, VarBuilder};
-use candle_transformers::models::bert::{BertModel, Config};
+use ort::session::Session;
+use ort::value::Tensor;
+use ort::inputs;
 use tokenizers::Tokenizer;
+use tracing::info;
 
-/// Cross-encoder reranker wrapping a Candle BERT + sequence-classification
-/// head.
+use super::dense::{
+    build_session, clamp_text_for_tokenize, load_tokenizer_with_truncation, InferenceDevice,
+    MAX_SEQ_LEN,
+};
+
+/// Cross-encoder reranker wrapping an ONNX BERT sequence-classification model.
 ///
 /// The bundled model is `cross-encoder/ms-marco-MiniLM-L6-v2`. For each
 /// (query, document) pair we tokenize `[CLS] query [SEP] document [SEP]`,
-/// run the BERT encoder, take the `[CLS]` (index 0) hidden state, apply the
-/// linear classifier head, and read the relevance score. The MiniLM-L6-v2
-/// checkpoint is a single-output regression cross-encoder (classifier shape
-/// `[1, hidden]`), so the one logit IS the score; for 2-class checkpoints
-/// we'd take `logits[1]` (relevant class).
+/// run the ONNX graph, and read the relevance score from `logits`. The
+/// MiniLM-L6-v2 checkpoint is a single-output regression cross-encoder
+/// (logits shape `[batch, 1]`); for 2-class checkpoints we take `logits[1]`.
+///
+/// Sequences are truncated to [`MAX_SEQ_LEN`] (512) — without this, long
+/// codebase chunks (e.g. minified JS) allocate multi‑GB tensors and OOM.
 pub struct Reranker {
-    encoder: BertModel,
-    classifier: Linear,
+    session: Mutex<Session>,
     tokenizer: Tokenizer,
-    device: Device,
+    device: InferenceDevice,
 }
 
 impl Reranker {
     pub fn load(model_dir: &Path) -> Result<Self> {
-        Self::load_with_device(model_dir, Device::Cpu)
+        Self::load_with_device(model_dir, InferenceDevice::Cpu)
     }
 
-    pub fn load_with_device(model_dir: &Path, device: Device) -> Result<Self> {
-        let weights = model_dir.join("model.safetensors");
+    pub fn load_with_device(model_dir: &Path, device: InferenceDevice) -> Result<Self> {
+        let weights = model_dir.join("model.onnx");
         let tokenizer_path = model_dir.join("tokenizer.json");
-        let config_path = model_dir.join("config.json");
 
-        let tokenizer = Tokenizer::from_file(&tokenizer_path)
-            .map_err(|e| anyhow!("failed to load tokenizer {}: {e}", tokenizer_path.display()))?;
+        let tokenizer = load_tokenizer_with_truncation(&tokenizer_path)?;
 
-        let config_text = std::fs::read_to_string(&config_path)
-            .with_context(|| format!("reading {}", config_path.display()))?;
-        let mut config: Config = serde_json::from_str(&config_text)
-            .with_context(|| format!("parsing {}", config_path.display()))?;
-        if config.model_type.is_none() {
-            config.model_type = Some("bert".to_string());
-        }
-        // cross-encoder/ms-marco-MiniLM-L6-v2 is a single-output regression
-        // cross-encoder: classifier shape is [1, hidden], and the single logit
-        // IS the relevance score (no softmax). Determine num_labels from
-        // `id2label` (falling back to 2 for canonical 2-class checkpoints).
-        let extras: ConfigExtras = serde_json::from_str(&config_text).unwrap_or_default();
-        let num_labels = extras.num_labels();
-
-        // Safety: memmap of a bundled, trusted safetensors file.
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[&weights], DType::F32, &device)
-                .with_context(|| format!("mmap {}", weights.display()))?
-        };
-
-        // Cross-encoder checkpoints typically store the encoder under
-        // `bert.*`. `BertModel::load` already has a fallback that retries
-        // under `{model_type}.embeddings` / `{model_type}.encoder` if the
-        // flat path fails, so passing the root VarBuilder handles both
-        // layouts (top-level weights and `bert.`-prefixed weights).
-        let encoder = BertModel::load(vb.clone(), &config).context("loading BERT encoder")?;
-
-        // Classifier head: Linear(hidden_size, num_labels). Cross-encoder
-        // safetensors store this as `classifier.weight` (and optionally
-        // `classifier.bias`). Load the tensors directly when present so we
-        // use the trained head; otherwise fall back to a fresh linear
-        // (random init — only happens for non-canonical checkpoints).
-        let classifier = match (
-            vb.get((num_labels, config.hidden_size), "classifier.weight"),
-            vb.get((num_labels,), "classifier.bias"),
-        ) {
-            (Ok(weight), Ok(bias)) => Linear::new(weight, Some(bias)),
-            (Ok(weight), Err(_)) => Linear::new(weight, None),
-            (Err(_), _) => linear(config.hidden_size, num_labels, vb.pp("classifier"))?,
-        };
+        let session = build_session(&weights, device)
+            .with_context(|| format!("loading ONNX session {}", weights.display()))?;
 
         Ok(Self {
-            encoder,
-            classifier,
+            session: Mutex::new(session),
             tokenizer,
             device,
         })
+    }
+
+    pub fn device(&self) -> InferenceDevice {
+        self.device
     }
 
     /// Score each (query, document) pair. Returns one f32 per document,
@@ -97,24 +67,39 @@ impl Reranker {
         if documents.is_empty() {
             return Ok(Vec::new());
         }
-        // Build pair texts: the tokenizer handles [CLS]/[SEP] insertion.
-        // HF BERT tokenizers encode_pair with truncation produces the right
-        // structure. We pass truncation=true so long docs don't overflow.
-        let pair_texts: Vec<String> = documents.iter().map(|d| d.to_string()).collect();
+        let query_clipped = clamp_text_for_tokenize(query);
+        let pair_texts: Vec<String> = documents
+            .iter()
+            .map(|d| clamp_text_for_tokenize(d))
+            .collect();
+        let total_batches = pair_texts.len().div_ceil(batch_size.max(1));
+        info!(
+            "reranker start device={} docs={} batch_size={} batches={}",
+            self.device.label(),
+            documents.len(),
+            batch_size.max(1),
+            total_batches
+        );
 
         let mut scores = Vec::with_capacity(documents.len());
+        let mut batch_idx = 0usize;
         for chunk in pair_texts.chunks(batch_size.max(1)) {
-            // Encode each (query, doc) pair as a single sequence.
+            batch_idx += 1;
+            let tok_start = Instant::now();
             let mut encodings = Vec::with_capacity(chunk.len());
             for doc in chunk {
                 let pair = self
                     .tokenizer
-                    .encode((query, doc.as_str()), true)
+                    .encode((query_clipped.as_str(), doc.as_str()), true)
                     .map_err(|e| anyhow!("tokenizer encode_pair failed: {e}"))?;
                 encodings.push(pair);
             }
-            // Pad manually to the max length in this chunk.
-            let seq_len = encodings.iter().map(|e| e.get_ids().len()).max().unwrap_or(0);
+            let seq_len = encodings
+                .iter()
+                .map(|e| e.get_ids().len().min(MAX_SEQ_LEN))
+                .max()
+                .unwrap_or(0)
+                .min(MAX_SEQ_LEN);
             if seq_len == 0 {
                 scores.extend(std::iter::repeat_n(0.0, chunk.len()));
                 continue;
@@ -127,59 +112,64 @@ impl Reranker {
                 let ids = enc.get_ids();
                 let mask = enc.get_attention_mask();
                 let type_ids = enc.get_type_ids();
+                let n = ids.len().min(seq_len);
                 for i in 0..seq_len {
-                    input_ids.push(if i < ids.len() { ids[i] as i64 } else { 0 });
-                    attention_mask.push(if i < mask.len() { mask[i] as i64 } else { 0 });
-                    token_type_ids.push(if i < type_ids.len() { type_ids[i] as i64 } else { 0 });
+                    if i < n {
+                        input_ids.push(ids[i] as i64);
+                        attention_mask.push(if i < mask.len() { mask[i] as i64 } else { 1 });
+                        token_type_ids.push(if i < type_ids.len() {
+                            type_ids[i] as i64
+                        } else {
+                            0
+                        });
+                    } else {
+                        input_ids.push(0);
+                        attention_mask.push(0);
+                        token_type_ids.push(0);
+                    }
                 }
             }
-            let input_ids = Tensor::from_vec(input_ids, (batch, seq_len), &self.device)?;
-            let attention_mask =
-                Tensor::from_vec(attention_mask, (batch, seq_len), &self.device)?;
-            let token_type_ids =
-                Tensor::from_vec(token_type_ids, (batch, seq_len), &self.device)?;
 
-            // (batch, seq_len, hidden)
-            let hidden = self
-                .encoder
-                .forward(&input_ids, &token_type_ids, Some(&attention_mask))?;
+            let shape = vec![batch as i64, seq_len as i64];
+            let input_ids = Tensor::from_array((shape.clone(), input_ids))?;
+            let attention_mask = Tensor::from_array((shape.clone(), attention_mask))?;
+            let token_type_ids = Tensor::from_array((shape, token_type_ids))?;
+            let tokenize_ms = tok_start.elapsed().as_millis();
 
-            // [CLS] is at index 0 of each sequence. narrow + squeeze keeps
-            // the batch dimension: (batch, seq_len, hidden) -> (batch, hidden).
-            let cls = hidden.narrow(1, 0, 1)?.squeeze(1)?;
-            let logits = self.classifier.forward(&cls)?; // (batch, num_labels)
-            let logits_vec: Vec<Vec<f32>> = logits.to_vec2()?;
-            for row in logits_vec {
-                // Single-output regression cross-encoder: the one logit IS
-                // the score. Two-class classifier: take logits[1] (relevant).
-                let score = if row.len() == 1 {
-                    row[0]
+            let mut session = self
+                .session
+                .lock()
+                .map_err(|_| anyhow!("reranker session lock poisoned"))?;
+            let run_start = Instant::now();
+            let outputs = session.run(inputs! {
+                "input_ids" => input_ids,
+                "attention_mask" => attention_mask,
+                "token_type_ids" => token_type_ids,
+            })?;
+            info!(
+                "reranker ORT run device={} batch={batch_idx}/{total_batches} size={batch} seq_len={seq_len} tokenize_ms={tokenize_ms} run_ms={}",
+                self.device.label(),
+                run_start.elapsed().as_millis()
+            );
+
+            let (out_shape, logits) = outputs["logits"].try_extract_tensor::<f32>()?;
+            let num_labels = if out_shape.len() >= 2 {
+                out_shape[1] as usize
+            } else {
+                1
+            }
+            .max(1);
+
+            for b in 0..batch {
+                let base = b * num_labels;
+                let score = if num_labels == 1 {
+                    logits[base]
                 } else {
-                    row.get(1).copied().unwrap_or(row[0])
+                    logits.get(base + 1).copied().unwrap_or(logits[base])
                 };
                 scores.push(score);
             }
         }
         Ok(scores)
-    }
-}
-
-#[derive(serde::Deserialize, Default)]
-struct ConfigExtras {
-    num_labels: Option<usize>,
-    id2label: Option<serde_json::Map<String, serde_json::Value>>,
-}
-
-impl ConfigExtras {
-    /// Resolve the classifier output dimension: explicit `num_labels` field,
-    /// else `id2label.len()`, else default 2 (canonical BERT 2-class).
-    fn num_labels(&self) -> usize {
-        if let Some(n) = self.num_labels {
-            return n;
-        }
-        if let Some(map) = &self.id2label {
-            return map.len().max(1);
-        }
-        2
     }
 }

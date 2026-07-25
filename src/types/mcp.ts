@@ -92,7 +92,6 @@ export const toolToFormData = (tool: ToolDefinition, knownWebsiteGroups: string[
 
 export interface ConnectionInfo {
   mcp_url: string;
-  user_id: string;
   server_id: string;
   server_name: string;
   full_url: string;

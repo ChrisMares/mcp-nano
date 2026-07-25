@@ -2,7 +2,7 @@
 //! language-specific subtype and metadata. Direct port of
 //! `embed_code.split_oversized_code_chunks`.
 //!
-//! Chunks whose `code` exceeds `max_chunk_tokens` (default 1024, the Python
+//! Chunks whose `code` exceeds `max_chunk_tokens` (default 768, the Python
 //! `CODE_CHUNK_SIZE` env var) are re-chunked by the shared text-splitter;
 //! each child becomes a `CodeChunk::split` of the original, carrying the
 //! same `kind`, `repo_name`, `file_name`, `dependencies`, and `created_at`.
@@ -17,6 +17,9 @@ use crate::services::ingestion::types::CodeChunk;
 ///
 /// Mirrors `split_oversized_code_chunks`. The single-chunk passthrough
 /// keeps the original `id` when no split is needed.
+/// Hard char ceiling when the token splitter cannot break minified one-liners.
+const MAX_CODE_CHUNK_CHARS: usize = 6_000;
+
 pub fn split_oversized_code_chunks(
     chunks: Vec<CodeChunk>,
     splitter: &TextSplitter<Tokenizer>,
@@ -24,14 +27,45 @@ pub fn split_oversized_code_chunks(
     let mut out = Vec::with_capacity(chunks.len());
     for chunk in chunks {
         let splits: Vec<String> = splitter.chunks(&chunk.code).map(String::from).collect();
-        if splits.len() <= 1 {
+        let splits = if splits.is_empty() {
+            vec![chunk.code.clone()]
+        } else {
+            splits
+        };
+        let keep_original_id = splits.len() == 1
+            && splits[0].chars().count() == chunk.code.chars().count()
+            && chunk.code.chars().count() <= MAX_CODE_CHUNK_CHARS;
+        if keep_original_id {
             out.push(chunk);
             continue;
         }
         for new_code in splits {
-            let new_id = uuid::Uuid::new_v4().to_string();
-            out.push(chunk.split(new_id, new_code));
+            for piece in hard_split_chars(&new_code, MAX_CODE_CHUNK_CHARS) {
+                let new_id = uuid::Uuid::new_v4().to_string();
+                out.push(chunk.split(new_id, piece));
+            }
         }
+    }
+    out
+}
+
+fn hard_split_chars(text: &str, max_chars: usize) -> Vec<String> {
+    if max_chars == 0 || text.chars().count() <= max_chars {
+        return vec![text.to_string()];
+    }
+    let mut out = Vec::new();
+    let mut buf = String::with_capacity(max_chars);
+    let mut n = 0usize;
+    for ch in text.chars() {
+        if n >= max_chars {
+            out.push(std::mem::take(&mut buf));
+            n = 0;
+        }
+        buf.push(ch);
+        n += 1;
+    }
+    if !buf.is_empty() {
+        out.push(buf);
     }
     out
 }

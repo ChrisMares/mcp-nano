@@ -8,6 +8,6 @@ describe('Account', () => {
   it('renders local mode heading and description', () => {
     renderWithProviders(<Account />)
     expect(screen.getByText('Local Mode')).toBeInTheDocument()
-    expect(screen.getByText(/Authentication and billing are disabled/)).toBeInTheDocument()
+    expect(screen.getByText(/runs entirely on your machine/)).toBeInTheDocument()
   })
 })

@@ -8,7 +8,7 @@ use std::path::Path;
 
 use tree_sitter::Node;
 
-use super::helpers::{generate_chunk_id, make_remainder_chunk, node_text};
+use super::helpers::{generate_chunk_id, make_remainder_chunk, node_text, walk_preorder};
 use crate::services::ingestion::types::{CodeChunk, CodeChunkKind, Parameter, RustFields};
 
 const FUNCTION_NODE_TYPES: &[&str] = &["function_item"];
@@ -17,8 +17,7 @@ const TYPE_NODE_TYPES: &[&str] = &["struct_item", "enum_item", "trait_item"];
 pub fn extract_dependencies<'a>(root: Node<'a>, source: &[u8]) -> Vec<String> {
     let mut deps: Vec<String> = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    let mut stack: Vec<Node<'a>> = vec![root];
-    while let Some(node) = stack.pop() {
+    walk_preorder(root, |node| {
         let kind = node.kind();
         if kind == "use_declaration" || kind == "extern_crate_declaration" {
             let dep = normalize_rust_dependency(&node_text(&node, source));
@@ -26,11 +25,7 @@ pub fn extract_dependencies<'a>(root: Node<'a>, source: &[u8]) -> Vec<String> {
                 deps.push(dep);
             }
         }
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            stack.push(child);
-        }
-    }
+    });
     deps
 }
 

@@ -1,6 +1,5 @@
 import React, { useState, useMemo, useCallback, useEffect, useRef } from "react";
 import { useLocalUpload } from "@/hooks/use-local-upload";
-import { useAuth } from "@/hooks/useAuth";
 import { useJobEvents, type JobProgressEvent } from "@/hooks/use-job-events";
 import { getActiveJobs, crawlWebsite, embedWebsite, getMetadataValues } from "@/utils/apicalls";
 import { CheckCircle } from "lucide-react";
@@ -17,7 +16,16 @@ import ConfigureWebsiteStep from "@/components/uploadfiles/ConfigureWebsiteStep"
 import UploadStep from "@/components/uploadfiles/UploadStep";
 import WebsiteProcessingStep from "@/components/uploadfiles/WebsiteProcessingStep";
 import JobStatusPanel from "@/components/uploadfiles/JobStatusPanel";
-import type { EmbedJob } from "@/types/embed";
+import type { EmbedJob, UploadJobEntry } from "@/types/embed";
+
+const mergeJobFromEvent = (prev: EmbedJob | undefined, e: JobProgressEvent, status: string): EmbedJob => ({
+  job_id: e.job_id,
+  status,
+  progress_percentage: e.percentage ?? prev?.progress_percentage ?? 0,
+  file_name: e.file_name ?? prev?.file_name ?? null,
+  created_at: prev?.created_at ?? new Date().toISOString(),
+  message: e.message ?? prev?.message ?? null,
+});
 
 const isZipFile = (f: { name: string }) => f.name.toLowerCase().endsWith(".zip");
 
@@ -70,7 +78,6 @@ const StepIndicator: React.FC<{ current: number; total: number; labels: string[]
 );
 
 const UploadFiles: React.FC = () => {
-  const { user } = useAuth();
   const [step, setStep] = useState(1);
   const [collection, setCollection] = useState<CollectionType>("");
   const [groupName, setGroupName] = useState<string>("");
@@ -90,28 +97,27 @@ const UploadFiles: React.FC = () => {
   const [mixWarning, setMixWarning] = useState("");
   const [activeJobs, setActiveJobs] = useState<EmbedJob[]>([]);
   const [completedJobs, setCompletedJobs] = useState<EmbedJob[]>([]);
-  const [processing] = useState(false);
   const [lastSubmittedCount, setLastSubmittedCount] = useState(0);
   const trackedJobsRef = useRef<Map<string, EmbedJob>>(new Map());
 
-  // -- Initial fetch: grab any active jobs the worker is already processing
-  //    (e.g. jobs queued before the user opened the UploadFiles view or
-  //    still-running jobs from a previous session that were reset to
-  //    PENDING on shutdown). The live progress events from the worker then
-  //    keep this list in sync without further polling.
   useEffect(() => {
     let cancelled = false;
     const fetchInitial = async () => {
       try {
         const res = await getActiveJobs();
         if (cancelled) return;
-        const jobs = res.jobs ?? [];
+        const jobs = (res.jobs ?? []).map((j) => ({
+          job_id: j.job_id,
+          status: j.status,
+          progress_percentage: j.progress_percentage,
+          file_name: j.file_name,
+          created_at: j.created_at,
+          message: null,
+        }));
         setActiveJobs(jobs);
         trackedJobsRef.current = new Map(jobs.map((j) => [j.job_id, j]));
       } catch {
-        // The SQLite/Qdrant sidecars may not be ready yet on first mount; a
-        // future event from the worker will refresh `activeJobs` as soon as
-        // the corresponding job_status row exists.
+        // sidecars may not be ready yet
       }
     };
     void fetchInitial();
@@ -120,78 +126,88 @@ const UploadFiles: React.FC = () => {
     };
   }, []);
 
-  // -- Live push: subscribe once to the three job lifecycle Tauri events.
-  //    The Rust worker emits `job_progress` on every progress update,
-  //    `job_finished` at status=FINISHED, and `job_failed` at status=FAILED.
-  //    This replaces the previous `setInterval(getActiveJobs, 5000)` polling
-  //    loop — the user sees progress bar ticks within milliseconds of the
-  //    worker emitting them, with zero network round-trips between updates.
+  const upsertActive = useCallback((job: EmbedJob) => {
+    trackedJobsRef.current.set(job.job_id, job);
+    setActiveJobs((prev) => {
+      const idx = prev.findIndex((j) => j.job_id === job.job_id);
+      if (idx < 0) return [...prev, job];
+      const next = [...prev];
+      next[idx] = job;
+      return next;
+    });
+  }, []);
+
   useJobEvents({
+    onQueued: (e: JobProgressEvent) => {
+      const prev = trackedJobsRef.current.get(e.job_id);
+      upsertActive(mergeJobFromEvent(prev, e, e.status ?? "PENDING"));
+    },
     onProgress: (e: JobProgressEvent) => {
-      setActiveJobs((prev) => {
-        const existing = prev.find((j) => j.job_id === e.job_id);
-        if (!existing) {
-          // New job we haven't seen before (queued by another view); add it
-          // to the tracked set so subsequent progress events update it
-          // in place.
-          const fresh: EmbedJob = {
-            job_id: e.job_id,
-            status: "RUNNING",
-            progress_percentage: e.percentage,
-            file_name: null,
-            created_at: new Date().toISOString(),
-          };
-          trackedJobsRef.current.set(e.job_id, fresh);
-          return [...prev, fresh];
-        }
-        if (existing.progress_percentage === e.percentage) return prev;
-        const updated: EmbedJob = { ...existing, progress_percentage: e.percentage, status: "RUNNING" };
-        trackedJobsRef.current.set(e.job_id, updated);
-        return prev.map((j) => (j.job_id === e.job_id ? updated : j));
-      });
+      const prev = trackedJobsRef.current.get(e.job_id);
+      const next = mergeJobFromEvent(prev, e, e.status ?? "RUNNING");
+      if (
+        prev &&
+        prev.progress_percentage === next.progress_percentage &&
+        prev.status === next.status &&
+        prev.message === next.message &&
+        prev.file_name === next.file_name
+      ) {
+        return;
+      }
+      upsertActive(next);
     },
     onFinished: (e: JobProgressEvent) => {
       const prev = trackedJobsRef.current.get(e.job_id);
       trackedJobsRef.current.delete(e.job_id);
       setActiveJobs((prevJobs) => prevJobs.filter((j) => j.job_id !== e.job_id));
+      const done = mergeJobFromEvent(prev, e, "COMPLETED");
+      done.progress_percentage = 100;
       setCompletedJobs((prevDone) => {
         if (prevDone.find((j) => j.job_id === e.job_id)) return prevDone;
-        return [
-          ...prevDone,
-          {
-            job_id: e.job_id,
-            status: "COMPLETED",
-            progress_percentage: 100,
-            file_name: prev?.file_name ?? null,
-            created_at: prev?.created_at ?? new Date().toISOString(),
-          },
-        ];
+        return [...prevDone, done];
       });
     },
     onFailed: (e: JobProgressEvent) => {
       const prev = trackedJobsRef.current.get(e.job_id);
       trackedJobsRef.current.delete(e.job_id);
       setActiveJobs((prevJobs) => prevJobs.filter((j) => j.job_id !== e.job_id));
+      const failed = mergeJobFromEvent(prev, e, "FAILED");
+      failed.progress_percentage = 100;
       setCompletedJobs((prevDone) => {
         if (prevDone.find((j) => j.job_id === e.job_id)) return prevDone;
-        return [
-          ...prevDone,
-          {
-            job_id: e.job_id,
-            status: "FAILED",
-            progress_percentage: 100,
-            file_name: prev?.file_name ?? null,
-            created_at: prev?.created_at ?? new Date().toISOString(),
-          },
-        ];
+        return [...prevDone, failed];
       });
     },
   });
 
-  const handleUploadSuccess = useCallback((submittedCount: number) => {
+  const handleUploadSuccess = useCallback((submittedCount: number, jobs: UploadJobEntry[]) => {
     setLastSubmittedCount(submittedCount);
-    // The worker will emit `job_progress` events for the queued jobs as
-    // soon as it claims them; no polling kick needed.
+    for (const entry of jobs) {
+      const job: EmbedJob = {
+        job_id: entry.job_id,
+        status: entry.status || "PENDING",
+        progress_percentage: 0,
+        file_name: entry.filename,
+        created_at: new Date().toISOString(),
+        message: "Queued",
+      };
+      trackedJobsRef.current.set(job.job_id, job);
+    }
+    setActiveJobs((prev) => {
+      const byId = new Map(prev.map((j) => [j.job_id, j]));
+      for (const entry of jobs) {
+        const existing = byId.get(entry.job_id);
+        byId.set(entry.job_id, {
+          job_id: entry.job_id,
+          status: existing?.status === "RUNNING" ? existing.status : entry.status || "PENDING",
+          progress_percentage: existing?.progress_percentage ?? 0,
+          file_name: entry.filename || existing?.file_name || null,
+          created_at: existing?.created_at ?? new Date().toISOString(),
+          message: existing?.message ?? "Queued",
+        });
+      }
+      return Array.from(byId.values());
+    });
   }, []);
 
   const handleWebsiteSubmit = useCallback(async () => {
@@ -234,15 +250,15 @@ const UploadFiles: React.FC = () => {
 
   // Fetch repo names when codebase is selected
   useEffect(() => {
-    if (collection !== "codebase" || !user) return;
+    if (collection !== "codebase") return;
     getMetadataValues("codebase", "repo_name")
       .then((res) => setRepoOptions(res.values ?? []))
       .catch(() => setRepoOptions([]));
-  }, [collection, user]);
+  }, [collection]);
 
   // Fetch group names when general is selected
   useEffect(() => {
-    if (collection !== "general" || !user) return;
+    if (collection !== "general") return;
     getMetadataValues("general", "group")
       .then((res) => {
         const vals: string[] = res.values ?? [];
@@ -251,7 +267,7 @@ const UploadFiles: React.FC = () => {
         if (!vals.includes(groupName) && groupMode === "existing") setGroupName("");
       })
       .catch(() => setGroupOptions(["default"]));
-  }, [collection, user, groupName, groupMode]);
+  }, [collection, groupName, groupMode]);
 
   const uploadProps = useLocalUpload({
     collection: collection === "" ? "general" : collection === "website" ? "general" : collection,
@@ -285,8 +301,6 @@ const UploadFiles: React.FC = () => {
       return { disableUpload: true, disableReason: "Enter a repo name before uploading." };
     return { disableUpload: false, disableReason: "" };
   }, [collection, codeUploadMode, repoName]);
-
-  if (!user) return null;
 
   const handleCollectionSelect = (val: "codebase" | "general" | "website") => {
     setCollection(val);
@@ -406,7 +420,7 @@ const UploadFiles: React.FC = () => {
       </div>
 
       <JobStatusPanel
-        processing={processing}
+        processing={uploadProps.loading}
         activeJobs={activeJobs}
         completedJobs={completedJobs}
       />

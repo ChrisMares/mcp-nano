@@ -253,10 +253,106 @@ fn load_spreadsheet(path: &Path, file_name: &str, doc_type: &str) -> anyhow::Res
 }
 
 fn load_pdf(path: &Path, file_name: &str) -> anyhow::Result<Vec<DocumentChunk>> {
+    if let Some(text) = try_pdftotext(path) {
+        return Ok(one_chunk(file_name, "pdf", text));
+    }
+
     let bytes = std::fs::read(path)?;
-    let text = pdf_extract::extract_text_from_mem(&bytes)
-        .map_err(|e| anyhow::anyhow!("pdf-extract failed: {e}"))?;
+    let pages = extract_pdf_pages_fallback(&bytes)?;
+    let text = pages.join("\n\n");
     Ok(one_chunk(file_name, "pdf", text))
+}
+
+fn try_pdftotext(path: &Path) -> Option<String> {
+    let output = std::process::Command::new("pdftotext")
+        .arg("-layout")
+        .arg("-enc")
+        .arg("UTF-8")
+        .arg(path)
+        .arg("-")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    if text.trim().is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+fn extract_pdf_pages_fallback(bytes: &[u8]) -> anyhow::Result<Vec<String>> {
+    let doc = catch_panic(|| {
+        let mut doc = pdf_extract::Document::load_mem(bytes)?;
+        if doc.is_encrypted() {
+            if let Err(e) = doc.decrypt("") {
+                return Err(pdf_extract::OutputError::PdfError(e));
+            }
+        }
+        Ok(doc)
+    })
+    .map_err(|e| anyhow::anyhow!("pdf load panicked: {e}"))?
+    .map_err(|e| anyhow::anyhow!("pdf load failed: {e}"))?;
+
+    let page_map = doc.get_pages();
+    if page_map.is_empty() {
+        return Err(anyhow::anyhow!("pdf has no pages"));
+    }
+    let mut page_nums: Vec<u32> = page_map.keys().copied().collect();
+    page_nums.sort_unstable();
+
+    let mut pages = Vec::new();
+    let mut failures = 0usize;
+    for page_num in page_nums {
+        let page_result = catch_panic(std::panic::AssertUnwindSafe(|| {
+            let mut s = String::new();
+            {
+                let mut output = pdf_extract::PlainTextOutput::new(&mut s);
+                pdf_extract::output_doc_page(&doc, &mut output, page_num)?;
+            }
+            Ok::<String, pdf_extract::OutputError>(s)
+        }));
+        match page_result {
+            Ok(Ok(text)) if !text.trim().is_empty() => pages.push(text),
+            Ok(Ok(_)) => {}
+            Ok(Err(_)) | Err(_) => failures += 1,
+        }
+    }
+
+    if pages.is_empty() {
+        return Err(anyhow::anyhow!(
+            "pdf-extract produced no text ({failures} page failure(s)); install poppler-utils (pdftotext) for better PDF support"
+        ));
+    }
+    if failures > 0 {
+        tracing::warn!(
+            "pdf-extract: kept {} page(s), skipped {failures} failed page(s)",
+            pages.len()
+        );
+    }
+    Ok(pages)
+}
+
+fn catch_panic<T, F>(f: F) -> Result<T, String>
+where
+    F: FnOnce() -> T + std::panic::UnwindSafe,
+{
+    match std::panic::catch_unwind(f) {
+        Ok(v) => Ok(v),
+        Err(payload) => Err(panic_payload_msg(&payload)),
+    }
+}
+
+fn panic_payload_msg(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
+    }
 }
 
 fn load_docx(path: &Path, file_name: &str) -> anyhow::Result<Vec<DocumentChunk>> {
@@ -322,5 +418,32 @@ mod tests {
         assert_eq!(chunks.len(), 1);
         assert!(chunks[0].content.contains("hello"));
         assert!(chunks[0].content.contains("world"));
+    }
+
+    #[test]
+    fn load_pdf_invalid_bytes_does_not_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.pdf");
+        std::fs::write(&path, b"%PDF-1.4 not a real pdf").unwrap();
+        let result = load_document(&path);
+        assert!(result.is_err(), "expected error, got {result:?}");
+    }
+
+    #[test]
+    fn load_bedrock_pdf_via_pdftotext_when_available() {
+        let path = Path::new("/home/chris/Downloads/aws/bedrock-0001-1000.pdf");
+        if !path.exists() {
+            return;
+        }
+        if std::process::Command::new("pdftotext")
+            .arg("-v")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let chunks = load_document(path).expect("bedrock pdf should load");
+        assert!(!chunks.is_empty());
+        assert!(chunks[0].content.contains("Amazon Bedrock"));
     }
 }

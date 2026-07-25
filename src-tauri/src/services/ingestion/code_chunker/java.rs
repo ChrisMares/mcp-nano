@@ -9,7 +9,7 @@ use std::path::Path;
 
 use tree_sitter::Node;
 
-use super::helpers::{generate_chunk_id, make_remainder_chunk, node_text};
+use super::helpers::{generate_chunk_id, make_remainder_chunk, node_text, walk_preorder};
 use crate::services::ingestion::types::{CodeChunk, CodeChunkKind, JavaFields, Parameter};
 
 const FUNCTION_NODE_TYPES: &[&str] = &["method_declaration", "constructor_declaration"];
@@ -18,19 +18,14 @@ const TYPE_NODE_TYPES: &[&str] = &["class_declaration", "interface_declaration",
 pub fn extract_dependencies<'a>(root: Node<'a>, source: &[u8]) -> Vec<String> {
     let mut deps: Vec<String> = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    let mut stack: Vec<Node<'a>> = vec![root];
-    while let Some(node) = stack.pop() {
+    walk_preorder(root, |node| {
         if node.kind() == "import_declaration" {
             let dep = normalize_java_import(&node_text(&node, source));
             if !dep.is_empty() && seen.insert(dep.clone()) {
                 deps.push(dep);
             }
         }
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            stack.push(child);
-        }
-    }
+    });
     deps
 }
 

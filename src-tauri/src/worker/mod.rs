@@ -1,7 +1,10 @@
 pub mod progress;
 pub mod tasks;
 
-pub use progress::{noop_progress, progress_for_job, set_job_status, update_job_progress, ProgressCallback};
+pub use progress::{
+    emit_job_event, noop_progress, progress_for_job, progress_for_job_with_app, set_job_status,
+    update_job_progress, JobProgressEvent, ProgressCallback,
+};
 pub use tasks::{BoxedTaskFuture, TaskFn, TaskRegistry};
 
 use std::sync::Arc;
@@ -9,7 +12,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use sqlx::SqlitePool;
-use tauri::{AppHandle, Emitter};
+use tauri::AppHandle;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, warn};
@@ -19,6 +22,16 @@ use crate::models::entities::JobStatus;
 /// Maximum concurrent in-flight jobs. Mirrors the Python
 /// `MAX_CONCURRENT_JOBS = 2`.
 const MAX_CONCURRENT_JOBS: usize = 2;
+
+fn panic_payload_msg(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
+    }
+}
 
 /// Poll interval between worker sweeps. Mirrors `POLL_INTERVAL = 2.0` (sec).
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -87,9 +100,57 @@ async fn run_loop(
                         let sem = sem.clone();
                         let app = app.clone();
                         let task = tokio::spawn(async move {
-                            // Hold the permit for the lifetime of the task.
                             let _permit = sem.acquire_owned().await.expect("sem closed");
-                            run_job(&pool, &registry, job, app).await;
+                            let job_id = job.job_id.clone();
+                            let file_name = job.file_name.clone();
+                            let params: serde_json::Value = job
+                                .task_params
+                                .as_deref()
+                                .and_then(|s| serde_json::from_str(s).ok())
+                                .unwrap_or(serde_json::Value::Null);
+                            let pool_for_fail = pool.clone();
+                            let app_for_fail = app.clone();
+                            let inner = tokio::spawn(async move {
+                                run_job(&pool, &registry, job, app).await;
+                            });
+                            if let Err(join_err) = inner.await {
+                                let msg = if join_err.is_panic() {
+                                    let payload = join_err.into_panic();
+                                    let detail = panic_payload_msg(&payload);
+                                    format!("task panicked: {detail}")
+                                } else {
+                                    format!("task cancelled: {join_err}")
+                                };
+                                error!("worker task panicked for {job_id}: {msg}");
+                                if let Some(app) = app_for_fail.as_ref() {
+                                    progress::emit_job_event(
+                                        app,
+                                        "job_failed",
+                                        &progress::JobProgressEvent::new(
+                                            job_id.clone(),
+                                            100,
+                                            "FAILED",
+                                            file_name,
+                                            Some(msg.clone()),
+                                        ),
+                                    );
+                                }
+                                let _ = set_job_status(
+                                    &pool_for_fail,
+                                    &job_id,
+                                    "FAILED",
+                                    None,
+                                    Some(&msg),
+                                )
+                                .await;
+                                let _ = post_process_file_status(
+                                    &pool_for_fail,
+                                    &params,
+                                    "failed",
+                                    Some(&msg),
+                                )
+                                .await;
+                            }
                         });
                         inflight.push(task);
                     }
@@ -131,18 +192,22 @@ async fn run_job(
     app: Option<AppHandle>,
 ) {
     let job_id = job.job_id.clone();
+    let file_name = job.file_name.clone();
     let task_name = match &job.task_name {
         Some(n) => n.clone(),
         None => {
             let _ = set_job_status(pool, &job_id, "FAILED", None, Some("missing task_name")).await;
             if let Some(app) = app.as_ref() {
-                let _ = app.emit(
+                progress::emit_job_event(
+                    app,
                     "job_failed",
-                    progress::JobProgressEvent {
-                        job_id: job_id.clone(),
-                        percentage: 100,
-                        message: Some("missing task_name".to_string()),
-                    },
+                    &progress::JobProgressEvent::new(
+                        job_id.clone(),
+                        100,
+                        "FAILED",
+                        file_name.clone(),
+                        Some("missing task_name".to_string()),
+                    ),
                 );
             }
             return;
@@ -155,13 +220,16 @@ async fn run_job(
             let msg = format!("unknown task: {task_name}");
             let _ = set_job_status(pool, &job_id, "FAILED", None, Some(&msg)).await;
             if let Some(app) = app.as_ref() {
-                let _ = app.emit(
+                progress::emit_job_event(
+                    app,
                     "job_failed",
-                    progress::JobProgressEvent {
-                        job_id: job_id.clone(),
-                        percentage: 100,
-                        message: Some(msg.clone()),
-                    },
+                    &progress::JobProgressEvent::new(
+                        job_id.clone(),
+                        100,
+                        "FAILED",
+                        file_name.clone(),
+                        Some(msg),
+                    ),
                 );
             }
             return;
@@ -174,29 +242,47 @@ async fn run_job(
         .and_then(|s| serde_json::from_str(s).ok())
         .unwrap_or(serde_json::Value::Null);
 
+    if let Some(app) = app.as_ref() {
+        progress::emit_job_event(
+            app,
+            "job_progress",
+            &progress::JobProgressEvent::new(
+                job_id.clone(),
+                0,
+                "RUNNING",
+                file_name.clone(),
+                Some("Starting".to_string()),
+            ),
+        );
+    }
+
     let progress = match app.clone() {
-        Some(app) => progress::progress_for_job_with_app(pool.clone(), job_id.clone(), app),
+        Some(app) => progress::progress_for_job_with_app(
+            pool.clone(),
+            job_id.clone(),
+            app,
+            file_name.clone(),
+        ),
         None => progress_for_job(pool.clone(), job_id.clone()),
     };
 
     let result = task_fn(params.clone(), progress).await;
     match result {
         Ok(msg) => {
-            // Set progress to 100 before the terminal status, mirroring the
-            // Python `_run_task` which sets `progress_percentage = 100` on
-            // FINISHED. Awaits the update so the row reflects 100 before the
-            // status flip is observed.
             if let Err(e) = update_job_progress(pool, &job_id, 100, None).await {
                 error!("final progress update failed for {job_id}: {e:#}");
             }
             if let Some(app) = app.as_ref() {
-                let _ = app.emit(
+                progress::emit_job_event(
+                    app,
                     "job_finished",
-                    progress::JobProgressEvent {
-                        job_id: job_id.clone(),
-                        percentage: 100,
-                        message: Some(msg.clone()),
-                    },
+                    &progress::JobProgressEvent::new(
+                        job_id.clone(),
+                        100,
+                        "FINISHED",
+                        file_name.clone(),
+                        Some(msg.clone()),
+                    ),
                 );
             }
             let _ = set_job_status(pool, &job_id, "FINISHED", Some(&msg), None).await;
@@ -207,13 +293,16 @@ async fn run_job(
         Err(e) => {
             let msg = format!("{e:#}");
             if let Some(app) = app.as_ref() {
-                let _ = app.emit(
+                progress::emit_job_event(
+                    app,
                     "job_failed",
-                    progress::JobProgressEvent {
-                        job_id: job_id.clone(),
-                        percentage: 100,
-                        message: Some(msg.clone()),
-                    },
+                    &progress::JobProgressEvent::new(
+                        job_id.clone(),
+                        100,
+                        "FAILED",
+                        file_name.clone(),
+                        Some(msg.clone()),
+                    ),
                 );
             }
             let _ = set_job_status(pool, &job_id, "FAILED", None, Some(&msg)).await;

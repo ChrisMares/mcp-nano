@@ -4,7 +4,7 @@ use std::path::Path;
 
 use tree_sitter::Node;
 
-use super::helpers::{build_remainder_code, generate_chunk_id, node_text};
+use super::helpers::{build_remainder_code, generate_chunk_id, node_text, walk_preorder};
 use crate::services::ingestion::types::{CodeChunk, CodeChunkKind, Parameter, PythonFields};
 
 const FUNCTION_NODE_TYPE: &str = "function_definition";
@@ -26,8 +26,7 @@ pub fn extract_dependencies<'a>(root: Node<'a>, source: &[u8]) -> Vec<String> {
             deps.push(dep);
         }
     };
-    let mut stack: Vec<Node<'a>> = vec![root];
-    while let Some(node) = stack.pop() {
+    walk_preorder(root, |node| {
         if node.kind() == "import_statement" {
             let mut cursor = node.walk();
             for name_node in node.children_by_field_name("name", &mut cursor) {
@@ -40,11 +39,7 @@ pub fn extract_dependencies<'a>(root: Node<'a>, source: &[u8]) -> Vec<String> {
                 add("__future__".to_string(), &mut deps, &mut seen);
             }
         }
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            stack.push(child);
-        }
-    }
+    });
     deps
 }
 
@@ -68,20 +63,26 @@ pub fn extract_chunks<'a>(
     extract_scope(&node, source, file_path, deps, None, false, &mut chunks, &mut spans);
     let remainder = build_remainder_code(source, &spans);
     if !remainder.trim().is_empty() {
-        chunks.push(CodeChunk {
-            id: uuid::Uuid::new_v4().to_string(),
-            repo_name: String::new(),
-            file_name: Path::new(file_path)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(file_path)
-                .to_string(),
-            code: crate::services::ingestion::types::normalize_code(&remainder),
-            r#type: "file_remainder".to_string(),
-            dependencies: deps.to_vec(),
-            created_at: crate::services::ingestion::types::now_iso(),
-            kind: CodeChunkKind::Generic,
-        });
+        chunks.push(make_chunk(
+            file_path,
+            None,
+            None,
+            Vec::new(),
+            None,
+            Vec::new(),
+            Vec::new(),
+            false,
+            false,
+            false,
+            false,
+            None,
+            None,
+            None,
+            None,
+            remainder,
+            "file_remainder",
+            deps,
+        ));
     }
     chunks
 }
@@ -429,8 +430,10 @@ fn extract_class_properties<'a>(class_node: &Node<'a>, source: &[u8]) -> Vec<Par
             let annotation = assignment.child_by_field_name("type");
             let prop_type = annotation
                 .map(|a| node_text(&a, source))
-                .filter(|s| !TYPE_ALIAS_ANNOTATIONS.contains(&s.trim()))
                 .unwrap_or_default();
+            if TYPE_ALIAS_ANNOTATIONS.contains(&prop_type.trim()) {
+                continue;
+            }
             properties.push(Parameter::new(node_text(&left, source), prop_type));
         }
     }

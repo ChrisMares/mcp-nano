@@ -17,6 +17,47 @@ fn now_iso() -> String {
     Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
 }
 
+fn validate_server_name(name: &str) -> Result<String, String> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("Server name is required".into());
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Err("Only letters, numbers, and underscores allowed".into());
+    }
+    Ok(name)
+}
+
+async fn ensure_unique_server_name(
+    pool: &SqlitePool,
+    name: &str,
+    exclude_id: Option<&str>,
+) -> Result<(), String> {
+    let existing = if let Some(id) = exclude_id {
+        sqlx::query_scalar::<_, String>(
+            "SELECT id FROM mcp_servers WHERE name = ? AND id != ? LIMIT 1",
+        )
+        .bind(name)
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+    } else {
+        sqlx::query_scalar::<_, String>("SELECT id FROM mcp_servers WHERE name = ? LIMIT 1")
+            .bind(name)
+            .fetch_optional(pool)
+            .await
+    }
+    .map_err(|e| format!("checking server name uniqueness: {e}"))?;
+
+    if existing.is_some() {
+        return Err(format!("Server name already exists: {name}"));
+    }
+    Ok(())
+}
+
 pub async fn list_servers(pool: &SqlitePool) -> Result<ServersResponse, String> {
     let mut servers = sqlx::query_as::<_, McpServer>(
         "SELECT id, name, description, active, created_at, updated_at FROM mcp_servers ORDER BY created_at ASC",
@@ -36,10 +77,8 @@ pub async fn create_server(
     name: String,
     description: Option<String>,
 ) -> Result<ServerResponse, String> {
-    let name = name.trim().to_string();
-    if name.is_empty() {
-        return Err("Server name is required".into());
-    }
+    let name = validate_server_name(&name)?;
+    ensure_unique_server_name(pool, &name, None).await?;
     let id = Uuid::new_v4().to_string();
     let now = now_iso();
     sqlx::query(
@@ -79,11 +118,9 @@ pub async fn update_server(
     name: String,
     description: Option<String>,
 ) -> Result<ServerResponse, String> {
-    let name = name.trim().to_string();
-    if name.is_empty() {
-        return Err("Server name is required".into());
-    }
+    let name = validate_server_name(&name)?;
     let _ = get_server_row(pool, server_id).await?;
+    ensure_unique_server_name(pool, &name, Some(server_id)).await?;
     let now = now_iso();
     sqlx::query(
         "UPDATE mcp_servers SET name = ?, description = ?, updated_at = ? WHERE id = ?",
@@ -279,36 +316,34 @@ pub async fn connection_info(
 ) -> Result<ConnectionInfo, String> {
     let server = get_server_row(pool, server_id).await?;
     let mcp_url = format!("http://127.0.0.1:{port}/mcp");
-    let full_url = format!("{mcp_url}?server_id={server_id}");
-    let slug = server.name.to_lowercase().replace(' ', "-");
+    let full_url = format!("{mcp_url}?server_id={}", server.name);
     Ok(ConnectionInfo {
         mcp_url,
-        user_id: "local-user".into(),
-        server_id: server_id.to_string(),
-        server_name: server.name,
+        server_id: server.name.clone(),
+        server_name: server.name.clone(),
         full_url: full_url.clone(),
         config_snippets: json!({
-            "claude_desktop": { "mcpServers": { slug.clone(): { "url": full_url } } },
-            "opencode": { "mcp": { slug.clone(): { "type": "remote", "url": full_url } } },
-            "vscode": { "servers": { slug: { "type": "http", "url": full_url } } },
+            "claude_desktop": { "mcpServers": { server.name.clone(): { "url": full_url } } },
+            "opencode": { "mcp": { server.name.clone(): { "type": "remote", "url": full_url } } },
+            "vscode": { "servers": { server.name.clone(): { "type": "http", "url": full_url } } },
         }),
     })
 }
 
-/// Active tools for an optional server_id — used by the MCP protocol handler.
+/// Active tools for an optional MCP server name (`?server_id=` query value).
 pub async fn list_active_tools(
     pool: &SqlitePool,
-    server_id: Option<&str>,
+    server_name: Option<&str>,
 ) -> Result<Vec<ToolDefinition>, String> {
-    let tools = if let Some(sid) = server_id {
+    let tools = if let Some(name) = server_name {
         sqlx::query_as::<_, ToolDefinition>(
             "SELECT t.id, t.mcp_server_id, t.name, t.description, t.active, t.created_at, t.updated_at \
              FROM tool_definitions t \
              JOIN mcp_servers s ON s.id = t.mcp_server_id \
-             WHERE t.active = 1 AND s.active = 1 AND t.mcp_server_id = ? \
+             WHERE t.active = 1 AND s.active = 1 AND s.name = ? \
              ORDER BY t.created_at ASC",
         )
-        .bind(sid)
+        .bind(name)
         .fetch_all(pool)
         .await
     } else {
@@ -336,10 +371,10 @@ pub async fn list_active_tools(
 
 pub async fn find_active_tool_by_name(
     pool: &SqlitePool,
-    server_id: Option<&str>,
+    server_name: Option<&str>,
     name: &str,
 ) -> Result<Option<ToolDefinition>, String> {
-    let tools = list_active_tools(pool, server_id).await?;
+    let tools = list_active_tools(pool, server_name).await?;
     Ok(tools.into_iter().find(|t| t.name == name))
 }
 

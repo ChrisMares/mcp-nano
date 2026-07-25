@@ -16,14 +16,22 @@ describe('JobStatusPanel', () => {
     expect(screen.getByText('Submitting files for processing...')).toBeInTheDocument()
   })
 
-  it('renders active jobs with status', () => {
+  it('renders active jobs with filename and progress message', () => {
     const jobs = [
-      { job_id: 'j1', status: 'RUNNING', progress_percentage: 50, file_name: 'test.pdf', created_at: null },
+      {
+        job_id: 'j1',
+        status: 'RUNNING',
+        progress_percentage: 50,
+        file_name: 'test.pdf',
+        created_at: null,
+        message: 'Embedding batches 2/4',
+      },
     ]
     renderWithProviders(<JobStatusPanel processing={false} activeJobs={jobs} completedJobs={[]} />)
     expect(screen.getByText('test.pdf')).toBeInTheDocument()
     expect(screen.getByText('RUNNING')).toBeInTheDocument()
     expect(screen.getByText('50%')).toBeInTheDocument()
+    expect(screen.getByText('Embedding batches 2/4')).toBeInTheDocument()
   })
 
   it('renders completed jobs', () => {
@@ -35,12 +43,30 @@ describe('JobStatusPanel', () => {
     expect(screen.getByText('Completed')).toBeInTheDocument()
   })
 
-  it('shows job_id when file_name is null', () => {
+  it('renders failed jobs with error styling', () => {
     const jobs = [
-      { job_id: 'abc-123', status: 'PENDING', progress_percentage: 0, file_name: null, created_at: null },
+      {
+        job_id: 'j-fail',
+        status: 'FAILED',
+        progress_percentage: 100,
+        file_name: 'bad.pdf',
+        created_at: null,
+        message: 'pdf-extract panicked',
+      },
+    ]
+    renderWithProviders(<JobStatusPanel processing={false} activeJobs={[]} completedJobs={jobs} />)
+    expect(screen.getByText('bad.pdf')).toBeInTheDocument()
+    expect(screen.getByText('Failed')).toBeInTheDocument()
+    expect(screen.getByText('pdf-extract panicked')).toBeInTheDocument()
+  })
+
+  it('shows Untitled when file_name is null instead of a bare GUID', () => {
+    const jobs = [
+      { job_id: 'abc-123-guid', status: 'PENDING', progress_percentage: 0, file_name: null, created_at: null },
     ]
     renderWithProviders(<JobStatusPanel processing={false} activeJobs={jobs} completedJobs={[]} />)
-    expect(screen.getByText('abc-123')).toBeInTheDocument()
+    expect(screen.getByText('Untitled')).toBeInTheDocument()
+    expect(screen.queryByText('abc-123-guid')).not.toBeInTheDocument()
   })
 
   it('renders PENDING job with queue position', () => {

@@ -4,6 +4,7 @@ export interface EmbedJob {
   progress_percentage: number;
   file_name: string | null;
   created_at: string | null;
+  message?: string | null;
   queue_position?: number;
   total_in_queue?: number;
 }

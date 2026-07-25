@@ -50,11 +50,7 @@ const BackendStatusBanner: React.FC = () => {
   if (!status.worker_ready) parts.push("worker");
 
   if (ready(status)) {
-    return (
-      <div className="px-4 py-1.5 text-xs text-muted-foreground bg-muted/40 border-b border-border" role="status">
-        Embedding: <span className="font-medium text-foreground">{status.embedding_device ?? "initializing"}</span>
-      </div>
-    );
+    return null;
   }
 
   return (

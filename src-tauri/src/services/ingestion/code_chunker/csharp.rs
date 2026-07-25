@@ -4,7 +4,7 @@ use std::path::Path;
 
 use tree_sitter::Node;
 
-use super::helpers::{generate_chunk_id, node_text};
+use super::helpers::{generate_chunk_id, node_text, walk_preorder};
 use crate::services::ingestion::types::{CSharpFields, CodeChunk, CodeChunkKind, Parameter};
 
 const NAMED_DECLARATION_TYPES: &[&str] = &[
@@ -20,8 +20,7 @@ const NAMED_DECLARATION_TYPES: &[&str] = &[
 pub fn extract_dependencies<'a>(root: Node<'a>, source: &[u8]) -> Vec<String> {
     let mut deps: Vec<String> = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    let mut stack: Vec<Node<'a>> = vec![root];
-    while let Some(node) = stack.pop() {
+    walk_preorder(root, |node| {
         if node.kind() == "using_directive" {
             let using_text = node_text(&node, source);
             if let Some(dep) = normalize_csharp_using(&using_text) {
@@ -30,11 +29,7 @@ pub fn extract_dependencies<'a>(root: Node<'a>, source: &[u8]) -> Vec<String> {
                 }
             }
         }
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            stack.push(child);
-        }
-    }
+    });
     deps
 }
 

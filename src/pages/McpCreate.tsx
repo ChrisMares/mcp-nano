@@ -1,6 +1,5 @@
 import React, { useState, useEffect, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
-import { useAuth } from "@/hooks/useAuth";
 import { useScopeOptions } from "@/hooks/useScopeOptions";
 import { useToolForm } from "@/hooks/useToolForm";
 import { getMcpServers, createMcpServer, createMcpTool } from "@/utils/apicalls";
@@ -16,16 +15,18 @@ import { alertError } from "@/styles/classes";
 const SERVER_NAME_RE = /^[A-Za-z0-9_]+$/;
 const STEP_LABELS = ["MCP Server", "Select Data", "Tool Details"];
 
-const validateServerName = (name: string): string | null => {
+const validateServerName = (name: string, existingNames: string[] = []): string | null => {
   if (!name.trim()) return "Server name is required";
   if (!SERVER_NAME_RE.test(name)) return "Only letters, numbers, and underscores allowed";
+  if (existingNames.some((n) => n.toLowerCase() === name.toLowerCase())) {
+    return "Server name already exists";
+  }
   return null;
 };
 
 const McpCreate: React.FC = () => {
-  const { user } = useAuth();
   const navigate = useNavigate();
-  const { repoOptions, groupOptions, websiteOptions } = useScopeOptions(user?.id);
+  const { repoOptions, groupOptions, websiteOptions } = useScopeOptions();
   const { form, toggleRepo, toggleGroup, setRepos, setGroups, toggleWebsite, setWebsites, updateForm } = useToolForm();
   const [step, setStep] = useState(1);
 
@@ -40,7 +41,6 @@ const McpCreate: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!user) return;
     getMcpServers()
       .then((res) => {
         const servers: McpServer[] = res?.servers || [];
@@ -48,24 +48,37 @@ const McpCreate: React.FC = () => {
         if (servers.length > 0) setServerMode(servers[0].id);
       })
       .catch(() => setExistingServers([]));
-  }, [user]);
+  }, []);
+
+  const existingNames = existingServers.map((s) => s.name);
+
+  useEffect(() => {
+    if (serverName) {
+      setServerNameError(
+        validateServerName(
+          serverName,
+          existingServers.map((s) => s.name),
+        ),
+      );
+    }
+  }, [existingServers, serverName]);
 
   const handleServerNameChange = (value: string) => {
     const cleaned = value.replace(/\s/g, "");
     setServerName(cleaned);
-    setServerNameError(validateServerName(cleaned));
+    setServerNameError(validateServerName(cleaned, existingNames));
   };
 
   const handleStep1Next = () => {
     if (serverMode === "new") {
-      const err = validateServerName(serverName);
+      const err = validateServerName(serverName, existingNames);
       if (err) { setServerNameError(err); return; }
     }
     setStep(2);
   };
 
   const handleSave = useCallback(async () => {
-    if (!user || !form.name.trim()) return;
+    if (!form.name.trim()) return;
     setSaving(true);
     setError(null);
 
@@ -86,9 +99,7 @@ const McpCreate: React.FC = () => {
     } finally {
       setSaving(false);
     }
-  }, [form, user, serverMode, serverName, navigate]);
-
-  if (!user) return null;
+  }, [form, serverMode, serverName, navigate]);
 
   return (
     <div className="rounded-lg border border-border bg-card p-6">

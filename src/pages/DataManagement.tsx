@@ -1,5 +1,4 @@
-import React, { useState, useEffect, useCallback } from "react";
-import { useAuth } from "@/hooks/useAuth";
+import React, { useState, useEffect, useCallback, useMemo } from "react";
 import {
   getFiles,
   getWebsites,
@@ -61,7 +60,6 @@ const formatDate = (iso: string) => {
 };
 
 const DataManagement: React.FC = () => {
-  const { user } = useAuth();
   const [userFiles, setUserFiles] = useState<UserFiles | null>(null);
   const [websites, setWebsites] = useState<WebsiteItem[]>([]);
   const [loading, setLoading] = useState(true);
@@ -72,7 +70,6 @@ const DataManagement: React.FC = () => {
   const [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>({});
 
   const fetchFiles = useCallback(async () => {
-    if (!user) return;
     try {
       const res = await getFiles();
       setUserFiles(res);
@@ -81,17 +78,16 @@ const DataManagement: React.FC = () => {
     } finally {
       setLoading(false);
     }
-  }, [user]);
+  }, []);
 
   const fetchWebsites = useCallback(async () => {
-    if (!user) return;
     try {
       const res = await getWebsites();
       setWebsites(res.websites ?? []);
     } catch (err) {
       console.error("Failed to fetch websites:", err);
     }
-  }, [user]);
+  }, []);
 
   useEffect(() => {
     fetchFiles();
@@ -174,33 +170,39 @@ const DataManagement: React.FC = () => {
       message: `You are about to delete all website embeddings in group '${groupName}'. Documents in this group will NOT be affected.`,
     });
 
-  if (!user) return null;
+  const documentsByGroup = useMemo(() => {
+    return (userFiles?.documents ?? []).reduce<Record<string, DocItem[]>>((acc, doc) => {
+      const groupName = doc.group || "default";
+      const typeParts = doc.file_type?.split("/");
+      const t = typeParts ? typeParts[typeParts.length - 1] : doc.file_type;
+      (acc[groupName] ??= []).push({ ...doc, file_type: t });
+      return acc;
+    }, {});
+  }, [userFiles?.documents]);
 
-  const documentsByGroup = (userFiles?.documents ?? []).reduce<Record<string, DocItem[]>>((acc, doc) => {
-    const groupName = doc.group || "default";
-    const typeParts = doc.file_type?.split("/");
-    const t = typeParts ? typeParts[typeParts.length - 1] : doc.file_type;
-    (acc[groupName] ??= []).push({ ...doc, file_type: t });
-    return acc;
-  }, {});
+  const sortedGroupNames = useMemo(() => {
+    return Object.keys(documentsByGroup).sort((a, b) => {
+      if (a === "default") return -1;
+      if (b === "default") return 1;
+      return a.localeCompare(b);
+    });
+  }, [documentsByGroup]);
 
-  const sortedGroupNames = Object.keys(documentsByGroup).sort((a, b) => {
-    if (a === "default") return -1;
-    if (b === "default") return 1;
-    return a.localeCompare(b);
-  });
+  const websitesByGroup = useMemo(() => {
+    return websites.reduce<Record<string, WebsiteItem[]>>((acc, w) => {
+      const g = w.group || "default";
+      (acc[g] ??= []).push(w);
+      return acc;
+    }, {});
+  }, [websites]);
 
-  const websitesByGroup = websites.reduce<Record<string, WebsiteItem[]>>((acc, w) => {
-    const g = w.group || "default";
-    (acc[g] ??= []).push(w);
-    return acc;
-  }, {});
-
-  const sortedWebsiteGroups = Object.keys(websitesByGroup).sort((a, b) => {
-    if (a === "default") return -1;
-    if (b === "default") return 1;
-    return a.localeCompare(b);
-  });
+  const sortedWebsiteGroups = useMemo(() => {
+    return Object.keys(websitesByGroup).sort((a, b) => {
+      if (a === "default") return -1;
+      if (b === "default") return 1;
+      return a.localeCompare(b);
+    });
+  }, [websitesByGroup]);
 
   return (
     <div className="max-w-[788px] space-y-4">

@@ -1,8 +1,13 @@
 import React, { useState, useEffect, useCallback } from "react";
-import { useAuth } from "@/hooks/useAuth";
 import { getMetadataValues, ragQuery } from "@/utils/apicalls";
 import { Loader2 } from "lucide-react";
-import { radioInput, textareaInput, btnPrimary, fieldLabel, sliderBounds } from "@/styles/classes";
+import {
+  radioInput,
+  textareaInput,
+  btnPrimary,
+  fieldLabel,
+  sliderBounds,
+} from "@/styles/classes";
 import PageHead from "@/components/shared/PageHead";
 import { useTheme } from "@/contexts/ThemeContext";
 import type { RagQueryPayload, RagResponse } from "@/types/rag";
@@ -14,15 +19,23 @@ const SLIDER_CONFIG = [
 ] as const;
 
 const FetchContext: React.FC = () => {
-  const { user } = useAuth();
+  console.log("Rendering FetchContext component");
+
   const { theme } = useTheme();
-  const [collection, setCollection] = useState<"codebase" | "general">("codebase");
+  const [collection, setCollection] = useState<"codebase" | "general">(
+    "codebase",
+  );
   const [query, setQuery] = useState("");
   const [limit, setLimit] = useState(10);
   const [filterOptions, setFilterOptions] = useState<string[]>([]);
-  const [selectedFilters, setSelectedFilters] = useState<Set<string>>(new Set());
+  const [selectedFilters, setSelectedFilters] = useState<Set<string>>(
+    new Set(),
+  );
   const [loading, setLoading] = useState(false);
-  const [result, setResult] = useState<{ rag_response?: RagResponse; error?: string } | null>(null);
+  const [result, setResult] = useState<{
+    rag_response?: RagResponse;
+    error?: string;
+  } | null>(null);
 
   const sliderValues: Record<string, number> = { limit };
   const sliderSetters: Record<string, (v: number) => void> = {
@@ -30,7 +43,6 @@ const FetchContext: React.FC = () => {
   };
 
   useEffect(() => {
-    if (!user) return;
     setSelectedFilters(new Set());
     const key = collection === "codebase" ? "repo_name" : "group";
     getMetadataValues(collection, key)
@@ -41,7 +53,7 @@ const FetchContext: React.FC = () => {
         }
       })
       .catch(() => setFilterOptions([]));
-  }, [collection, user]);
+  }, [collection]);
 
   const handleCollectionChange = (val: "codebase" | "general") => {
     setCollection(val);
@@ -72,7 +84,9 @@ const FetchContext: React.FC = () => {
     };
 
     if (selectedFilters.size > 0) {
-      payload.where = { $or: Array.from(selectedFilters).map((v) => ({ [filterKey]: v })) };
+      payload.where = {
+        $or: Array.from(selectedFilters).map((v) => ({ [filterKey]: v })),
+      };
     }
 
     try {
@@ -86,8 +100,6 @@ const FetchContext: React.FC = () => {
     }
   }, [collection, query, limit, selectedFilters]);
 
-  if (!user) return null;
-
   const filterLabel = collection === "codebase" ? "Repos" : "Groups";
   const canSubmit = query.trim().length > 0 && !loading;
 
@@ -99,15 +111,22 @@ const FetchContext: React.FC = () => {
         path="/query/fetch"
       />
       <h1 className="text-2xl font-bold text-foreground mb-4">Fetch Context</h1>
-      <p className="text-muted-foreground mb-6">Query your embedded data to retrieve relevant context.</p>
+      <p className="text-muted-foreground mb-6">
+        Query your embedded data to retrieve relevant context.
+      </p>
 
       <div className="max-w-3xl space-y-6">
         {/* Collection Radio */}
         <div>
-          <label className="block text-sm font-medium text-foreground mb-3">Collection</label>
+          <label className="block text-sm font-medium text-foreground mb-3">
+            Collection
+          </label>
           <div className="flex gap-6">
             {(["codebase", "general"] as const).map((val) => (
-              <label key={val} className="flex items-center gap-2 cursor-pointer">
+              <label
+                key={val}
+                className="flex items-center gap-2 cursor-pointer"
+              >
                 <input
                   type="radio"
                   name="collection"
@@ -116,7 +135,9 @@ const FetchContext: React.FC = () => {
                   onChange={() => handleCollectionChange(val)}
                   className={radioInput}
                 />
-                <span className="text-sm text-foreground capitalize">{val}</span>
+                <span className="text-sm text-foreground capitalize">
+                  {val}
+                </span>
               </label>
             ))}
           </div>
@@ -147,7 +168,8 @@ const FetchContext: React.FC = () => {
           {SLIDER_CONFIG.map(({ key, label, min, max, step }) => (
             <div key={key}>
               <label className={fieldLabel}>
-                {label}: <span className="text-primary">{sliderValues[key]}</span>
+                {label}:{" "}
+                <span className="text-primary">{sliderValues[key]}</span>
               </label>
               <input
                 type="range"
@@ -166,7 +188,11 @@ const FetchContext: React.FC = () => {
           ))}
         </div>
 
-        <button onClick={handleSubmit} disabled={!canSubmit} className={btnPrimary}>
+        <button
+          onClick={handleSubmit}
+          disabled={!canSubmit}
+          className={btnPrimary}
+        >
           {loading ? (
             <>
               <Loader2 className="h-4 w-4 animate-spin" />

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Download the embedder + reranker safetensors + tokenizers into
+# Download the embedder + reranker ONNX models + tokenizers into
 # src-tauri/resources/models/. Re-runnable: skips files that already exist
 # with non-zero size.
 #
 # Layout produced:
-#   resources/models/arctic-embed-xs/{model.safetensors,tokenizer.json,config.json}
-#   resources/models/minilm-l6-v2/{model.safetensors,tokenizer.json,config.json}
+#   resources/models/arctic-embed-xs/{model.onnx,tokenizer.json,config.json}
+#   resources/models/minilm-l6-v2/{model.onnx,tokenizer.json,config.json}
 #
 # BM25 stopwords are embedded directly in the Rust crate (no download).
 set -euo pipefail
@@ -30,17 +30,17 @@ fetch() {
     fi
 }
 
-echo "Dense embedder: Snowflake/snowflake-arctic-embed-xs"
+echo "Dense embedder: Snowflake/snowflake-arctic-embed-xs (ONNX)"
 DENSE_BASE="https://huggingface.co/Snowflake/snowflake-arctic-embed-xs/resolve/main"
-fetch "${DENSE_BASE}/model.safetensors" "${MODELS_DIR}/arctic-embed-xs/model.safetensors"
-fetch "${DENSE_BASE}/tokenizer.json"    "${MODELS_DIR}/arctic-embed-xs/tokenizer.json"
-fetch "${DENSE_BASE}/config.json"       "${MODELS_DIR}/arctic-embed-xs/config.json"
+fetch "${DENSE_BASE}/onnx/model.onnx" "${MODELS_DIR}/arctic-embed-xs/model.onnx"
+fetch "${DENSE_BASE}/tokenizer.json"  "${MODELS_DIR}/arctic-embed-xs/tokenizer.json"
+fetch "${DENSE_BASE}/config.json"     "${MODELS_DIR}/arctic-embed-xs/config.json"
 
-echo "Reranker: cross-encoder/ms-marco-MiniLM-L6-v2"
+echo "Reranker: cross-encoder/ms-marco-MiniLM-L6-v2 (ONNX)"
 RERANKER_BASE="https://huggingface.co/cross-encoder/ms-marco-MiniLM-L6-v2/resolve/main"
-fetch "${RERANKER_BASE}/model.safetensors" "${MODELS_DIR}/minilm-l6-v2/model.safetensors"
-fetch "${RERANKER_BASE}/tokenizer.json"    "${MODELS_DIR}/minilm-l6-v2/tokenizer.json"
-fetch "${RERANKER_BASE}/config.json"       "${MODELS_DIR}/minilm-l6-v2/config.json"
+fetch "${RERANKER_BASE}/onnx/model.onnx" "${MODELS_DIR}/minilm-l6-v2/model.onnx"
+fetch "${RERANKER_BASE}/tokenizer.json"  "${MODELS_DIR}/minilm-l6-v2/tokenizer.json"
+fetch "${RERANKER_BASE}/config.json"     "${MODELS_DIR}/minilm-l6-v2/config.json"
 
 echo "Done."
 ls -lh "${MODELS_DIR}"/*/

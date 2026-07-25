@@ -25,7 +25,6 @@ pub struct MessageResponse {
 #[derive(Debug, Default, Serialize)]
 pub struct ConnectionInfo {
     pub mcp_url: String,
-    pub user_id: String,
     pub server_id: String,
     pub server_name: String,
     pub full_url: String,

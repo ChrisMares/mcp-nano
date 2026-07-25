@@ -23,7 +23,7 @@ export const fieldLabel = "block text-sm font-medium text-foreground mb-1";
 
 // Buttons
 export const btnPrimary =
-  "px-6 py-2.5 bg-primary text-primary-foreground rounded-md hover:bg-primary/85 shadow-md hover:shadow-lg hover:shadow-primary/20 transition-all font-semibold disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2";
+  "px-6 py-2.5 bg-primary text-primary-foreground rounded-md hover:bg-primary/85 shadow-md hover:shadow-lg hover:shadow-primary/20 transition-[background-color,box-shadow,opacity] font-semibold disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2";
 export const btnDanger =
   "px-4 py-2 border border-destructive/30 text-destructive rounded-md hover:bg-destructive/10 transition-colors font-medium flex items-center gap-2 text-sm";
 export const btnSecondary =
@@ -93,7 +93,7 @@ export const wizardConnector =
 export const wizardNav =
   "flex items-center justify-between mt-6 pt-4 border-t border-border";
 export const wizardCard =
-  "rounded-lg border-2 p-5 cursor-pointer transition-all";
+  "rounded-lg border-2 p-5 cursor-pointer transition-[border-color,background-color,box-shadow]";
 export const wizardCardSelected =
   "border-primary bg-primary/5 shadow-md shadow-primary/10";
 export const wizardCardUnselected =

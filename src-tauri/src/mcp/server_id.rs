@@ -3,7 +3,7 @@ use axum::http::Uri;
 use axum::middleware::Next;
 use axum::response::Response;
 
-/// Request extension carrying `?server_id=` from the MCP URL.
+/// Request extension carrying `?server_id=` (MCP server name) from the MCP URL.
 #[derive(Debug, Clone)]
 pub struct ServerId(pub String);
 
@@ -30,10 +30,10 @@ mod tests {
 
     #[test]
     fn parses_server_id_query() {
-        let uri: Uri = "http://127.0.0.1:18651/mcp?server_id=abc-123"
+        let uri: Uri = "http://127.0.0.1:18651/mcp?server_id=test_mcp"
             .parse()
             .unwrap();
-        assert_eq!(server_id_from_uri(&uri).as_deref(), Some("abc-123"));
+        assert_eq!(server_id_from_uri(&uri).as_deref(), Some("test_mcp"));
     }
 
     #[test]

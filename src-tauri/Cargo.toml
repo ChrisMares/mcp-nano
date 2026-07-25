@@ -16,9 +16,12 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [features]
 default = []
-# Requires the CUDA toolkit at build time. At runtime the application falls
-# back to CPU when no compatible NVIDIA device/driver is available.
-cuda = ["candle-core/cuda"]
+# Linux NVIDIA: ORT CUDA EP. Needs CUDA >= 12.8 and cuDNN >= 9.19 at runtime.
+cuda = ["ort/cuda"]
+# Windows GPU via DirectML (no CUDA toolkit required).
+directml = ["ort/directml"]
+# Enable both EPs in the binary; runtime selects by OS.
+gpu = ["cuda", "directml"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -40,9 +43,7 @@ rmcp = { version = "2.2.0", features = [
     "transport-child-process",
 ] }
 sqlx = { version = "0.9.0", features = ["runtime-tokio", "tls-rustls", "sqlite", "migrate", "macros", "chrono", "uuid"] }
-candle-core = "0.11.0"
-candle-nn = "0.11.0"
-candle-transformers = "0.11.0"
+ort = { version = "=2.0.0-rc.12", default-features = true }
 tokenizers = "0.23.1"
 text-splitter = { version = "0.32.0", features = ["tokenizers"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "http2", "charset", "json"] }

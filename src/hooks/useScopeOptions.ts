@@ -6,14 +6,12 @@ interface WebsiteItem {
 }
 
 // Fetches available repo names, document group IDs, and website hostnames for scope selection
-export function useScopeOptions(userId: string | undefined) {
+export function useScopeOptions() {
   const [repoOptions, setRepoOptions] = useState<string[]>([]);
   const [groupOptions, setGroupOptions] = useState<string[]>([]);
   const [websiteOptions, setWebsiteOptions] = useState<string[]>([]);
 
   useEffect(() => {
-    if (!userId) return;
-
     getMetadataValues("codebase", "repo_name")
       .then((res) => { if (res?.values) { const sorted = [...res.values].sort(); setRepoOptions(sorted); } })
       .catch(() => setRepoOptions([]));
@@ -39,7 +37,7 @@ export function useScopeOptions(userId: string | undefined) {
         setGroupOptions([]);
         setWebsiteOptions([]);
       });
-  }, [userId]);
+  }, []);
 
   return { repoOptions, groupOptions, websiteOptions };
 }

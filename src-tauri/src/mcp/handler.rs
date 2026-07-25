@@ -14,6 +14,9 @@ use crate::models::request::RagQueryRequest;
 use crate::services::mcp_config;
 use crate::services::rag_service::RagService;
 
+const DEFAULT_LIMIT: i64 = 5;
+const MAX_LIMIT: i64 = 10;
+
 /// Shared state for every MCP session handler.
 #[derive(Clone)]
 pub struct McpAppState {
@@ -21,7 +24,7 @@ pub struct McpAppState {
     pub rag: Arc<RagService>,
 }
 
-/// Dynamic MCP server: tools are loaded from SQLite per `server_id`.
+/// Dynamic MCP server: tools are loaded from SQLite per server name (`server_id` query).
 #[derive(Clone)]
 pub struct McpHandler {
     state: Arc<McpAppState>,
@@ -36,7 +39,10 @@ impl McpHandler {
 impl ServerHandler for McpHandler {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("VectorFlow RAG Server", env!("CARGO_PKG_VERSION")))
+            .with_server_info(Implementation::new(
+                "VectorFlow RAG Server",
+                env!("CARGO_PKG_VERSION"),
+            ))
             .with_instructions("Local RAG search tools scoped by MCP server configuration.")
             .with_protocol_version(ProtocolVersion::V_2025_03_26)
     }
@@ -84,7 +90,7 @@ impl ServerHandler for McpHandler {
             Ok(Some(t)) => t,
             Ok(None) => {
                 return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-                    "Error: tool '{name}' not found for this user"
+                    "Error: tool '{name}' not found for this server"
                 ))]));
             }
             Err(e) => {
@@ -100,15 +106,14 @@ impl ServerHandler for McpHandler {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+
         let mut limit = args
             .get("limit")
             .and_then(|v| v.as_i64())
-            .unwrap_or(5);
-        if limit > 20 {
-            limit = 20;
-        }
-        if limit < 1 {
-            limit = 1;
+            .unwrap_or(DEFAULT_LIMIT);
+
+        if limit > MAX_LIMIT || limit < 1 {
+            limit = DEFAULT_LIMIT;
         }
 
         let mut requests = Vec::new();
@@ -163,13 +168,10 @@ fn search_input_schema() -> serde_json::Map<String, serde_json::Value> {
             "limit": {
                 "type": "integer",
                 "description": "Maximum number of results to return",
-                "default": 10
+                "default": 5
             }
         },
         "required": ["query"]
     });
-    schema
-        .as_object()
-        .cloned()
-        .unwrap_or_default()
+    schema.as_object().cloned().unwrap_or_default()
 }

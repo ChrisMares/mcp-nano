@@ -66,7 +66,9 @@ pub async fn get_metadata_keys(
 
 #[tauri::command]
 pub async fn get_embedders_status(app: AppHandle) -> Result<EmbedderStatusResponse, String> {
-    let embedders_loaded = app.try_state::<Arc<EmbedderState>>().is_some();
+    let embedder_state = app.try_state::<Arc<EmbedderState>>();
+    let embedders_loaded = embedder_state.is_some();
+    let embedding_device = embedder_state.map(|s| s.device_mode().to_string());
     let models_dir = EmbedderState::models_dir(&app)
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
@@ -75,6 +77,7 @@ pub async fn get_embedders_status(app: AppHandle) -> Result<EmbedderStatusRespon
         reranker_loaded: embedders_loaded,
         bm25_loaded: embedders_loaded,
         models_dir,
+        embedding_device,
     })
 }
 

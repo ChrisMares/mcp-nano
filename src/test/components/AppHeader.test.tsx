@@ -15,8 +15,8 @@ describe('AppHeader', () => {
     expect(screen.getByText('NASA MCP')).toBeInTheDocument()
   })
 
-  it('renders user dropdown (display name from email)', () => {
+  it('renders local mode dropdown', () => {
     renderWithProviders(<AppHeader />)
-    expect(screen.getByText('test')).toBeInTheDocument()
+    expect(screen.getByText('Local')).toBeInTheDocument()
   })
 })

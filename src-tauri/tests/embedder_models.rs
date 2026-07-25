@@ -3,7 +3,7 @@
 //! files are absent (run `scripts/download-models.sh` to fetch them).
 //!
 //! Unlike the Qdrant E2E tests in `qdrant_e2e.rs`, these do not spawn any
-//! external process — they only need the safetensors files on disk — so
+//! external process — they only need the ONNX model files on disk — so
 //! they are NOT marked `#[ignore]`. Run with:
 //!
 //! ```sh
@@ -108,6 +108,22 @@ fn relevant_doc_scores_higher_than_irrelevant() {
 }
 
 #[test]
+fn rerank_truncates_very_long_documents() {
+    let Some(r) = reranker_ready() else {
+        eprintln!("skipping: minilm-l6-v2 model not downloaded; run scripts/download-models.sh");
+        return;
+    };
+    // Far beyond 512 tokens — previously OOMed the CUDA EP (~28GB alloc).
+    let long_doc = "fn foo() { let x = 1; }\n".repeat(50_000);
+    let docs = [long_doc.as_str(), "short relevant rust function"];
+    let scores = r
+        .rerank("rust function", &docs, 2)
+        .expect("rerank long docs");
+    assert_eq!(scores.len(), 2);
+    assert!(scores.iter().all(|x| x.is_finite()));
+}
+
+#[test]
 fn empty_documents_returns_empty_scores() {
     let Some(r) = reranker_ready() else {
         eprintln!("skipping: minilm-l6-v2 model not downloaded; run scripts/download-models.sh");
@@ -120,15 +136,22 @@ fn empty_documents_returns_empty_scores() {
 #[test]
 fn embedder_state_reports_selected_device() {
     let models_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/models");
-    if !models_dir.join("arctic-embed-xs/model.safetensors").exists()
-        || !models_dir.join("minilm-l6-v2/model.safetensors").exists()
+    if !models_dir.join("arctic-embed-xs/model.onnx").exists()
+        || !models_dir.join("minilm-l6-v2/model.onnx").exists()
     {
         eprintln!("skipping: embedding models not downloaded; run scripts/download-models.sh");
         return;
     }
 
     let state = EmbedderState::load(&models_dir).expect("load embedder state");
-    assert!(state.device_mode().starts_with("CPU") || state.device_mode() == "CUDA (GPU)");
+    eprintln!("embedder device_mode={}", state.device_mode());
+    assert!(
+        state.device_mode().starts_with("CPU")
+            || state.device_mode() == "CUDA (GPU)"
+            || state.device_mode() == "DirectML (GPU)",
+        "unexpected device_mode: {}",
+        state.device_mode()
+    );
     let embedding = state.dense.encode_query("GPU device selection test").expect("encode query");
     assert_eq!(embedding.len(), state.dense.dim());
 }

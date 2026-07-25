@@ -1,4 +1,4 @@
-import { useCallback } from "react";
+import { useCallback, useState } from "react";
 import { Link, useLocation } from "react-router-dom";
 import { LayoutDashboard } from "lucide-react";
 import { FolderIcon, ChatIcon, PlugIn } from "@/icons";
@@ -47,7 +47,8 @@ const navItems: NavItem[] = [
 const sidebarWidth = (expanded: boolean) => expanded ? "w-[290px]" : "w-[90px]";
 
 const AppSidebar: React.FC = () => {
-  const { isExpanded, isMobileOpen, isHovered, setIsHovered } = useSidebar();
+  const { isExpanded, isMobileOpen } = useSidebar();
+  const [isHovered, setIsHovered] = useState(false);
   const location = useLocation();
   const isActive = useCallback((path: string) => {
     return location.pathname === path;
@@ -57,7 +58,7 @@ const AppSidebar: React.FC = () => {
 
   return (
     <aside
-      className={`fixed mt-16 flex flex-col lg:mt-0 top-0 px-5 left-0 bg-sidebar text-sidebar-foreground h-screen transition-all duration-300 ease-in-out z-50 border-r border-sidebar-border shadow-lg
+      className={`fixed top-16 bottom-0 left-0 z-50 flex flex-col bg-sidebar px-5 text-sidebar-foreground transition-[width,transform] duration-300 ease-in-out border-r border-sidebar-border shadow-lg lg:top-0
         ${sidebarWidth(showLabels)}
         ${isMobileOpen ? "translate-x-0" : "-translate-x-full"}
         lg:translate-x-0`}
@@ -67,7 +68,7 @@ const AppSidebar: React.FC = () => {
       <div className={`py-4 flex ${!showLabels ? "lg:justify-center" : "justify-center"}`}>
         <Link 
           to="/" 
-          className="logo-container w-full flex items-center justify-center px-3 py-5 rounded-xl transition-all duration-300"
+          className="logo-container w-full flex items-center justify-center px-3 py-5 rounded-xl"
         >
           {showLabels ? (
             <BlockLogo className="sidebar-block-logo max-w-[200px]" />

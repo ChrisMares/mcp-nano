@@ -1,6 +1,5 @@
 import React, { useState, useEffect } from "react";
 import { Link } from "react-router-dom";
-import { useAuth } from "@/hooks/useAuth";
 import { getFiles, getMcpServers, getMcpServer, getWebsites } from "@/utils/apicalls";
 import { Database, Search, Plug, Code2, FileText, Server, Wrench, Loader2, ArrowRight } from "lucide-react";
 import PageHead from "@/components/shared/PageHead";
@@ -54,13 +53,10 @@ const statCards = [
 ];
 
 const Dashboard: React.FC = () => {
-  const { user } = useAuth();
   const [stats, setStats] = useState<DashboardStats>(emptyStats);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    if (!user) return;
-
     Promise.all([
       getFiles().catch(() => ({ repos: [], documents: [] })),
       getMcpServers().catch(() => ({ servers: [] })),
@@ -83,9 +79,7 @@ const Dashboard: React.FC = () => {
         tools: toolCount,
       });
     }).finally(() => setLoading(false));
-  }, [user]);
-
-  if (!user) return null;
+  }, []);
 
   const hasData = stats.repos + stats.documents > 0;
   const disabledHint = "Embed your data first -- there's nothing to search or serve yet.";

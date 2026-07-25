@@ -2,7 +2,7 @@
 
 Native desktop rewrite of VectorFlow, built with Tauri 2, Rust, React, Vite, and Tailwind CSS.
 
-The full backend is implemented in Rust: candle ML models (dense embedding, BM25 sparse, cross-encoder reranker), tree-sitter code chunkers (11 languages), document loaders (PDF, DOCX, XLSX, HTML, CSV, XML, ODT, Markdown, plain text), SQLite persistence, Qdrant vector DB sidecar management, hybrid RAG query pipeline, MCP streamable-HTTP server on port 18651, background job worker, and website crawling/embedding — all running locally with zero Docker or Python dependencies.
+The full backend is implemented in Rust: ONNX Runtime ML models (dense embedding, BM25 sparse, cross-encoder reranker), tree-sitter code chunkers (11 languages), document loaders (PDF, DOCX, XLSX, HTML, CSV, XML, ODT, Markdown, plain text), SQLite persistence, Qdrant vector DB sidecar management, hybrid RAG query pipeline, MCP streamable-HTTP server on port 18651, background job worker, and website crawling/embedding — all running locally with zero Docker or Python dependencies.
 
 ## Prerequisites
 

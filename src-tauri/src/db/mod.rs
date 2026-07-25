@@ -92,6 +92,7 @@ mod tests {
                 "ix_tool_code_search_tool_definition_id",
                 "ix_tool_definitions_mcp_server_id",
                 "ix_tool_document_search_tool_definition_id",
+                "ux_mcp_servers_name",
             ]
         );
 
@@ -111,8 +112,10 @@ mod tests {
                 .map(|row| row.get("name"))
                 .collect();
             assert!(
-                !columns.iter().any(|column| column == "user_id"),
-                "table {table} must not have a user_id column"
+                !columns.iter().any(|column| {
+                    column == "user" || column == "user_id" || column.starts_with("user_")
+                }),
+                "table {table} must not have user-related columns: {columns:?}"
             );
         }
     }

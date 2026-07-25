@@ -175,7 +175,7 @@ pub fn chunk_single_code_file(
     for chunk in &mut chunks {
         chunk.repo_name = repo_name.to_string();
         chunk.file_name = final_name.clone();
-        chunk.code = super::types::normalize_code(&chunk.code);
+        chunk.code = super::types::clean_code(&chunk.code);
     }
     chunks
 }

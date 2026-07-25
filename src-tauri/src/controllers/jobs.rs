@@ -23,7 +23,7 @@ use crate::db::DbState;
 use crate::models::entities::JobStatus;
 use crate::models::request::EmbeddingOptions;
 use crate::models::response::{ActiveJobsResponse, UploadJobEntry, UploadResponse};
-use crate::worker::progress::now_iso;
+use crate::worker::progress::{emit_job_event, now_iso, JobProgressEvent};
 
 #[tauri::command]
 pub async fn upload_repo_zip(
@@ -41,13 +41,30 @@ pub async fn upload_repo_zip(
         &paths,
         &embedding_options,
         "process_zip",
-        |orig_name, dest_path| {
+        |orig_name, dest_path, job_id, options| {
+            let mut opts = options.clone();
+            if opts.collection.as_deref().unwrap_or("codebase") == "codebase" {
+                let needs_default = opts
+                    .repo_name
+                    .as_ref()
+                    .map(|s| s.trim().is_empty())
+                    .unwrap_or(true);
+                if needs_default {
+                    let default_name =
+                        crate::services::ingestion_service::repo_name_from_zip_filename(orig_name);
+                    if !default_name.is_empty() {
+                        opts.repo_name = Some(default_name);
+                    }
+                }
+            }
             json!({
                 "zip_path": dest_path.to_string_lossy(),
                 "zip_filename": orig_name,
-                "embedding_options": embedding_options,
+                "storage_object_id": job_id,
+                "embedding_options": opts,
             })
         },
+        true,
     )
     .await
 }
@@ -68,14 +85,16 @@ pub async fn upload_documents(
         &paths,
         &embedding_options,
         "process_documents_upload",
-        |_orig_name, dest_path| {
+        |_orig_name, dest_path, job_id, options| {
             json!({
                 "path": dest_path.to_string_lossy(),
-                "collection": embedding_options.collection.clone(),
-                "group": embedding_options.group.clone(),
-                "metadata": embedding_options.metadata.clone(),
+                "storage_object_id": job_id,
+                "collection": options.collection.clone(),
+                "group": options.group.clone(),
+                "metadata": options.metadata.clone(),
             })
         },
+        true,
     )
     .await
 }
@@ -96,14 +115,16 @@ pub async fn upload_code_files(
         &paths,
         &embedding_options,
         "process_code_file_upload",
-        |_orig_name, dest_path| {
+        |_orig_name, dest_path, job_id, options| {
             json!({
                 "path": dest_path.to_string_lossy(),
-                "collection": embedding_options.collection.clone(),
-                "repo_name": embedding_options.repo_name.clone(),
-                "metadata": embedding_options.metadata.clone(),
+                "storage_object_id": job_id,
+                "collection": options.collection.clone(),
+                "repo_name": options.repo_name.clone(),
+                "metadata": options.metadata.clone(),
             })
         },
+        true,
     )
     .await
 }
@@ -227,16 +248,17 @@ fn uploads_dir(app: &AppHandle) -> Result<PathBuf, String> {
 /// 2. Copy each path into `uploads/<uuid>_<orig_name>`.
 /// 3. Insert a PENDING `job_status` row with `task_name` and a
 ///    `task_params` JSON derived from the per-task closure.
-/// 4. Return an `UploadResponse` with one entry per file.
+/// 4. Optionally insert a `file_metadata` row (status `pending`) so Data
+///    Management can track the upload; the worker marks it `completed`.
 ///
-/// `task_params_for(orig_name, dest_path)` is per-task: callers craft the
-/// param object the worker expects (zip vs code vs doc upload).
+/// `task_params_for(orig_name, dest_path, job_id, options)` is per-task.
 async fn enqueue_upload_jobs(
     app: &AppHandle,
     paths: &[String],
     embedding_options: &EmbeddingOptions,
     task_name: &str,
-    task_params_for: impl Fn(&str, &Path) -> serde_json::Value + Sync,
+    task_params_for: impl Fn(&str, &Path, &str, &EmbeddingOptions) -> serde_json::Value,
+    register_file_metadata: bool,
 ) -> Result<UploadResponse, String> {
     let pool = pool_from_state(app)?;
     let now = now_iso();
@@ -262,19 +284,21 @@ async fn enqueue_upload_jobs(
             errors.push(format!("copy {p} to {}: {e}", dest_path.display()));
             continue;
         }
-        let task_params = task_params_for(&orig_name, &dest_path);
+        let job_id_str = job_id.to_string();
+        let task_params = task_params_for(&orig_name, &dest_path, &job_id_str, embedding_options);
         let task_params_str =
             serde_json::to_string(&task_params).unwrap_or_else(|_| "{}".to_string());
-        let job_id_str = job_id.to_string();
         if let Err(e) = sqlx::query(
-            "INSERT INTO job_status (job_id, status, created_at, updated_at, progress_percentage, task_name, task_params) \
-             VALUES (?, 'PENDING', ?, ?, 0, ?, ?)",
+            "INSERT INTO job_status (job_id, status, created_at, updated_at, progress_percentage, task_name, task_params, storage_object_id, file_name) \
+             VALUES (?, 'PENDING', ?, ?, 0, ?, ?, ?, ?)",
         )
         .bind(&job_id_str)
         .bind(&now)
         .bind(&now)
         .bind(task_name)
         .bind(&task_params_str)
+        .bind(&job_id_str)
+        .bind(&orig_name)
         .execute(&pool)
         .await
         {
@@ -282,6 +306,68 @@ async fn enqueue_upload_jobs(
             let _ = std::fs::remove_file(&dest_path);
             continue;
         }
+
+        if register_file_metadata {
+            let repo_name = task_params
+                .pointer("/embedding_options/repo_name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    task_params
+                        .get("repo_name")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                })
+                .or_else(|| {
+                    if task_name == "process_zip" {
+                        Some(
+                            crate::services::ingestion_service::repo_name_from_zip_filename(
+                                &orig_name,
+                            ),
+                        )
+                    } else {
+                        embedding_options.repo_name.clone()
+                    }
+                });
+            let group_id = embedding_options.group.clone();
+            let size_bytes = std::fs::metadata(&source).ok().map(|m| m.len() as i64);
+            let file_type = source
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("bin")
+                .to_string();
+            if let Err(e) = sqlx::query(
+                "INSERT INTO file_metadata \
+                 (storage_object_id, full_path, file_type, size_bytes, repo_name, group_id, status, created_at, collection) \
+                 VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+            )
+            .bind(&job_id_str)
+            .bind(&orig_name)
+            .bind(&file_type)
+            .bind(size_bytes)
+            .bind(repo_name)
+            .bind(group_id)
+            .bind(&now)
+            .bind(&collection)
+            .execute(&pool)
+            .await
+            {
+                errors.push(format!("insert file_metadata: {e}"));
+            }
+        }
+
+        emit_job_event(
+            app,
+            "job_queued",
+            &JobProgressEvent::new(
+                job_id_str.clone(),
+                0,
+                "PENDING",
+                Some(orig_name.clone()),
+                Some("Queued".to_string()),
+            ),
+        );
+
         entries.push(UploadJobEntry {
             filename: orig_name,
             job_id: job_id_str,

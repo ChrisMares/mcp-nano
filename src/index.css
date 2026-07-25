@@ -189,8 +189,20 @@
   * {
     @apply border-border outline-ring/50;
   }
+  html {
+    height: 100%;
+    overflow: hidden;
+    overflow-anchor: none;
+  }
   body {
     @apply bg-background text-foreground;
+    height: 100%;
+    overflow: hidden;
+    overscroll-behavior: none;
+  }
+  #root {
+    height: 100%;
+    overflow: hidden;
   }
   
   /* Modern light mode enhancements */
@@ -202,15 +214,13 @@
   
   :root:not(.dark) body {
     background: linear-gradient(180deg, var(--bg-gradient-start) 0%, var(--bg-gradient-end) 100%);
-    min-height: 100vh;
   }
   
   /* Enhanced card styling for light mode */
-  :root:not(.dark) .rounded-lg,
-  :root:not(.dark) [class*="rounded-lg"] {
-    box-shadow: 
+  :root:not(.dark) .bg-card.rounded-lg,
+  :root:not(.dark) .bg-card.rounded-xl {
+    box-shadow:
       0 1px 3px 0 color-mix(in oklch, oklch(0.2 0.01 260) 5%, transparent),
-      0 1px 2px -1px color-mix(in oklch, oklch(0.2 0.01 260) 5%, transparent),
       0 0 0 1px color-mix(in oklch, var(--border) 50%, transparent);
   }
   
@@ -220,7 +230,7 @@
     background-color: oklch(0.99 0.003 85);
     border-color: oklch(0.78 0.02 80);
     box-shadow: inset 0 1px 2px color-mix(in oklch, oklch(0.2 0.01 260) 4%, transparent);
-    transition: all 0.2s ease;
+    transition: background-color 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
   }
   
   :root:not(.dark) input:not([type="checkbox"]):not([type="radio"]):focus,
@@ -236,21 +246,18 @@
   /* Better button styling */
   :root:not(.dark) button:not([class*="ghost"]):not([class*="link"]) {
     box-shadow: 
-      0 1px 2px 0 color-mix(in oklch, oklch(0.2 0.01 260) 8%, transparent),
-      0 0 0 1px color-mix(in oklch, var(--border) 30%, transparent);
+      0 1px 2px 0 color-mix(in oklch, oklch(0.2 0.01 260) 8%, transparent);
   }
   
   :root:not(.dark) button[class*="primary"],
   :root:not(.dark) .bg-primary {
     box-shadow: 
       0 1px 3px 0 color-mix(in oklch, var(--primary) 30%, transparent),
-      0 0 0 1px color-mix(in oklch, var(--primary) 20%, transparent),
       inset 0 1px 0 0 color-mix(in oklch, white 20%, transparent);
   }
   
   /* Sidebar enhancements */
-  :root:not(.dark) aside,
-  :root:not(.dark) [class*="sidebar"] {
+  :root:not(.dark) aside {
     box-shadow: 
       1px 0 3px 0 color-mix(in oklch, oklch(0.2 0.01 260) 4%, transparent);
   }
@@ -336,13 +343,11 @@
     accent-color: var(--brand-cyan);
   }
   
-  /* Primary buttons with cyan glow on hover */
+  /* Primary buttons on hover */
   :root:not(.dark) button[class*="primary"]:hover,
   :root:not(.dark) .bg-primary:hover {
-    box-shadow: 
+    box-shadow:
       0 1px 3px 0 color-mix(in oklch, var(--brand-cyan) 30%, transparent),
-      0 0 0 1px color-mix(in oklch, var(--brand-cyan) 20%, transparent),
-      0 0 15px color-mix(in oklch, var(--brand-cyan) 25%, transparent),
       inset 0 1px 0 0 color-mix(in oklch, white 20%, transparent);
   }
   

@@ -95,10 +95,13 @@ after installation.
 
 ## Implementation Notes
 
-- Load bundled model resources from disk and memory-map safetensors; do not use
-  `include_bytes!` or compile model data into the executable.
-- Keep embedding and reranking CPU-first until profiling justifies the optional
-  CUDA feature.
+- Load bundled ONNX model resources (`model.onnx` + `tokenizer.json`) from disk
+  via ONNX Runtime (`ort`); do not use `include_bytes!` or compile model data
+  into the executable.
+- GPU is optional and OS-specific: Linux uses the `cuda` feature (CUDA ≥ 12.8 +
+  cuDNN ≥ 9); Windows uses `directml` (no CUDA toolkit). Convenience feature
+  `gpu` enables both; runtime picks the EP for the current OS and falls back to
+  CPU. Force CPU with `MCP_NANO_DEVICE=cpu`.
 - The worker claims SQLite jobs with `BEGIN IMMEDIATE` and `RETURNING`, limits
   concurrency to two jobs, and resets interrupted running jobs to pending on
   shutdown as specified in the rewrite plan.

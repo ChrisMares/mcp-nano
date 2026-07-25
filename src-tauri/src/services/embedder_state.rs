@@ -1,15 +1,15 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use candle_core::Device;
 use tracing::info;
 
+use crate::services::embedders::dense::InferenceDevice;
 use crate::services::embedders::{Bm25Embedder, DenseEmbedder, Reranker};
 use crate::services::embedders::EncodeQuery;
 
-/// Tauri-managed state holding mmap'd embedder + reranker models.
+/// Tauri-managed state holding ONNX embedder + reranker sessions.
 ///
-/// Heavy tensors are mmap'd once at startup. Register via
+/// Sessions are loaded once at startup. Register via
 /// `app.manage(Arc::new(state))` so controllers and worker tasks can share
 /// a single cheap reference (`State<'_, Arc<EmbedderState>>`).
 pub struct EmbedderState {
@@ -23,34 +23,47 @@ impl EmbedderState {
     /// Load all three embedders from `resources/models/{arctic-embed-xs,minilm-l6-v2}`.
     pub fn load(models_dir: &Path) -> Result<Self> {
         let (device, device_mode) = Self::embedding_device();
-        let (dense, reranker) = Self::load_models(models_dir, device.clone())?;
 
-        if device.is_cuda() {
-            if let Err(error) = dense.encode_query("CUDA capability check") {
-                tracing::warn!("CUDA embedding cannot run this model; using CPU: {error}");
-                let (dense, reranker) = Self::load_models(models_dir, Device::Cpu)?;
-                return Ok(Self {
-                    dense,
-                    reranker,
-                    bm25: Bm25Embedder::new(),
-                    device_mode: "CPU (CUDA fallback)".to_string(),
-                });
+        let (dense, reranker, device_mode) = match Self::load_models(models_dir, device) {
+            Ok((dense, reranker)) if device.is_gpu() => {
+                if let Err(error) = dense.encode_query("GPU capability check") {
+                    tracing::warn!(
+                        "{} embedding cannot run this model; using CPU: {error}",
+                        device.label()
+                    );
+                    let (dense, reranker) = Self::load_models(models_dir, InferenceDevice::Cpu)?;
+                    (dense, reranker, device.fallback_label().to_string())
+                } else {
+                    (dense, reranker, device_mode)
+                }
             }
-        }
+            Ok((dense, reranker)) => (dense, reranker, device_mode),
+            Err(error) if device.is_gpu() => {
+                tracing::warn!(
+                    "{} embedding unavailable; using CPU: {error:#}",
+                    device.label()
+                );
+                let (dense, reranker) = Self::load_models(models_dir, InferenceDevice::Cpu)?;
+                (dense, reranker, device.fallback_label().to_string())
+            }
+            Err(error) => return Err(error),
+        };
 
-        let bm25 = Bm25Embedder::new();
         Ok(Self {
             dense,
             reranker,
-            bm25,
+            bm25: Bm25Embedder::new(),
             device_mode,
         })
     }
 
-    fn load_models(models_dir: &Path, device: Device) -> Result<(DenseEmbedder, Reranker)> {
+    fn load_models(
+        models_dir: &Path,
+        device: InferenceDevice,
+    ) -> Result<(DenseEmbedder, Reranker)> {
         let dense = DenseEmbedder::load_with_device(
             &models_dir.join("arctic-embed-xs"),
-            device.clone(),
+            device,
         )
         .context("loading dense embedder")?;
         let reranker = Reranker::load_with_device(&models_dir.join("minilm-l6-v2"), device)
@@ -62,31 +75,40 @@ impl EmbedderState {
         &self.device_mode
     }
 
-    fn embedding_device() -> (Device, String) {
+    fn embedding_device() -> (InferenceDevice, String) {
         if std::env::var("MCP_NANO_DEVICE")
             .ok()
             .is_some_and(|value| value.eq_ignore_ascii_case("cpu"))
         {
             info!("Embedding device: CPU (requested by MCP_NANO_DEVICE)");
-            return (Device::Cpu, "CPU".to_string());
+            return (InferenceDevice::Cpu, InferenceDevice::Cpu.label().to_string());
         }
 
-        #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
-        match Device::new_cuda(0) {
-            Ok(device) => {
-                info!("Embedding device: CUDA (GPU 0)");
-                (device, "CUDA (GPU)".to_string())
-            }
-            Err(error) => {
-                tracing::warn!("CUDA embedding unavailable; using CPU: {error}");
-                (Device::Cpu, "CPU".to_string())
-            }
-        }
-
-        #[cfg(not(all(feature = "cuda", any(target_os = "linux", target_os = "windows"))))]
+        #[cfg(all(feature = "directml", target_os = "windows"))]
         {
-            info!("Embedding device: CPU (CUDA support was not included in this build)");
-            (Device::Cpu, "CPU".to_string())
+            info!("Embedding device: DirectML (GPU)");
+            return (
+                InferenceDevice::DirectMl,
+                InferenceDevice::DirectMl.label().to_string(),
+            );
+        }
+
+        #[cfg(all(feature = "cuda", target_os = "linux"))]
+        {
+            info!("Embedding device: CUDA (GPU 0)");
+            return (
+                InferenceDevice::Cuda,
+                InferenceDevice::Cuda.label().to_string(),
+            );
+        }
+
+        #[cfg(not(any(
+            all(feature = "directml", target_os = "windows"),
+            all(feature = "cuda", target_os = "linux"),
+        )))]
+        {
+            info!("Embedding device: CPU (no GPU EP enabled for this OS/build)");
+            (InferenceDevice::Cpu, InferenceDevice::Cpu.label().to_string())
         }
     }
 

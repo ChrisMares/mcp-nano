@@ -24,13 +24,40 @@ pub type ProgressCallback =
     Arc<dyn Fn(i32, Option<String>) -> ProgressFuture + Send + Sync>;
 
 /// Event payload emitted alongside each row update when an `AppHandle` is
-/// attached. The UI subscribes to `job_progress` once at startup and reacts
-/// to these events instead of polling `get_job_status`.
+/// attached. The UI subscribes to `job_progress` / `job_queued` /
+/// `job_finished` / `job_failed` and reacts instead of polling.
 #[derive(Debug, Clone, Serialize)]
 pub struct JobProgressEvent {
     pub job_id: String,
     pub percentage: i32,
     pub message: Option<String>,
+    pub file_name: Option<String>,
+    pub status: String,
+}
+
+impl JobProgressEvent {
+    pub fn new(
+        job_id: impl Into<String>,
+        percentage: i32,
+        status: impl Into<String>,
+        file_name: Option<String>,
+        message: Option<String>,
+    ) -> Self {
+        Self {
+            job_id: job_id.into(),
+            percentage: percentage.clamp(0, 100),
+            message,
+            file_name,
+            status: status.into(),
+        }
+    }
+}
+
+/// Emit a job lifecycle event if an app handle is available.
+pub fn emit_job_event(app: &AppHandle, event_name: &str, event: &JobProgressEvent) {
+    if let Err(e) = app.emit(event_name, event) {
+        error!("emit {event_name} failed for job {}: {e:#}", event.job_id);
+    }
 }
 
 /// A no-op progress callback for tests / tasks that don't report progress.
@@ -54,31 +81,30 @@ pub fn progress_for_job(pool: SqlitePool, job_id: String) -> ProgressCallback {
 }
 
 /// Build a progress callback bound to a specific `job_id` that also pushes
-/// a `job_progress` Tauri event via the supplied `AppHandle`. The UI
-/// listens for this event once at startup and updates progress bars live
-/// without polling — the user-facing replacement for `get_job_status`
-/// polling.
+/// a `job_progress` Tauri event via the supplied `AppHandle`.
 pub fn progress_for_job_with_app(
     pool: SqlitePool,
     job_id: String,
     app: AppHandle,
+    file_name: Option<String>,
 ) -> ProgressCallback {
     Arc::new(move |pct, msg| {
         let pool = pool.clone();
         let job_id = job_id.clone();
         let app = app.clone();
+        let file_name = file_name.clone();
         Box::pin(async move {
             if let Err(e) = update_job_progress(&pool, &job_id, pct, msg.as_deref()).await {
                 error!("progress update failed for job {job_id}: {e:#}");
             }
-            let event = JobProgressEvent {
-                job_id: job_id.clone(),
-                percentage: pct,
-                message: msg.clone(),
-            };
-            if let Err(e) = app.emit("job_progress", event) {
-                error!("emit job_progress failed for job {job_id}: {e:#}");
-            }
+            let event = JobProgressEvent::new(
+                job_id.clone(),
+                pct,
+                "RUNNING",
+                file_name,
+                msg,
+            );
+            emit_job_event(&app, "job_progress", &event);
         })
     })
 }
@@ -141,6 +167,18 @@ pub fn now_iso() -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn job_progress_event_clamps_percentage() {
+        let e = JobProgressEvent::new("j1", 150, "RUNNING", Some("a.pdf".into()), None);
+        assert_eq!(e.percentage, 100);
+        assert_eq!(e.file_name.as_deref(), Some("a.pdf"));
+        assert_eq!(e.status, "RUNNING");
+
+        let e2 = JobProgressEvent::new("j2", -5, "PENDING", None, Some("queued".into()));
+        assert_eq!(e2.percentage, 0);
+        assert_eq!(e2.message.as_deref(), Some("queued"));
+    }
+
     #[tokio::test]
     async fn noop_progress_does_not_panic() {
         let p = noop_progress();
@@ -191,7 +229,6 @@ mod tests {
         .execute(&pool)
         .await?;
 
-        // FINISHED: result overwritten with the new message.
         set_job_status(&pool, "job-2", "FINISHED", Some("done"), None).await?;
         let row =
             sqlx::query("SELECT status, result, error_message FROM job_status WHERE job_id = ?")
@@ -202,7 +239,6 @@ mod tests {
         assert_eq!(row.get::<String, _>(1), "done");
         assert!(row.get::<Option<String>, _>(2).is_none());
 
-        // FAILED: error_message set, result cleared (terminal overwrites).
         set_job_status(&pool, "job-2", "FAILED", None, Some("boom")).await?;
         let row =
             sqlx::query("SELECT status, result, error_message FROM job_status WHERE job_id = ?")
@@ -215,7 +251,6 @@ mod tests {
         Ok(())
     }
 
-    /// Open a SqlitePool against a fresh tempdir + run migrations.
     async fn open_in_memory_pool(dir: &tempfile::TempDir) -> Result<SqlitePool> {
         let path = dir.path().join("app.db");
         let options = sqlx::sqlite::SqliteConnectOptions::new()

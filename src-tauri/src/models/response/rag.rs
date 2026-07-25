@@ -25,6 +25,7 @@ pub struct EmbedderStatusResponse {
     pub reranker_loaded: bool,
     pub bm25_loaded: bool,
     pub models_dir: String,
+    pub embedding_device: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize)]

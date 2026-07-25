@@ -37,12 +37,12 @@ const Dropzone = ({
       <div
         {...getRootProps({
           className: cn(
-            'border-2 rounded-xl p-8 text-center transition-all duration-300 text-foreground cursor-pointer',
+            'border-2 rounded-xl p-8 text-center transition-[border-color,background-color,box-shadow] duration-200 text-foreground cursor-pointer',
             'bg-gradient-to-br from-card via-card to-muted/50 shadow-lg hover:shadow-xl',
             'border-primary/30 hover:border-primary/60',
             className,
             isSuccess ? 'border-solid' : 'border-dashed',
-            isActive && 'border-primary bg-primary/10 scale-[1.02] shadow-primary/30 shadow-xl ring-2 ring-primary/30',
+            isActive && 'border-primary bg-primary/10 shadow-primary/30 shadow-xl ring-2 ring-primary/30',
             isInvalid && 'border-destructive bg-destructive/10'
           ),
         })}
@@ -101,7 +101,14 @@ const DropzoneContent = ({ className }: { className?: string }) => {
           </div>
         ))}
         <div className="mt-3">
-          <Button variant="outline" onClick={handleReset}>
+          <Button
+            variant="outline"
+            onClick={(event) => {
+              event.preventDefault()
+              event.stopPropagation()
+              handleReset()
+            }}
+          >
             Upload More
           </Button>
         </div>
@@ -161,7 +168,11 @@ const DropzoneContent = ({ className }: { className?: string }) => {
                 size="icon"
                 variant="link"
                 className="shrink-0 justify-self-end text-muted-foreground hover:text-foreground"
-                onClick={() => handleRemoveFile(file.name)}
+                onClick={(event) => {
+                  event.preventDefault()
+                  event.stopPropagation()
+                  handleRemoveFile(file.name)
+                }}
               >
                 <X />
               </Button>
@@ -182,7 +193,11 @@ const DropzoneContent = ({ className }: { className?: string }) => {
           )}
           <Button
             variant="outline"
-            onClick={onUpload}
+            onClick={(event) => {
+              event.preventDefault()
+              event.stopPropagation()
+              void onUpload()
+            }}
             disabled={files.some((file) => file.errors.length !== 0) || loading || disableUpload}
           >
             {loading ? (

@@ -10,7 +10,9 @@ interface Props {
   completedJobs: EmbedJob[];
 }
 
-const JobStatusPanel: React.FC<Props> = ({ processing, activeJobs, completedJobs }) => {
+const displayName = (job: EmbedJob) => job.file_name?.trim() || "Untitled";
+
+const JobStatusPanel: React.FC<Props> = React.memo(({ processing, activeJobs, completedJobs }) => {
   const hasVisibleJobs = processing || activeJobs.length > 0 || completedJobs.length > 0;
   if (!hasVisibleJobs) return null;
 
@@ -33,38 +35,66 @@ const JobStatusPanel: React.FC<Props> = ({ processing, activeJobs, completedJobs
           </div>
         )}
         {activeJobs.map((job) => (
-          <div key={job.job_id} className="flex items-center gap-3">
-            <span className={`${statusDot} ${job.status === "RUNNING" ? "bg-info animate-pulse" : "bg-warning"}`} />
-            <span className="text-sm text-foreground truncate">{job.file_name ?? job.job_id}</span>
-            <span className="text-xs text-muted-foreground uppercase">{job.status}</span>
-            {job.status === "PENDING" && job.queue_position != null && (
-              <span className="text-xs text-muted-foreground">
-                #{job.queue_position} of {job.total_in_queue} in queue
+          <div key={job.job_id} className="space-y-1">
+            <div className="flex items-center gap-3">
+              <span className={`${statusDot} ${job.status === "RUNNING" ? "bg-info" : "bg-warning"}`} />
+              <span className="text-sm text-foreground truncate" title={displayName(job)}>
+                {displayName(job)}
               </span>
-            )}
-            {job.status === "PENDING" && job.queue_position == null && (
-              <RotateCw size={14} className="text-muted-foreground" />
-            )}
-            {job.status === "RUNNING" && (
-              <div className="flex-1 flex items-center gap-2 min-w-0">
-                <div className="flex-1 h-1.5 bg-muted rounded-full overflow-hidden">
-                  <div className="h-full bg-info rounded-full transition-all duration-500" style={{ width: `${job.progress_percentage}%` }} />
+              <span className="text-xs text-muted-foreground uppercase">{job.status}</span>
+              {job.status === "PENDING" && job.queue_position != null && (
+                <span className="text-xs text-muted-foreground">
+                  #{job.queue_position} of {job.total_in_queue} in queue
+                </span>
+              )}
+              {job.status === "PENDING" && job.queue_position == null && (
+                <RotateCw size={14} className="text-muted-foreground" />
+              )}
+              {job.status === "RUNNING" && (
+                <div className="flex-1 flex items-center gap-2 min-w-0">
+                  <div className="flex-1 h-1.5 bg-muted rounded-full overflow-hidden">
+                    <div
+                      className="h-full bg-info rounded-full transition-[width] duration-300"
+                      style={{ width: `${job.progress_percentage}%` }}
+                    />
+                  </div>
+                  <span className="text-xs text-muted-foreground w-8 text-right">
+                    {job.progress_percentage}%
+                  </span>
                 </div>
-                <span className="text-xs text-muted-foreground w-8 text-right">{job.progress_percentage}%</span>
-              </div>
+              )}
+            </div>
+            {job.message && (
+              <p className="text-xs text-muted-foreground pl-5 truncate" title={job.message}>
+                {job.message}
+              </p>
             )}
           </div>
         ))}
-        {completedJobs.map((job) => (
-          <div key={job.job_id} className="flex items-center gap-3">
-            <span className={`${statusDot} bg-success`} />
-            <span className="text-sm text-foreground truncate">{job.file_name ?? job.job_id}</span>
-            <span className="text-xs text-success uppercase">Completed</span>
-          </div>
-        ))}
+        {completedJobs.map((job) => {
+          const failed = job.status === "FAILED";
+          return (
+            <div key={job.job_id} className="space-y-1">
+              <div className="flex items-center gap-3">
+                <span className={`${statusDot} ${failed ? "bg-destructive" : "bg-success"}`} />
+                <span className="text-sm text-foreground truncate" title={displayName(job)}>
+                  {displayName(job)}
+                </span>
+                <span className={`text-xs uppercase ${failed ? "text-destructive" : "text-success"}`}>
+                  {failed ? "Failed" : "Completed"}
+                </span>
+              </div>
+              {failed && job.message && (
+                <p className="text-xs text-destructive pl-5 truncate" title={job.message}>
+                  {job.message}
+                </p>
+              )}
+            </div>
+          );
+        })}
       </div>
     </div>
   );
-};
+});
 
 export default JobStatusPanel;

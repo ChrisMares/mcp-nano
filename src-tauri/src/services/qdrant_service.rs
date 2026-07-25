@@ -3,7 +3,8 @@ use std::collections::HashMap;
 use anyhow::{anyhow, Context, Result};
 use qdrant_client::qdrant::{
     point_id::PointIdOptions, Condition, DeletePointsBuilder, FieldType, Filter, Fusion, PointId,
-    PointStruct, PrefetchQueryBuilder, QueryPointsBuilder, UpsertPointsBuilder, Vector, Vectors,
+    PointStruct, PrefetchQueryBuilder, QueryPointsBuilder, SetPayloadPointsBuilder,
+    UpsertPointsBuilder, Vector, Vectors,
 };
 use qdrant_client::{Payload, Qdrant};
 use uuid::Uuid;
@@ -428,6 +429,85 @@ impl QdrantService {
             .await
             .with_context(|| format!("create_index({collection}, {key}, {field_type})"))?;
         Ok(())
+    }
+
+    /// Backfill empty `repo_name` payloads from `zip_filename` (basename minus
+    /// `.zip`). Used so Data Management can list zips that were uploaded
+    /// before the default-repo-name fix. Idempotent.
+    pub async fn repair_empty_repo_names_from_zip(
+        &self,
+        collection: &str,
+    ) -> Result<usize> {
+        use crate::services::ingestion_service::repo_name_from_zip_filename;
+
+        // Ensure zip_filename is indexed so we can facet it.
+        let _ = self.create_index(collection, "zip_filename", "keyword").await;
+
+        let zip_names = match self
+            .get_metadata_values_by_key(collection, "zip_filename", None)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                debug!("repair_empty_repo_names: facet zip_filename failed: {e:#}");
+                return Ok(0);
+            }
+        };
+
+        let mut repaired = 0usize;
+        for name in zip_names {
+            let Some(zf) = name.as_str().filter(|s| !s.is_empty()) else {
+                continue;
+            };
+            let repo = repo_name_from_zip_filename(zf);
+            if repo.is_empty() {
+                continue;
+            }
+
+            // Only repair when this zip has no non-empty repo_name yet
+            // (legacy uploads used ""). Matching empty string in filters is
+            // unreliable, so we set by zip_filename after checking facet.
+            let zip_filter = Filter::must([Condition::matches("zip_filename", zf.to_string())]);
+            let existing = self
+                .get_metadata_values_by_key(collection, "repo_name", Some(zip_filter.clone()))
+                .await
+                .unwrap_or_default();
+            let has_named = existing.iter().any(|v| {
+                v.as_str()
+                    .map(|s| !s.is_empty() && s != repo)
+                    .unwrap_or(false)
+            });
+            let already_ok = existing
+                .iter()
+                .any(|v| v.as_str() == Some(repo.as_str()));
+            if has_named || already_ok {
+                continue;
+            }
+
+            let mut payload = HashMap::new();
+            payload.insert(
+                "repo_name".to_string(),
+                qdrant_client::qdrant::Value::from(repo.clone()),
+            );
+            match self
+                .client
+                .set_payload(
+                    SetPayloadPointsBuilder::new(collection, payload)
+                        .points_selector(zip_filter)
+                        .wait(true),
+                )
+                .await
+            {
+                Ok(_) => {
+                    info!("repaired repo_name={repo} for zip_filename={zf} on {collection}");
+                    repaired += 1;
+                }
+                Err(e) => {
+                    debug!("set_payload repo_name for {zf}: {e:#}");
+                }
+            }
+        }
+        Ok(repaired)
     }
 
     /// Unique values for a payload key (faceted). Requires an existing payload

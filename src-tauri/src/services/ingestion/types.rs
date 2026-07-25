@@ -825,11 +825,14 @@ pub fn now_iso() -> String {
 /// blank lines into a single blank line. Matches Python `_normalize_code`.
 pub fn normalize_code(code: &str) -> String {
     let normalized: String = code
-        .split('\n')
-        .map(|line| line.trim_end())
+        .split_inclusive('\n')
+        .map(|line| {
+            let line = line.strip_suffix('\n').unwrap_or(line);
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            line.trim_end().to_string()
+        })
         .collect::<Vec<_>>()
         .join("\n");
-    // Collapse 3+ newlines to 2 (one blank line).
     let mut out = String::with_capacity(normalized.len());
     let mut blanks = 0usize;
     for ch in normalized.chars() {
@@ -845,6 +848,112 @@ pub fn normalize_code(code: &str) -> String {
     }
     if out.trim_matches('\n').is_empty() {
         return "\n".to_string();
+    }
+    out
+}
+
+/// Clean and normalize code spacing for embedding. Matches Python
+/// `helpers.clean_code` (applied after chunk extraction in
+/// `chunk_single_code_file`).
+pub fn clean_code(code: &str) -> String {
+    if code.is_empty() {
+        return String::new();
+    }
+    let expanded = expand_tabs(code, 4);
+    let dedented = dedent(&expanded);
+    let lines: Vec<String> = dedented
+        .split_inclusive('\n')
+        .map(|line| {
+            let line = line.strip_suffix('\n').unwrap_or(line);
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            line.trim_end().to_string()
+        })
+        .collect();
+    let mut cleaned = lines.join("\n");
+    cleaned = collapse_blank_lines(&cleaned);
+    cleaned = cleaned.replace(" { get; set; }", " {get;set;}");
+    static EMPTY_BRACES_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = EMPTY_BRACES_RE.get_or_init(|| regex::Regex::new(r"\s*\{\s*\}").unwrap());
+    cleaned = re.replace_all(&cleaned, "{}").into_owned();
+    cleaned.trim().to_string()
+}
+
+fn expand_tabs(s: &str, tabsize: usize) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut col = 0usize;
+    for ch in s.chars() {
+        if ch == '\t' {
+            let spaces = tabsize - (col % tabsize);
+            for _ in 0..spaces {
+                out.push(' ');
+            }
+            col += spaces;
+        } else {
+            out.push(ch);
+            if ch == '\n' {
+                col = 0;
+            } else {
+                col += 1;
+            }
+        }
+    }
+    out
+}
+
+fn dedent(text: &str) -> String {
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let mut margin: Option<usize> = None;
+    for line in &lines {
+        let raw = line.strip_suffix('\n').unwrap_or(line);
+        let raw = raw.strip_suffix('\r').unwrap_or(raw);
+        if raw.trim().is_empty() {
+            continue;
+        }
+        let indent = raw.chars().take_while(|c| *c == ' ' || *c == '\t').count();
+        margin = Some(match margin {
+            Some(m) => m.min(indent),
+            None => indent,
+        });
+    }
+    let Some(m) = margin else {
+        return text.to_string();
+    };
+    if m == 0 {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    for line in lines {
+        let has_nl = line.ends_with('\n');
+        let raw = line.strip_suffix('\n').unwrap_or(line);
+        let raw = raw.strip_suffix('\r').unwrap_or(raw);
+        if raw.trim().is_empty() {
+            if has_nl {
+                out.push('\n');
+            }
+            continue;
+        }
+        let stripped: String = raw.chars().skip(m).collect();
+        out.push_str(&stripped);
+        if has_nl {
+            out.push('\n');
+        }
+    }
+    out
+}
+
+fn collapse_blank_lines(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut blanks = 0usize;
+    for ch in s.chars() {
+        if ch == '\n' {
+            blanks += 1;
+            if blanks <= 2 {
+                out.push(ch);
+            }
+        } else {
+            blanks = 0;
+            out.push(ch);
+        }
     }
     out
 }
@@ -869,14 +978,14 @@ mod tests {
     fn normalize_collapses_blank_runs() {
         let src = "a\n\n\n\nb\n   \n\nc\n";
         let out = normalize_code(src);
-        assert_eq!(out, "a\n\nb\n\nc\n");
+        assert_eq!(out, "a\n\nb\n\nc");
     }
 
     #[test]
     fn normalize_strips_trailing_whitespace() {
         let src = "a   \nb\t\n";
         let out = normalize_code(src);
-        assert_eq!(out, "a\nb\n");
+        assert_eq!(out, "a\nb");
     }
 
     #[test]
@@ -1017,6 +1126,29 @@ mod tests {
         assert_eq!(split.repo_name, "r");
         assert_eq!(split.file_name, "f.txt");
         assert!(matches!(split.kind, CodeChunkKind::Generic));
-        assert_eq!(split.code, "y = 2\n");
+        assert_eq!(split.code, "y = 2");
+    }
+
+    #[test]
+    fn clean_code_expands_tabs_and_collapses_empty_braces() {
+        assert_eq!(clean_code("a\tb"), "a   b");
+        // Python re.sub(r"\s*{\s*}", "{}") also eats the space before `{`.
+        assert_eq!(clean_code("const obj = {  }"), "const obj ={}");
+        assert_eq!(clean_code("noop = () => { }"), "noop = () =>{}");
+        assert_eq!(clean_code("prop { get; set; }"), "prop {get;set;}");
+    }
+
+    #[test]
+    fn clean_code_dedents_and_strips() {
+        let src = "    def foo():\n        return 1\n";
+        assert_eq!(clean_code(src), "def foo():\n    return 1");
+    }
+
+    #[test]
+    fn normalize_code_handles_crlf_and_blank_runs() {
+        // Matches Python `_normalize_code` / `str.splitlines()` (drops final newline).
+        assert_eq!(normalize_code("foo\r\nbar\r\n"), "foo\nbar");
+        assert_eq!(normalize_code("a\n\n\n\nb"), "a\n\nb");
+        assert_eq!(normalize_code("a  \nb   "), "a\nb");
     }
 }

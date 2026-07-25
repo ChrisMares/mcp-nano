@@ -1,7 +1,7 @@
 //! Localhost-only MCP streamable-HTTP endpoint (Axum + rmcp).
 //!
 //! Binds `127.0.0.1:18651` (or an ephemeral fallback) and serves a single
-//! `/mcp` route. Clients pass `?server_id=` to scope dynamic tools.
+//! `/mcp` route. Clients pass `?server_id=<server_name>` to scope dynamic tools.
 
 mod format;
 mod handler;

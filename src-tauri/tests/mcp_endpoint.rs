@@ -1,4 +1,4 @@
-//! MCP streamable-HTTP endpoint: list_tools filtered by server_id.
+//! MCP streamable-HTTP endpoint: list_tools filtered by server name.
 
 mod common;
 
@@ -49,7 +49,7 @@ async fn build_rag_if_possible() -> Option<(Arc<RagService>, common::ChildGuard)
 #[tokio::test]
 async fn list_tools_filtered_by_server_id() {
     let pool = memory_pool().await;
-    let server = mcp_config::create_server(&pool, "code-search".into(), None)
+    let server = mcp_config::create_server(&pool, "code_search".into(), None)
         .await
         .unwrap();
     mcp_config::create_tool(
@@ -85,7 +85,7 @@ async fn list_tools_filtered_by_server_id() {
     .await
     .unwrap();
 
-    let tools = mcp_config::list_active_tools(&pool, Some(&server.server.id))
+    let tools = mcp_config::list_active_tools(&pool, Some(&server.server.name))
         .await
         .unwrap();
     assert_eq!(tools.len(), 1);
@@ -103,10 +103,11 @@ async fn mcp_http_list_tools_via_streamable_http() {
     };
 
     let pool = memory_pool().await;
-    let server = mcp_config::create_server(&pool, "http-server".into(), None)
+    let server = mcp_config::create_server(&pool, "http_server".into(), None)
         .await
         .unwrap();
     let server_id = server.server.id.clone();
+    let server_name = server.server.name.clone();
     mcp_config::create_tool(
         &pool,
         &server_id,
@@ -151,7 +152,7 @@ async fn mcp_http_list_tools_via_streamable_http() {
 
     tokio::time::sleep(Duration::from_millis(80)).await;
 
-    let url = format!("http://{addr}/mcp?server_id={server_id}");
+    let url = format!("http://{addr}/mcp?server_id={server_name}");
     let transport = StreamableHttpClientTransport::from_uri(url);
     let client = ().serve(transport).await.expect("mcp client connect");
 
