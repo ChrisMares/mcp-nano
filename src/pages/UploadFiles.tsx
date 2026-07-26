@@ -1,4 +1,5 @@
 import React, { useState, useMemo, useCallback, useEffect, useRef } from "react";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useLocalUpload } from "@/hooks/use-local-upload";
 import { useJobEvents, type JobProgressEvent } from "@/hooks/use-job-events";
 import { getActiveJobs, crawlWebsite, embedWebsite, getMetadataValues } from "@/utils/apicalls";
@@ -17,6 +18,12 @@ import UploadStep from "@/components/uploadfiles/UploadStep";
 import WebsiteProcessingStep from "@/components/uploadfiles/WebsiteProcessingStep";
 import JobStatusPanel from "@/components/uploadfiles/JobStatusPanel";
 import type { EmbedJob, UploadJobEntry } from "@/types/embed";
+
+interface CrawlProgressEvent {
+  url: string;
+  phase: string;
+  found_count: number;
+}
 
 const mergeJobFromEvent = (prev: EmbedJob | undefined, e: JobProgressEvent, status: string): EmbedJob => ({
   job_id: e.job_id,
@@ -93,6 +100,8 @@ const UploadFiles: React.FC = () => {
   const [websiteUrls, setWebsiteUrls] = useState<string[]>([]);
   const [websiteCrawlError, setWebsiteCrawlError] = useState<boolean>(false);
   const [websiteCrawling, setWebsiteCrawling] = useState<boolean>(false);
+  const [crawlCurrentUrl, setCrawlCurrentUrl] = useState<string | null>(null);
+  const [crawlFoundCount, setCrawlFoundCount] = useState(0);
   const [websiteEmbedJobId, setWebsiteEmbedJobId] = useState<string | null>(null);
   const [mixWarning, setMixWarning] = useState("");
   const [activeJobs, setActiveJobs] = useState<EmbedJob[]>([]);
@@ -180,6 +189,28 @@ const UploadFiles: React.FC = () => {
     },
   });
 
+  useEffect(() => {
+    let unlisten: UnlistenFn | undefined;
+    let cancelled = false;
+    void listen<CrawlProgressEvent>("crawl_progress", (ev) => {
+      if (cancelled) return;
+      const { url, phase, found_count } = ev.payload;
+      setCrawlFoundCount(found_count);
+      if (phase === "done") {
+        setCrawlCurrentUrl(null);
+        return;
+      }
+      if (url) setCrawlCurrentUrl(url);
+    }).then((fn) => {
+      if (cancelled) fn();
+      else unlisten = fn;
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
+
   const handleUploadSuccess = useCallback((submittedCount: number, jobs: UploadJobEntry[]) => {
     setLastSubmittedCount(submittedCount);
     for (const entry of jobs) {
@@ -214,6 +245,8 @@ const UploadFiles: React.FC = () => {
     setWebsiteCrawlError(false);
     setWebsiteUrls([]);
     setWebsiteEmbedJobId(null);
+    setCrawlCurrentUrl(null);
+    setCrawlFoundCount(0);
     setWebsiteCrawling(true);
     try {
       const res = await crawlWebsite(websiteUrl, websiteDepth, websiteSameDomainOnly);
@@ -275,7 +308,7 @@ const UploadFiles: React.FC = () => {
     repoName,
     groupName,
     maxFiles: 10,
-    maxFileSize: 1000 * 1000 * 200,
+    maxFileSize: Number.POSITIVE_INFINITY,
     onSuccess: handleUploadSuccess,
   });
 
@@ -307,7 +340,17 @@ const UploadFiles: React.FC = () => {
     setCodeUploadMode("");
     if (val !== "codebase") { setRepoName(""); setRepoMode("existing"); }
     if (val !== "general" && val !== "website") { setGroupName(""); setGroupMode("existing"); }
-    if (val !== "website") { setWebsiteUrl(""); setWebsiteDepth(1); setWebsiteSameDomainOnly(true); setWebsiteUrls([]); setWebsiteCrawlError(false); setWebsiteCrawling(false); setWebsiteEmbedJobId(null); }
+    if (val !== "website") {
+      setWebsiteUrl("");
+      setWebsiteDepth(1);
+      setWebsiteSameDomainOnly(true);
+      setWebsiteUrls([]);
+      setWebsiteCrawlError(false);
+      setWebsiteCrawling(false);
+      setCrawlCurrentUrl(null);
+      setCrawlFoundCount(0);
+      setWebsiteEmbedJobId(null);
+    }
     setStep(2);
   };
 
@@ -324,6 +367,8 @@ const UploadFiles: React.FC = () => {
     setWebsiteUrls([]);
     setWebsiteCrawlError(false);
     setWebsiteCrawling(false);
+    setCrawlCurrentUrl(null);
+    setCrawlFoundCount(0);
     setWebsiteEmbedJobId(null);
     setStep(1);
   };
@@ -380,6 +425,8 @@ const UploadFiles: React.FC = () => {
             depth={websiteDepth}
             sameDomainOnly={websiteSameDomainOnly}
             isCrawling={websiteCrawling}
+            crawlCurrentUrl={crawlCurrentUrl}
+            crawlFoundCount={crawlFoundCount}
             onUrlChange={setWebsiteUrl}
             onDepthChange={setWebsiteDepth}
             onSameDomainChange={setWebsiteSameDomainOnly}

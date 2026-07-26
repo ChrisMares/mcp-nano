@@ -13,7 +13,6 @@ import FetchContext from "./pages/FetchContext";
 import McpCreate from "./pages/McpCreate";
 import McpManage from "./pages/McpManage";
 import McpConnect from "./pages/McpConnect";
-import Account from "./pages/Account";
 import Dashboard from "./pages/Dashboard";
 
 function App() {
@@ -31,7 +30,6 @@ function App() {
               <Route path="/mcp/create" element={<McpCreate />} />
               <Route path="/mcp/manage" element={<McpManage />} />
               <Route path="/mcp/connect" element={<McpConnect />} />
-              <Route path="/account" element={<Account />} />
             </Route>
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>

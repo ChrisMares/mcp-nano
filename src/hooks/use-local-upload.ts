@@ -51,7 +51,7 @@ export const useLocalUpload = (options: UseLocalUploadOptions) => {
     codeUploadMode,
     repoName = "",
     groupName = "",
-    maxFileSize = 1000 * 1000 * 200,
+    maxFileSize = Number.POSITIVE_INFINITY,
     maxFiles = 10,
     onSuccess,
   } = options;

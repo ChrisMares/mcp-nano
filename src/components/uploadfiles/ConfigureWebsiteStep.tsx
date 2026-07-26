@@ -7,6 +7,8 @@ interface Props {
   depth: number;
   sameDomainOnly: boolean;
   isCrawling: boolean;
+  crawlCurrentUrl?: string | null;
+  crawlFoundCount?: number;
   onUrlChange: (url: string) => void;
   onDepthChange: (depth: number) => void;
   onSameDomainChange: (val: boolean) => void;
@@ -18,6 +20,7 @@ const DEPTH_LABELS = ["This page only", "1 level deep", "2 levels deep", "3 leve
 
 const ConfigureWebsiteStep: React.FC<Props> = ({
   websiteUrl, depth, sameDomainOnly, isCrawling,
+  crawlCurrentUrl = null, crawlFoundCount = 0,
   onUrlChange, onDepthChange, onSameDomainChange, onBack, onNext,
 }) => {
   const canProceed = !!websiteUrl.trim() && !isCrawling;
@@ -87,11 +90,14 @@ const ConfigureWebsiteStep: React.FC<Props> = ({
       </div>
 
       {isCrawling && (
-        <div className="flex items-center gap-3 mb-4 px-4 py-3 rounded-lg bg-muted/50 border border-border">
-          <Loader2 size={20} className="animate-spin text-primary shrink-0" />
-          <p className="text-sm text-muted-foreground">
-            Crawl in progress.
-          </p>
+        <div className="flex items-center gap-2 mb-4 text-sm text-muted-foreground min-w-0">
+          <Loader2 size={16} className="animate-spin text-primary shrink-0" />
+          <span className="truncate" title={crawlCurrentUrl ?? undefined}>
+            {crawlCurrentUrl
+              ? `Crawling ${crawlCurrentUrl}`
+              : "Crawl in progress…"}
+            {crawlFoundCount > 0 ? ` · ${crawlFoundCount} found` : ""}
+          </span>
         </div>
       )}
 

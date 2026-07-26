@@ -16,12 +16,28 @@
 
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::Duration;
 
+use serde::Serialize;
 use serde_json::{Map, Value};
 use url::Url;
 
 use super::types::DocumentChunk;
+
+/// Live crawl progress pushed to the UI while `crawl_website` runs.
+#[derive(Debug, Clone, Serialize)]
+pub struct CrawlProgressEvent {
+    /// URL currently being fetched, or the URL just found / finished.
+    pub url: String,
+    /// `fetching` | `found` | `done`
+    pub phase: String,
+    /// Pages successfully crawled so far.
+    pub found_count: usize,
+}
+
+/// Optional callback invoked from crawl workers (may be concurrent).
+pub type CrawlProgressCallback = Arc<dyn Fn(CrawlProgressEvent) + Send + Sync>;
 
 const REQUEST_TIMEOUT_SECS: u64 = 3;
 const CRAWL_DELAY_MS: u64 = 100;
@@ -90,19 +106,55 @@ fn same_domain(url: &Url, base: &str) -> bool {
     false
 }
 
-fn normalize_url(href: &str, base: &Url) -> Option<Url> {
+/// Canonical form used for visited/seen/results identity.
+/// Strips fragment and trailing slashes (except `scheme://host` root stays valid).
+fn canonical_url(url: &Url) -> String {
+    let mut u = url.clone();
+    u.set_fragment(None);
+    let mut s = u.to_string();
+    while s.ends_with('/') {
+        s.pop();
+    }
+    s
+}
+
+/// True when the last path segment looks like a file (`name.ext`).
+fn path_looks_like_file(url: &Url) -> bool {
+    let path = url.path();
+    let last = path.rsplit('/').next().unwrap_or("");
+    !last.is_empty() && last.contains('.')
+}
+
+/// URL string used for the actual HTTP GET. Directory-like paths keep a
+/// trailing slash so relative joins on the response and strict static
+/// servers (`/docs/` only) both work.
+fn fetch_url_string(url: &Url) -> String {
+    if path_looks_like_file(url) || url.path().ends_with('/') {
+        return url.to_string();
+    }
+    let mut u = url.clone();
+    let path = u.path().to_string();
+    if path.is_empty() {
+        u.set_path("/");
+    } else {
+        u.set_path(&format!("{path}/"));
+    }
+    u.to_string()
+}
+
+/// Resolve `href` against the document base URL, then canonicalize.
+///
+/// Important: `base` must be the document URL *as the browser sees it*
+/// (typically `response.url()` after redirects, which preserves a trailing
+/// slash on directory indexes). Joining relative paths like `symbols/X.html`
+/// against `https://example.com/api` (no slash) incorrectly yields
+/// `https://example.com/symbols/X.html` per URL RFC 3986.
+pub fn normalize_url(href: &str, base: &Url) -> Option<String> {
     let joined = base.join(href).ok()?;
     if !matches!(joined.scheme(), "http" | "https") {
         return None;
     }
-    let mut s = joined.to_string();
-    if let Some(idx) = s.find('#') {
-        s.truncate(idx);
-    }
-    while s.ends_with('/') {
-        s.pop();
-    }
-    Url::parse(&s).ok()
+    Some(canonical_url(&joined))
 }
 
 /// BFS-crawl a website starting from `start_url`, returning the list of
@@ -111,10 +163,22 @@ fn normalize_url(href: &str, base: &Url) -> Option<Url> {
 /// Uses a tokio task set capped at 10 concurrent fetches, with a 100ms
 /// inter-fetch delay. Skips non-HTML responses, ignored domains, and (when
 /// `same_domain_only`) off-domain pages.
-pub async fn crawl_website(start_url: &str, depth: usize, same_domain_only: bool) -> anyhow::Result<Vec<String>> {
-    let start = Url::parse(start_url.trim_end_matches('/'))
+///
+/// When `on_progress` is set, emits `fetching` / `found` / `done` events so
+/// the UI can show the live URL list (same idea as zip file embedding status).
+pub async fn crawl_website(
+    start_url: &str,
+    depth: usize,
+    same_domain_only: bool,
+    on_progress: Option<CrawlProgressCallback>,
+) -> anyhow::Result<Vec<String>> {
+    let start = Url::parse(start_url.trim())
         .map_err(|e| anyhow::anyhow!("invalid URL {start_url:?}: {e}"))?;
-    let base_domain = start.host_str().ok_or_else(|| anyhow::anyhow!("no domain in {start_url}"))?.to_lowercase();
+    let base_domain = start
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("no domain in {start_url}"))?
+        .to_lowercase();
+    let start_key = canonical_url(&start);
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
@@ -125,12 +189,14 @@ pub async fn crawl_website(start_url: &str, depth: usize, same_domain_only: bool
     let visited: std::sync::Arc<tokio::sync::Mutex<HashSet<String>>> =
         std::sync::Arc::new(tokio::sync::Mutex::new(HashSet::new()));
     let seen: std::sync::Arc<tokio::sync::Mutex<HashSet<String>>> =
-        std::sync::Arc::new(tokio::sync::Mutex::new(HashSet::from([start.to_string()])));
+        std::sync::Arc::new(tokio::sync::Mutex::new(HashSet::from([start_key.clone()])));
     let results: std::sync::Arc<tokio::sync::Mutex<Vec<String>>> =
         std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
 
-    let queue: std::sync::Arc<tokio::sync::Mutex<VecDeque<(Url, usize)>>> =
-        std::sync::Arc::new(tokio::sync::Mutex::new(VecDeque::from([(start, 0)])));
+    // Queue stores the fetch URL string (directory paths keep trailing slash) + depth.
+    let queue: std::sync::Arc<tokio::sync::Mutex<VecDeque<(String, usize)>>> = std::sync::Arc::new(
+        tokio::sync::Mutex::new(VecDeque::from([(fetch_url_string(&start), 0)])),
+    );
 
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(10));
     let mut handles = Vec::new();
@@ -140,7 +206,7 @@ pub async fn crawl_website(start_url: &str, depth: usize, same_domain_only: bool
             let mut q = queue.lock().await;
             q.pop_front()
         };
-        let Some((url, cur_depth)) = item else {
+        let Some((url_str, cur_depth)) = item else {
             // No items in queue; check if any tasks still running, otherwise
             // we're done.
             let active = semaphore.available_permits();
@@ -151,16 +217,22 @@ pub async fn crawl_website(start_url: &str, depth: usize, same_domain_only: bool
             continue;
         };
 
-        let url_str = url.to_string();
+        let visit_key = {
+            if let Ok(u) = Url::parse(&url_str) {
+                canonical_url(&u)
+            } else {
+                url_str.trim_end_matches('/').to_string()
+            }
+        };
         {
             let mut v = visited.lock().await;
-            if v.contains(&url_str) {
+            if v.contains(&visit_key) {
                 continue;
             }
             if v.len() >= max_pages {
                 break;
             }
-            v.insert(url_str.clone());
+            v.insert(visit_key.clone());
         }
 
         tokio::time::sleep(Duration::from_millis(CRAWL_DELAY_MS)).await;
@@ -170,12 +242,21 @@ pub async fn crawl_website(start_url: &str, depth: usize, same_domain_only: bool
         let queue = queue.clone();
         let seen = seen.clone();
         let results = results.clone();
-        let visited = visited.clone();
         let base_domain_clone = base_domain.clone();
+        let on_progress = on_progress.clone();
+
+        if let Some(cb) = on_progress.as_ref() {
+            let found_count = results.lock().await.len();
+            cb(CrawlProgressEvent {
+                url: url_str.clone(),
+                phase: "fetching".into(),
+                found_count,
+            });
+        }
 
         handles.push(tokio::spawn(async move {
             let _permit = permit;
-            let resp = client.get(url.clone()).send().await;
+            let resp = client.get(&url_str).send().await;
             let resp = match resp {
                 Ok(r) => r,
                 Err(_) => return,
@@ -192,30 +273,47 @@ pub async fn crawl_website(start_url: &str, depth: usize, same_domain_only: bool
             if !content_type.contains("text/html") {
                 return;
             }
+            // Final URL after redirects is the correct join base (preserves
+            // trailing slash on directory indexes like /api/ → /api/).
+            let document_base = resp.url().clone();
+            let result_key = canonical_url(&document_base);
             let body = match resp.text().await {
                 Ok(t) => t,
                 Err(_) => return,
             };
 
-            {
+            let found_count = {
                 let mut r = results.lock().await;
-                r.push(url.to_string());
+                if !r.iter().any(|u| u == &result_key) {
+                    r.push(result_key.clone());
+                }
+                r.len()
+            };
+            if let Some(cb) = on_progress.as_ref() {
+                cb(CrawlProgressEvent {
+                    url: result_key,
+                    phase: "found".into(),
+                    found_count,
+                });
             }
 
             if cur_depth < depth {
-                let found: Vec<Url> = {
+                let found: Vec<String> = {
                     let doc = scraper::Html::parse_document(&body);
-                    let mut out: Vec<Url> = Vec::new();
+                    let mut out: Vec<String> = Vec::new();
                     let sel = scraper::Selector::parse("a[href]").unwrap();
                     for el in doc.select(&sel) {
                         if let Some(href) = el.value().attr("href") {
-                            if let Some(nu) = normalize_url(href, &url) {
-                                let nu_host = nu.host_str().unwrap_or("").to_lowercase();
-                                if is_ignored_domain(&nu_host) {
-                                    continue;
-                                }
-                                if same_domain_only && !same_domain(&nu, &base_domain_clone) {
-                                    continue;
+                            if let Some(nu) = normalize_url(href, &document_base) {
+                                if let Ok(parsed) = Url::parse(&nu) {
+                                    let nu_host = parsed.host_str().unwrap_or("").to_lowercase();
+                                    if is_ignored_domain(&nu_host) {
+                                        continue;
+                                    }
+                                    if same_domain_only && !same_domain(&parsed, &base_domain_clone)
+                                    {
+                                        continue;
+                                    }
                                 }
                                 out.push(nu);
                             }
@@ -226,13 +324,15 @@ pub async fn crawl_website(start_url: &str, depth: usize, same_domain_only: bool
                 let mut s = seen.lock().await;
                 let mut q = queue.lock().await;
                 for nu in found {
-                    if !s.contains(&nu.to_string()) {
-                        s.insert(nu.to_string());
-                        q.push_back((nu, cur_depth + 1));
+                    if !s.contains(&nu) {
+                        s.insert(nu.clone());
+                        let fetch = Url::parse(&nu)
+                            .map(|u| fetch_url_string(&u))
+                            .unwrap_or(nu);
+                        q.push_back((fetch, cur_depth + 1));
                     }
                 }
             }
-            let _ = &visited;
         }));
     }
 
@@ -240,7 +340,15 @@ pub async fn crawl_website(start_url: &str, depth: usize, same_domain_only: bool
         let _ = h.await;
     }
     let r = results.lock().await;
-    Ok(r.clone())
+    let urls = r.clone();
+    if let Some(cb) = on_progress.as_ref() {
+        cb(CrawlProgressEvent {
+            url: String::new(),
+            phase: "done".into(),
+            found_count: urls.len(),
+        });
+    }
+    Ok(urls)
 }
 
 /// One scraped section of an HTML page. Sections are keyed by the heading
@@ -667,4 +775,47 @@ fn simple_chunk(text: &str, chunk_size: usize, _chunk_overlap: usize) -> Vec<Str
         start = e;
     }
     chunks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_url_joins_relative_against_directory_base() {
+        let base = Url::parse("https://gojs.net/latest/api/").unwrap();
+        assert_eq!(
+            normalize_url("symbols/Adornment.html", &base).as_deref(),
+            Some("https://gojs.net/latest/api/symbols/Adornment.html")
+        );
+    }
+
+    #[test]
+    fn normalize_url_strips_fragment_and_trailing_slash() {
+        let base = Url::parse("https://example.com/docs/").unwrap();
+        assert_eq!(
+            normalize_url("page#section", &base).as_deref(),
+            Some("https://example.com/docs/page")
+        );
+        assert_eq!(
+            normalize_url("../other/", &base).as_deref(),
+            Some("https://example.com/other")
+        );
+    }
+
+    #[test]
+    fn normalize_url_rejects_non_http() {
+        let base = Url::parse("https://example.com/").unwrap();
+        assert!(normalize_url("mailto:a@b.com", &base).is_none());
+        assert!(normalize_url("javascript:void(0)", &base).is_none());
+    }
+
+    #[test]
+    fn normalize_url_absolute_path_from_directory() {
+        let base = Url::parse("https://example.com/base").unwrap();
+        assert_eq!(
+            normalize_url("/page#section", &base).as_deref(),
+            Some("https://example.com/page")
+        );
+    }
 }

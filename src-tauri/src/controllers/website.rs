@@ -1,8 +1,8 @@
 //! Website controller commands.
 //!
 //! `crawl_website` runs the BFS crawler directly in the controller (no
-//! job queue) and returns the URL list — crawling is fast enough that the
-//! IPC response is sufficient.
+//! job queue) and returns the URL list. While crawling it emits
+//! `crawl_progress` Tauri events so the UI can show the live URL list.
 //!
 //! `embed_website` enqueues a `process_website_scrape` job row in
 //! `job_status` for the worker to claim; the worker dispatches to
@@ -10,24 +10,32 @@
 //! chunks the result, embeds it via the dense model, and upserts to
 //! Qdrant.
 
+use std::sync::Arc;
+
 use serde_json::json;
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 use uuid::Uuid;
 
 use crate::db::DbState;
 use crate::models::response::{CrawlResponse, EmbedWebsiteResponse};
 use crate::services::ingestion;
+use crate::services::ingestion::website::CrawlProgressEvent;
 use crate::worker::progress::{emit_job_event, now_iso, JobProgressEvent};
 
 #[tauri::command]
 pub async fn crawl_website(
+    app: AppHandle,
     url: String,
     depth: Option<i64>,
     same_domain_only: Option<bool>,
 ) -> Result<CrawlResponse, String> {
     let depth = depth.unwrap_or(1).max(0) as usize;
     let same_domain = same_domain_only.unwrap_or(true);
-    let urls = ingestion::website::crawl_website(&url, depth, same_domain)
+    let app_for_progress = app.clone();
+    let on_progress: ingestion::website::CrawlProgressCallback = Arc::new(move |ev: CrawlProgressEvent| {
+        let _ = app_for_progress.emit("crawl_progress", &ev);
+    });
+    let urls = ingestion::website::crawl_website(&url, depth, same_domain, Some(on_progress))
         .await
         .map_err(|e| format!("crawling {url}: {e:#}"))?;
     let count = urls.len() as i64;

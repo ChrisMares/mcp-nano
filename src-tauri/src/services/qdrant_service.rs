@@ -147,7 +147,16 @@ impl QdrantService {
             let sparse_vecs = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 bm25.embed_sparse(&doc_refs)
             }))
-            .map_err(|_| anyhow!("BM25 sparse embed panicked during upsert"))?
+            .map_err(|payload| {
+                let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                    (*s).to_string()
+                } else if let Some(s) = payload.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "unknown".into()
+                };
+                anyhow!("BM25 sparse embed panicked during upsert: {msg}")
+            })?
             .context("BM25 sparse embed during upsert")?;
             if sparse_vecs.len() != doc_refs.len() {
                 return Err(anyhow!(
@@ -165,7 +174,11 @@ impl QdrantService {
                     "dense".to_string(),
                     Vector::from(dense_embeddings[idx].clone()),
                 );
-                vectors.insert("sparse".to_string(), Vector::from(sparse.to_tuples()));
+                // Omit empty sparse vectors (stopword-only / empty docs). Qdrant
+                // accepts missing named vectors; empty sparse is rejected by some paths.
+                if !sparse.is_empty() {
+                    vectors.insert("sparse".to_string(), Vector::from(sparse.to_tuples()));
+                }
                 let vectors = Vectors::from(vectors);
 
                 let mut payload = serde_json::Map::new();
@@ -219,30 +232,40 @@ impl QdrantService {
         );
         let builder = if let (Some(text), Some(bm25)) = (query_text, bm25) {
             let sparse_vecs = bm25
-                .embed_sparse(&[text])
-                .context("BM25 sparse embed during query")?;
+                .embed_query_sparse(&[text])
+                .context("BM25 sparse query embed")?;
             let sparse = sparse_vecs.into_iter().next().unwrap_or_default();
-            let sparse_tuples = sparse.to_tuples();
 
             let mut dense_pf = PrefetchQueryBuilder::default()
                 .query(query_dense.to_vec())
                 .using("dense")
                 .limit(prefetch_limit);
-            let mut sparse_pf = PrefetchQueryBuilder::default()
-                .query(sparse_tuples)
-                .using("sparse")
-                .limit(prefetch_limit);
             if let Some(f) = filter.clone() {
-                dense_pf = dense_pf.filter(f.clone());
-                sparse_pf = sparse_pf.filter(f);
+                dense_pf = dense_pf.filter(f);
             }
 
-            let mut b = QueryPointsBuilder::new(collection)
-                .add_prefetch(dense_pf)
-                .add_prefetch(sparse_pf)
-                .query(Fusion::Rrf)
-                .limit(limit)
-                .with_payload(true);
+            // Hybrid only when the query produced at least one sparse term.
+            let mut b = if sparse.is_empty() {
+                QueryPointsBuilder::new(collection)
+                    .query(query_dense.to_vec())
+                    .using("dense")
+                    .limit(limit)
+                    .with_payload(true)
+            } else {
+                let mut sparse_pf = PrefetchQueryBuilder::default()
+                    .query(sparse.to_tuples())
+                    .using("sparse")
+                    .limit(prefetch_limit);
+                if let Some(f) = filter.clone() {
+                    sparse_pf = sparse_pf.filter(f);
+                }
+                QueryPointsBuilder::new(collection)
+                    .add_prefetch(dense_pf)
+                    .add_prefetch(sparse_pf)
+                    .query(Fusion::Rrf)
+                    .limit(limit)
+                    .with_payload(true)
+            };
             if let Some(f) = filter {
                 b = b.filter(f);
             }

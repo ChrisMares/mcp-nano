@@ -13,8 +13,8 @@
     "windows": [
       {
         "title": "mcp-nano",
-        "width": 1500,
-        "height": 800
+        "width": 1200,
+        "height": 1000
       }
     ],
     "security": {
@@ -26,7 +26,8 @@
     "targets": "all",
     "externalBin": ["binaries/qdrant"],
     "resources": {
-      "resources/models/**/*": "models/"
+      "resources/models/arctic-embed-xs/*": "models/arctic-embed-xs/",
+      "resources/models/minilm-l6-v2/*": "models/minilm-l6-v2/"
     },
     "icon": [
       "icons/32x32.png",

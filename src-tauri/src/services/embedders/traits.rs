@@ -52,7 +52,14 @@ pub trait EncodeDocuments {
 
 /// Produce sparse (BM25-style) vectors for a batch of texts.
 pub trait SparseEmbed {
+    /// Document / passage encoding (TF-saturation weights for BM25).
     fn embed_sparse(&self, texts: &[&str]) -> Result<Vec<SparseVector>>;
+
+    /// Query encoding. Default: same as documents. BM25 overrides this with
+    /// unit weights on unique tokens (fastembed `query_embed`).
+    fn embed_query_sparse(&self, texts: &[&str]) -> Result<Vec<SparseVector>> {
+        self.embed_sparse(texts)
+    }
 }
 
 #[cfg(test)]

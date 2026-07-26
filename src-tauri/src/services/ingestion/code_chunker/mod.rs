@@ -429,9 +429,26 @@ pub fn chunk_file_to_documents(
 ) -> Vec<DocumentChunk> {
     // Callers (zip ingest) wrap this in catch_unwind so a language-parser
     // panic becomes a per-file error rather than killing the whole job.
+    let path_s = file_path.display().to_string();
+    let t0 = std::time::Instant::now();
+    crate::write_ingest_breadcrumb("chunk_parse", &path_s);
     let chunks =
         chunk_single_code_file(file_path, repo_name, file_name_override, splitter, max_chunk_tokens);
+    let parse_ms = t0.elapsed().as_millis();
+    crate::write_ingest_breadcrumb(
+        "chunk_split_oversized",
+        &format!("path={path_s} raw_chunks={} parse_ms={parse_ms}", chunks.len()),
+    );
+    let t1 = std::time::Instant::now();
     let split = oversized::split_oversized_code_chunks(chunks, splitter);
+    let split_ms = t1.elapsed().as_millis();
+    crate::write_ingest_breadcrumb(
+        "chunk_to_docs",
+        &format!(
+            "path={path_s} split_chunks={} parse_ms={parse_ms} split_ms={split_ms}",
+            split.len()
+        ),
+    );
     code_chunks_to_document_chunks(split)
 }
 

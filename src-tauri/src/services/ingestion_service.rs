@@ -12,8 +12,8 @@ use uuid::Uuid;
 use tracing::{debug, error, info};
 
 use crate::models::request::EmbeddingOptions;
-use crate::services::embedders::EncodeDocuments;
 use crate::services::embedder_state::EmbedderState;
+use crate::services::embedders::EncodeDocuments;
 use crate::services::ingestion;
 use crate::services::qdrant_service::QdrantService;
 use crate::worker::TaskRegistry;
@@ -43,12 +43,36 @@ fn panic_payload_to_string(payload: &Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
+fn record_caught_panic(label: &str, msg: &str) {
+    error!("{label} panicked: {msg}");
+    crate::write_ingest_breadcrumb("caught_panic", &format!("{label}: {msg}"));
+    if let Some(dir) = crate::log_dir() {
+        let path = dir.join("last-panic.log");
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            use std::io::Write;
+            let _ = writeln!(
+                f,
+                "=== caught_panic ===\ntime_unix={}\nlabel={label}\npayload={msg}\n",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0)
+            );
+            let _ = f.flush();
+        }
+    }
+}
+
 /// Run a sync closure, converting panics into `Err` so batch jobs can skip
 /// one bad unit of work instead of aborting the whole task.
 fn catch_sync_panic<T>(label: &str, f: impl FnOnce() -> T) -> Result<T> {
     std::panic::catch_unwind(AssertUnwindSafe(f)).map_err(|payload| {
         let msg = panic_payload_to_string(&payload);
-        error!("{label} panicked: {msg}");
+        record_caught_panic(label, &msg);
         anyhow!("{label} panicked: {msg}")
     })
 }
@@ -62,7 +86,7 @@ where
         Ok(result) => result,
         Err(payload) => {
             let msg = panic_payload_to_string(&payload);
-            error!("{label} panicked: {msg}");
+            record_caught_panic(label, &msg);
             Err(anyhow!("{label} panicked: {msg}"))
         }
     }
@@ -107,7 +131,11 @@ pub struct IngestionService {
 }
 
 impl IngestionService {
-    pub fn new(embedders: Arc<EmbedderState>, qdrant: QdrantService, models_dir: &Path) -> Result<Self> {
+    pub fn new(
+        embedders: Arc<EmbedderState>,
+        qdrant: QdrantService,
+        models_dir: &Path,
+    ) -> Result<Self> {
         let tokenizer = Tokenizer::from_file(models_dir.join("arctic-embed-xs/tokenizer.json"))
             .map_err(|e| anyhow!("loading chunk tokenizer: {e}"))?;
         let config = ChunkConfig::new(DEFAULT_CHUNK_SIZE)
@@ -118,8 +146,9 @@ impl IngestionService {
 
         // Code-splitter: separate `Tokenizer` instance (TextSplitter borrows
         // it via `Arc<Tokenizer>`); use a fresh clone of the same file.
-        let code_tokenizer = Tokenizer::from_file(models_dir.join("arctic-embed-xs/tokenizer.json"))
-            .map_err(|e| anyhow!("loading code tokenizer: {e}"))?;
+        let code_tokenizer =
+            Tokenizer::from_file(models_dir.join("arctic-embed-xs/tokenizer.json"))
+                .map_err(|e| anyhow!("loading code tokenizer: {e}"))?;
         let code_config = ChunkConfig::new(CODE_CHUNK_SIZE)
             .with_sizer(code_tokenizer)
             .with_overlap(64)
@@ -147,12 +176,14 @@ impl IngestionService {
                 anyhow!("invalid params: {e:#}")
             })
             .context("deserializing process_zip_upload params")?;
-        info!("process_zip_upload: zip={} collection={:?}", p.zip_path, p.embedding_options.collection);
+        info!(
+            "process_zip_upload: zip={} collection={:?}",
+            p.zip_path, p.embedding_options.collection
+        );
         progress(5, Some("Starting zip extraction".to_string())).await;
 
         let extract_dir = PathBuf::from(format!("{}_extracted", strip_zip_ext(&p.zip_path)));
-        unzip_to(&p.zip_path, &extract_dir)
-            .with_context(|| format!("unzipping {}", p.zip_path))?;
+        unzip_to(&p.zip_path, &extract_dir).with_context(|| format!("unzipping {}", p.zip_path))?;
         info!("extracted zip to {}", extract_dir.display());
         progress(20, Some("Zip extraction complete".to_string())).await;
 
@@ -268,6 +299,7 @@ impl IngestionService {
             )
             .await;
 
+            let file_t0 = std::time::Instant::now();
             // One bad file must not abort the whole zip job.
             let result = catch_async_panic(
                 &format!("ingest {rel}"),
@@ -282,18 +314,28 @@ impl IngestionService {
                 ),
             )
             .await;
+            let file_ms = file_t0.elapsed().as_millis();
             match result {
                 Ok(n) => {
                     processed += n;
+                    if file_ms >= 2_000 {
+                        info!(
+                            "process_zip_upload: slow file={rel} chunks={n} elapsed_ms={file_ms}"
+                        );
+                    }
                     debug!(
-                        "process_zip_upload: ok file={rel} chunks={n} running_total={processed}"
+                        "process_zip_upload: ok file={rel} chunks={n} running_total={processed} elapsed_ms={file_ms}"
+                    );
+                    crate::write_ingest_breadcrumb(
+                        "zip_file_ok",
+                        &format!("{rel} chunks={n} ms={file_ms}"),
                     );
                 }
                 Err(e) => {
-                    error!("process_zip_upload: skip file={rel}: {e:#}");
+                    error!("process_zip_upload: skip file={rel} elapsed_ms={file_ms}: {e:#}");
                     crate::write_ingest_breadcrumb(
                         "zip_file_error",
-                        &format!("{rel}: {e:#}"),
+                        &format!("{rel} ms={file_ms}: {e:#}"),
                     );
                     errors.push(format!("{rel}: {e:#}"));
                     progress(
@@ -342,7 +384,10 @@ impl IngestionService {
                 anyhow!("invalid params: {e:#}")
             })
             .context("deserializing process_documents_upload params")?;
-        info!("process_documents_upload: path={} group={:?}", p.path, p.group);
+        info!(
+            "process_documents_upload: path={} group={:?}",
+            p.path, p.group
+        );
         let display = Path::new(&p.path)
             .file_name()
             .and_then(|n| n.to_str())
@@ -393,7 +438,10 @@ impl IngestionService {
                 anyhow!("invalid params: {e:#}")
             })
             .context("deserializing process_code_file_upload params")?;
-        info!("process_code_file_upload: path={} collection={}", p.path, p.collection);
+        info!(
+            "process_code_file_upload: path={} collection={}",
+            p.path, p.collection
+        );
         let display = Path::new(&p.path)
             .file_name()
             .and_then(|n| n.to_str())
@@ -443,24 +491,41 @@ impl IngestionService {
                 anyhow!("invalid params: {e:#}")
             })
             .context("deserializing process_website_embed params")?;
-        info!("process_website_embed: {} urls, group={}", p.urls.len(), p.group);
-        progress(5, Some(format!("Scraping {} pages", p.urls.len()))).await;
+        info!(
+            "process_website_embed: {} urls, group={}",
+            p.urls.len(),
+            p.group
+        );
 
         let mut base_metadata = serde_json::Map::new();
         base_metadata.insert("group".into(), serde_json::Value::String(p.group.clone()));
-        for (k, v) in p.metadata.unwrap_or_default().as_object().into_iter().flatten() {
+        for (k, v) in p
+            .metadata
+            .unwrap_or_default()
+            .as_object()
+            .into_iter()
+            .flatten()
+        {
             base_metadata.insert(k.clone(), v.clone());
         }
 
-        let chunks = catch_async_panic(
-            "website scrape",
-            async {
-                ingestion::website::process_website(&p.urls, &base_metadata)
+        let total_urls = p.urls.len().max(1);
+        let mut chunks = Vec::new();
+        for (i, url) in p.urls.iter().enumerate() {
+            let pct = 5 + ((i as i32) * 25 / total_urls as i32);
+            progress(
+                pct,
+                Some(format!("Scraping {} ({}/{})", url, i + 1, p.urls.len())),
+            )
+            .await;
+            let page_chunks = catch_async_panic("website scrape", async {
+                ingestion::website::process_website(std::slice::from_ref(url), &base_metadata)
                     .await
                     .context("scraping + chunking website pages")
-            },
-        )
-        .await?;
+            })
+            .await?;
+            chunks.extend(page_chunks);
+        }
         if chunks.is_empty() {
             return Err(anyhow!("No content extracted from any URL"));
         }
@@ -527,8 +592,7 @@ impl IngestionService {
             .and_then(|n| n.to_str())
             .unwrap_or("unknown")
             .to_string();
-        let display = strip_job_prefix(&file_name)
-            .unwrap_or_else(|| file_name.clone());
+        let display = strip_job_prefix(&file_name).unwrap_or_else(|| file_name.clone());
         let doc_type = path
             .extension()
             .and_then(|e| e.to_str())
@@ -539,11 +603,7 @@ impl IngestionService {
         // Report distinct stages so the UI is not frozen on one percentage.
         let load_pct = (range_start.saturating_sub(5)).max(5).min(range_start);
         let chunk_pct = load_pct.saturating_add(2).min(range_start);
-        progress(
-            load_pct,
-            Some(format!("Extracting text from {display}")),
-        )
-        .await;
+        progress(load_pct, Some(format!("Extracting text from {display}"))).await;
 
         let path_buf = path.to_path_buf();
         let path_display = path.display().to_string();
@@ -553,6 +613,7 @@ impl IngestionService {
             crate::write_ingest_breadcrumb("chunk_code", &path_display);
             let repo = repo_name.unwrap_or("");
             let name_override = strip_job_prefix(&file_name);
+            let t0 = std::time::Instant::now();
             let code_chunks = catch_sync_panic(&format!("code chunker {path_display}"), || {
                 ingestion::code_chunker::chunk_file_to_documents(
                     &path_buf,
@@ -562,15 +623,31 @@ impl IngestionService {
                     CODE_CHUNK_SIZE,
                 )
             })?;
+            let chunk_ms = t0.elapsed().as_millis();
             debug!(
-                "ingest: chunked code {} -> {} chunk(s)",
+                "ingest: chunked code {} -> {} chunk(s) elapsed_ms={chunk_ms}",
                 path_display,
                 code_chunks.len()
+            );
+            if chunk_ms >= 2_000 {
+                info!(
+                    "ingest: slow code chunk {} chunks={} elapsed_ms={chunk_ms}",
+                    path_display,
+                    code_chunks.len()
+                );
+            }
+            crate::write_ingest_breadcrumb(
+                "chunk_code_done",
+                &format!(
+                    "path={path_display} chunks={} ms={chunk_ms}",
+                    code_chunks.len()
+                ),
             );
             enforce_max_chunk_chars(code_chunks)
         } else {
             crate::write_ingest_breadcrumb("load_document", &path_display);
             let path_for_load = path_buf.clone();
+            let load_t0 = std::time::Instant::now();
             let loaded = tokio::task::spawn_blocking(move || {
                 catch_sync_panic(
                     &format!("document loader {}", path_for_load.display()),
@@ -584,17 +661,33 @@ impl IngestionService {
             .map_err(|e| {
                 if e.is_panic() {
                     let msg = panic_payload_to_string(&e.into_panic());
+                    record_caught_panic(&format!("load task {path_display}"), &msg);
                     anyhow!("load task panicked for {path_display}: {msg}")
                 } else {
                     anyhow!("load task join error for {path_display}: {e}")
                 }
             })??;
+            let load_ms = load_t0.elapsed().as_millis();
+            crate::write_ingest_breadcrumb(
+                "load_document_done",
+                &format!("path={path_display} ms={load_ms}"),
+            );
 
             progress(chunk_pct, Some(format!("Chunking text from {display}"))).await;
             crate::write_ingest_breadcrumb("chunk_text", &path_display);
-            catch_sync_panic(&format!("text splitter {path_display}"), || {
+            let split_t0 = std::time::Instant::now();
+            let split_chunks = catch_sync_panic(&format!("text splitter {path_display}"), || {
                 split_document_chunks(loaded, &self.splitter)
-            })?
+            })?;
+            crate::write_ingest_breadcrumb(
+                "chunk_text_done",
+                &format!(
+                    "path={path_display} chunks={} ms={}",
+                    split_chunks.len(),
+                    split_t0.elapsed().as_millis()
+                ),
+            );
+            split_chunks
         };
 
         if chunks.is_empty() {
@@ -627,10 +720,7 @@ impl IngestionService {
             )
             .await
             .with_context(|| format!("embed/upsert failed for {path_display}"))?;
-        crate::write_ingest_breadcrumb(
-            "embed_done",
-            &format!("path={path_display} chunks={n}"),
-        );
+        crate::write_ingest_breadcrumb("embed_done", &format!("path={path_display} chunks={n}"));
         Ok(n)
     }
 
@@ -648,8 +738,15 @@ impl IngestionService {
         range_end: i32,
     ) -> Result<usize> {
         let extra = serde_json::Value::Object(serde_json::Map::new());
-        self.embed_and_upsert_documents_inner(chunks, collection, extra, progress, range_start, range_end)
-            .await
+        self.embed_and_upsert_documents_inner(
+            chunks,
+            collection,
+            extra,
+            progress,
+            range_start,
+            range_end,
+        )
+        .await
     }
 
     async fn embed_and_upsert_documents_inner(
@@ -669,14 +766,12 @@ impl IngestionService {
             chunks.len()
         );
 
-        let texts: Vec<String> = chunks
-            .iter()
-            .map(|c| c.chunk_embedding_text())
-            .collect();
+        let texts: Vec<String> = chunks.iter().map(|c| c.chunk_embedding_text()).collect();
         let documents: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
         let chunk_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
 
-        let total_batches = (((chunks.len() + EMBED_BATCH_SIZE - 1) / EMBED_BATCH_SIZE) as i32).max(1);
+        let total_batches =
+            (((chunks.len() + EMBED_BATCH_SIZE - 1) / EMBED_BATCH_SIZE) as i32).max(1);
         let mut embeddings_list: Vec<Vec<f32>> = Vec::with_capacity(chunks.len());
         for batch_index in 0..total_batches {
             let batch_start = (batch_index as usize) * EMBED_BATCH_SIZE;
@@ -746,7 +841,11 @@ impl IngestionService {
             .map(|c| Uuid::parse_str(&c.id).unwrap_or_else(|_| Uuid::new_v4()))
             .collect();
 
-        progress(range_end, Some(format!("Upserting {} chunks to Qdrant", chunks.len()))).await;
+        progress(
+            range_end,
+            Some(format!("Upserting {} chunks to Qdrant", chunks.len())),
+        )
+        .await;
         crate::write_ingest_breadcrumb(
             "upsert",
             &format!("collection={collection} chunks={}", chunks.len()),
@@ -849,9 +948,9 @@ pub fn should_skip_ingest_path(path: &Path) -> bool {
         .to_ascii_lowercase();
 
     const SKIP_EXTS: &[&str] = &[
-        "map", "css", "scss", "sass", "less", "woff", "woff2", "ttf", "otf", "eot",
-        "ico", "svg", "gif", "webp", "bmp", "mp3", "mp4", "wav", "zip", "gz", "tar",
-        "7z", "rar", "bin", "exe", "dll", "so", "dylib", "pdb", "lock", "sum",
+        "map", "woff", "woff2", "ttf", "otf", "eot", "ico", "svg", "gif", "webp", "bmp", "mp3",
+        "mp4", "wav", "zip", "gz", "tar", "7z", "rar", "bin", "exe", "dll", "so", "dylib", "pdb",
+        "lock", "sum", "chm", "chw",
     ];
     if SKIP_EXTS.contains(&ext.as_str()) {
         return true;
@@ -918,10 +1017,8 @@ pub fn should_skip_ingest_path(path: &Path) -> bool {
 /// Strip the job-id UUID prefix from a temp filename (mirrors the Python
 /// `embedding_utils.strip_job_prefix`).
 pub fn strip_job_prefix(name: &str) -> Option<String> {
-    let re = regex::Regex::new(
-        r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}_",
-    )
-    .ok()?;
+    let re = regex::Regex::new(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}_")
+        .ok()?;
     let stripped = re.replace(name, "").to_string();
     Some(stripped)
 }
@@ -962,10 +1059,7 @@ fn build_base_metadata(
         }
     }
     let now = crate::worker::progress::now_iso();
-    map.insert(
-        "created_at".to_string(),
-        serde_json::Value::String(now),
-    );
+    map.insert("created_at".to_string(), serde_json::Value::String(now));
     serde_json::Value::Object(map)
 }
 
@@ -996,14 +1090,15 @@ pub fn repo_name_from_zip_filename(zip_filename: &str) -> String {
 
 fn is_image_ext(path: &Path) -> bool {
     matches!(
-        path.extension().and_then(|e| e.to_str()).map(|s| s.to_lowercase()).as_deref(),
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_lowercase())
+            .as_deref(),
         Some("png") | Some("jpg") | Some("jpeg")
     )
 }
 
-fn enforce_max_chunk_chars(
-    chunks: Vec<ingestion::DocumentChunk>,
-) -> Vec<ingestion::DocumentChunk> {
+fn enforce_max_chunk_chars(chunks: Vec<ingestion::DocumentChunk>) -> Vec<ingestion::DocumentChunk> {
     let mut out = Vec::with_capacity(chunks.len());
     for chunk in chunks {
         if chunk.content.chars().count() <= MAX_CHUNK_CHARS {
@@ -1096,10 +1191,7 @@ mod tests {
             "OptionsPricing-main"
         );
         assert_eq!(repo_name_from_zip_filename("MyRepo.ZIP"), "MyRepo");
-        assert_eq!(
-            repo_name_from_zip_filename("/path/to/repo.zip"),
-            "repo"
-        );
+        assert_eq!(repo_name_from_zip_filename("/path/to/repo.zip"), "repo");
         assert_eq!(repo_name_from_zip_filename("noext"), "noext");
     }
 
@@ -1250,11 +1342,12 @@ mod tests {
         let huge = "a".repeat(900_000);
         let chunk = ingestion::DocumentChunk::new("id1", "chart.umd.min.js.map", huge, "map", 0);
         let split = split_document_chunks(vec![chunk], &splitter);
-        assert!(
-            !split.is_empty(),
-            "expected at least one chunk after split"
-        );
-        let max_chars = split.iter().map(|c| c.content.chars().count()).max().unwrap_or(0);
+        assert!(!split.is_empty(), "expected at least one chunk after split");
+        let max_chars = split
+            .iter()
+            .map(|c| c.content.chars().count())
+            .max()
+            .unwrap_or(0);
         assert!(
             max_chars <= MAX_CHUNK_CHARS,
             "chunk still oversized: max_chars={max_chars} limit={MAX_CHUNK_CHARS} n_chunks={}",
@@ -1266,7 +1359,9 @@ mod tests {
 
     #[test]
     fn should_skip_ingest_junk_assets() {
-        assert!(should_skip_ingest_path(Path::new("wwwroot/chart.umd.min.js.map")));
+        assert!(should_skip_ingest_path(Path::new(
+            "wwwroot/chart.umd.min.js.map"
+        )));
         assert!(should_skip_ingest_path(Path::new("bootstrap.min.css.map")));
         assert!(should_skip_ingest_path(Path::new("open-iconic.woff")));
         assert!(should_skip_ingest_path(Path::new("favicon.ico")));
@@ -1282,15 +1377,11 @@ mod tests {
         assert!(should_skip_ingest_path(Path::new(
             "Chart.js-4.5.1/test/fixtures/controller.radar/radius/indexable.js"
         )));
-        assert!(should_skip_ingest_path(Path::new(
-            "repo/tests/unit/foo.rs"
-        )));
+        assert!(should_skip_ingest_path(Path::new("repo/tests/unit/foo.rs")));
         assert!(should_skip_ingest_path(Path::new(
             "pkg/__tests__/button.tsx"
         )));
-        assert!(should_skip_ingest_path(Path::new(
-            "lib/spec/helpers.js"
-        )));
+        assert!(should_skip_ingest_path(Path::new("lib/spec/helpers.js")));
         assert!(should_skip_ingest_path(Path::new(
             "proj/.github/workflows/ci.yml"
         )));

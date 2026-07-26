@@ -62,6 +62,22 @@ describe('ConfigureWebsiteStep', () => {
     expect(screen.getByLabelText('Only crawl current domain')).toBeDisabled()
   })
 
+  it('shows current crawl URL on one line while crawling', () => {
+    render(
+      <ConfigureWebsiteStep
+        {...defaults}
+        websiteUrl="https://gojs.net/latest/api/"
+        isCrawling={true}
+        crawlFoundCount={2}
+        crawlCurrentUrl="https://gojs.net/latest/api/symbols/Diagram.html"
+      />
+    )
+    expect(
+      screen.getByText(/Crawling https:\/\/gojs\.net\/latest\/api\/symbols\/Diagram\.html/)
+    ).toBeInTheDocument()
+    expect(screen.getByText(/2 found/)).toBeInTheDocument()
+  })
+
   it('shows Start Crawl button when not crawling', () => {
     render(<ConfigureWebsiteStep {...defaults} />)
     expect(screen.getByText('Start Crawl')).toBeInTheDocument()

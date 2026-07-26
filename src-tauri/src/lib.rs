@@ -89,6 +89,7 @@ fn install_panic_hook() {
             chrono_lite_now()
         );
         eprintln!("{dump}");
+        let _ = std::io::Write::flush(&mut std::io::stderr());
         if let Some(dir) = LOG_DIR.get() {
             let path = dir.join("last-panic.log");
             if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -98,6 +99,27 @@ fn install_panic_hook() {
             {
                 use std::io::Write;
                 let _ = writeln!(f, "{dump}");
+                let _ = f.flush();
+            }
+            // Also stamp the live breadcrumb so a paused debugger still leaves
+            // a clear "this was a panic" marker even before catch_unwind runs.
+            let panic_crumb = format!(
+                "{}\tpanic\tthread={thread_name} loc={location} payload={}\n",
+                chrono_lite_now(),
+                payload.replace('\n', " ")
+            );
+            if let Ok(mut f) = std::fs::File::create(dir.join("ingest-current.txt")) {
+                use std::io::Write;
+                let _ = f.write_all(panic_crumb.as_bytes());
+                let _ = f.flush();
+            }
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("mcp-nano-debug.log"))
+            {
+                use std::io::Write;
+                let _ = writeln!(f, "ERROR panic_hook: {location} | {payload} | crumb={breadcrumb}");
                 let _ = f.flush();
             }
         }
@@ -255,6 +277,12 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .setup(|app| {
             init_logging(app.handle());
+            if let Some(window) = app.get_webview_window("main") {
+                if let Ok(icon) = tauri::image::Image::from_bytes(include_bytes!("../icons/icon.png"))
+                {
+                    let _ = window.set_icon(icon);
+                }
+            }
             app.manage(qdrant::BackendStatusState(std::sync::RwLock::new(
                 qdrant::BackendStatus::default(),
             )));
