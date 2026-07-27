@@ -7,8 +7,8 @@ use tracing::{debug, info};
 use crate::models::request::RagQueryRequest;
 use crate::models::response::RagResponse;
 use crate::models::RagResult;
-use crate::services::embedders::EncodeQuery;
 use crate::services::embedder_state::EmbedderState;
+use crate::services::embedders::EncodeQuery;
 use crate::services::qdrant_service::{Include, QdrantService};
 
 /// Keep rerank batches modest on GPU; pairs are truncated to 512 tokens but
@@ -78,9 +78,15 @@ impl RagService {
                 _ => None,
             };
 
-            // Overfetch candidates for the cross-encoder (prefetch overfetch is
-            // handled inside query_items for RRF).
-            let retrieve_n = (limit as usize).saturating_mul(4).max(1);
+            //overfetch multiple
+            let multiple = match limit {
+                0..=10 => 5,
+                11..=25 => 4,
+                26..=50 => 3,
+                _ => 2,
+            };
+
+            let retrieve_n = (limit as usize) * multiple;
             let retrieve_start = Instant::now();
             info!(
                 "RAG qdrant retrieve begin collection={} top_k={retrieve_n} filter={}",
