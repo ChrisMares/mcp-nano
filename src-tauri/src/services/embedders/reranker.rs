@@ -4,14 +4,13 @@ use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
 use ort::session::Session;
-use ort::value::Tensor;
 use ort::inputs;
 use tokenizers::Tokenizer;
 use tracing::info;
 
 use super::dense::{
-    build_session, clamp_text_for_tokenize, load_tokenizer_with_truncation, InferenceDevice,
-    MAX_SEQ_LEN,
+    build_bert_input_tensors, build_session, clamp_text_for_tokenize,
+    load_tokenizer_with_truncation, InferenceDevice, MAX_SEQ_LEN,
 };
 
 /// Cross-encoder reranker wrapping an ONNX BERT sequence-classification model.
@@ -105,35 +104,8 @@ impl Reranker {
                 continue;
             }
             let batch = encodings.len();
-            let mut input_ids = Vec::with_capacity(batch * seq_len);
-            let mut attention_mask = Vec::with_capacity(batch * seq_len);
-            let mut token_type_ids = Vec::with_capacity(batch * seq_len);
-            for enc in &encodings {
-                let ids = enc.get_ids();
-                let mask = enc.get_attention_mask();
-                let type_ids = enc.get_type_ids();
-                let n = ids.len().min(seq_len);
-                for i in 0..seq_len {
-                    if i < n {
-                        input_ids.push(ids[i] as i64);
-                        attention_mask.push(if i < mask.len() { mask[i] as i64 } else { 1 });
-                        token_type_ids.push(if i < type_ids.len() {
-                            type_ids[i] as i64
-                        } else {
-                            0
-                        });
-                    } else {
-                        input_ids.push(0);
-                        attention_mask.push(0);
-                        token_type_ids.push(0);
-                    }
-                }
-            }
-
-            let shape = vec![batch as i64, seq_len as i64];
-            let input_ids = Tensor::from_array((shape.clone(), input_ids))?;
-            let attention_mask = Tensor::from_array((shape.clone(), attention_mask))?;
-            let token_type_ids = Tensor::from_array((shape, token_type_ids))?;
+            let (input_ids, attention_mask, token_type_ids, _) =
+                build_bert_input_tensors(&encodings, seq_len)?;
             let tokenize_ms = tok_start.elapsed().as_millis();
 
             let mut session = self

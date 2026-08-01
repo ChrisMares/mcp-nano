@@ -64,7 +64,6 @@ pub async fn upload_repo_zip(
                 "embedding_options": opts,
             })
         },
-        true,
     )
     .await
 }
@@ -94,7 +93,6 @@ pub async fn upload_documents(
                 "metadata": options.metadata.clone(),
             })
         },
-        true,
     )
     .await
 }
@@ -124,7 +122,6 @@ pub async fn upload_code_files(
                 "metadata": options.metadata.clone(),
             })
         },
-        true,
     )
     .await
 }
@@ -155,71 +152,6 @@ pub async fn get_job_status(app: AppHandle, job_id: String) -> Result<JobStatus,
         .map_err(|e| format!("querying job_status: {e}"))
 }
 
-#[tauri::command]
-pub async fn get_all_jobs(app: AppHandle) -> Result<Vec<JobStatus>, String> {
-    let pool = pool_from_state(&app)?;
-    sqlx::query_as::<_, JobStatus>("SELECT * FROM job_status ORDER BY created_at DESC")
-        .fetch_all(&pool)
-        .await
-        .map_err(|e| format!("querying all jobs: {e}"))
-}
-
-#[tauri::command]
-pub async fn retry_job(app: AppHandle, job_id: String) -> Result<(), String> {
-    let pool = pool_from_state(&app)?;
-    let now = now_iso();
-    let result = sqlx::query(
-        "UPDATE job_status SET status = 'PENDING', updated_at = ?, error_message = NULL, result = NULL WHERE job_id = ? AND (status = 'FAILED' OR status = 'PENDING')",
-    )
-    .bind(&now)
-    .bind(&job_id)
-    .execute(&pool)
-    .await
-    .map_err(|e| format!("retrying job: {e}"))?;
-    if result.rows_affected() == 0 {
-        return Err("Job not found or not in a retryable state".to_string());
-    }
-    Ok(())
-}
-
-#[tauri::command]
-pub async fn delete_pending_jobs(app: AppHandle) -> Result<(), String> {
-    let pool = pool_from_state(&app)?;
-    sqlx::query("DELETE FROM job_status WHERE status = 'PENDING'")
-        .execute(&pool)
-        .await
-        .map_err(|e| format!("deleting pending jobs: {e}"))?;
-    Ok(())
-}
-
-#[tauri::command]
-pub async fn delete_all_jobs(app: AppHandle) -> Result<(), String> {
-    let pool = pool_from_state(&app)?;
-    sqlx::query("DELETE FROM job_status")
-        .execute(&pool)
-        .await
-        .map_err(|e| format!("deleting all jobs: {e}"))?;
-    Ok(())
-}
-
-#[tauri::command]
-pub async fn get_worker_status(app: AppHandle) -> Result<String, String> {
-    let pool = pool_from_state(&app)?;
-    let pending: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM job_status WHERE status = 'PENDING'")
-            .fetch_one(&pool)
-            .await
-            .map_err(|e| format!("count pending: {e}"))?;
-    let running: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM job_status WHERE status = 'RUNNING'")
-            .fetch_one(&pool)
-            .await
-            .map_err(|e| format!("count running: {e}"))?;
-    Ok(format!(
-        "{{ \"pending\": {pending}, \"running\": {running} }}"
-    ))
-}
-
 /// Resolve the SqlitePool from managed state. Returns a useful error
 /// message if the app hasn't finished `db::init` yet (the worker also
 /// waits on this; the UI shouldn't normally call uploads before
@@ -248,8 +180,8 @@ fn uploads_dir(app: &AppHandle) -> Result<PathBuf, String> {
 /// 2. Copy each path into `uploads/<uuid>_<orig_name>`.
 /// 3. Insert a PENDING `job_status` row with `task_name` and a
 ///    `task_params` JSON derived from the per-task closure.
-/// 4. Optionally insert a `file_metadata` row (status `pending`) so Data
-///    Management can track the upload; the worker marks it `completed`.
+/// 4. Insert a `file_metadata` row (status `pending`) so Data Management
+///    can track the upload; the worker marks it `completed`.
 ///
 /// `task_params_for(orig_name, dest_path, job_id, options)` is per-task.
 async fn enqueue_upload_jobs(
@@ -258,7 +190,6 @@ async fn enqueue_upload_jobs(
     embedding_options: &EmbeddingOptions,
     task_name: &str,
     task_params_for: impl Fn(&str, &Path, &str, &EmbeddingOptions) -> serde_json::Value,
-    register_file_metadata: bool,
 ) -> Result<UploadResponse, String> {
     let pool = pool_from_state(app)?;
     let now = now_iso();
@@ -307,53 +238,49 @@ async fn enqueue_upload_jobs(
             continue;
         }
 
-        if register_file_metadata {
-            let repo_name = task_params
-                .pointer("/embedding_options/repo_name")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .or_else(|| {
-                    task_params
-                        .get("repo_name")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string())
-                })
-                .or_else(|| {
-                    if task_name == "process_zip" {
-                        Some(
-                            crate::services::ingestion_service::repo_name_from_zip_filename(
-                                &orig_name,
-                            ),
-                        )
-                    } else {
-                        embedding_options.repo_name.clone()
-                    }
-                });
-            let group_id = embedding_options.group.clone();
-            let size_bytes = std::fs::metadata(&source).ok().map(|m| m.len() as i64);
-            let file_type = source
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("bin")
-                .to_string();
-            if let Err(e) = sqlx::query(
-                "INSERT INTO file_metadata \
-                 (storage_object_id, full_path, file_type, size_bytes, repo_name, group_id, status, created_at, collection) \
-                 VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
-            )
-            .bind(&job_id_str)
-            .bind(&orig_name)
-            .bind(&file_type)
-            .bind(size_bytes)
-            .bind(repo_name)
-            .bind(group_id)
-            .bind(&now)
-            .bind(&collection)
-            .execute(&pool)
-            .await
-            {
-                errors.push(format!("insert file_metadata: {e}"));
-            }
+        let repo_name = task_params
+            .pointer("/embedding_options/repo_name")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| {
+                task_params
+                    .get("repo_name")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            })
+            .or_else(|| {
+                if task_name == "process_zip" {
+                    Some(
+                        crate::services::ingestion_service::repo_name_from_zip_filename(&orig_name),
+                    )
+                } else {
+                    embedding_options.repo_name.clone()
+                }
+            });
+        let group_id = embedding_options.group.clone();
+        let size_bytes = std::fs::metadata(&source).ok().map(|m| m.len() as i64);
+        let file_type = source
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("bin")
+            .to_string();
+        if let Err(e) = sqlx::query(
+            "INSERT INTO file_metadata \
+             (storage_object_id, full_path, file_type, size_bytes, repo_name, group_id, status, created_at, collection) \
+             VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+        )
+        .bind(&job_id_str)
+        .bind(&orig_name)
+        .bind(&file_type)
+        .bind(size_bytes)
+        .bind(repo_name)
+        .bind(group_id)
+        .bind(&now)
+        .bind(&collection)
+        .execute(&pool)
+        .await
+        {
+            errors.push(format!("insert file_metadata: {e}"));
         }
 
         emit_job_event(

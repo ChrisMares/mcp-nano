@@ -1,5 +1,5 @@
 import React from "react";
-import StepIndicator from "./StepIndicator";
+import StepIndicator from "@/components/shared/StepIndicator";
 import DataSelectStep from "./DataSelectStep";
 import ToolDetailsStep from "./ToolDetailsStep";
 import { useToolForm } from "@/hooks/useToolForm";

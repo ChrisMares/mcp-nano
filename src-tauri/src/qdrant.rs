@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    io::Read,
     net::TcpListener,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -598,13 +598,4 @@ pub async fn ensure_collections(client: &Qdrant) -> Result<(), String> {
     }
 
     Ok(())
-}
-
-/// Touch schema stamp without wiping (tests / no-op path).
-#[allow(dead_code)]
-pub fn write_schema_stamp(app: &AppHandle) -> Result<(), String> {
-    let path = schema_stamp_path(app)?;
-    let mut f = File::create(&path).map_err(|e| e.to_string())?;
-    f.write_all(DATA_SCHEMA_VERSION.as_bytes())
-        .map_err(|e| e.to_string())
 }

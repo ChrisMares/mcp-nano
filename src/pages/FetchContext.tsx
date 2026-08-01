@@ -7,6 +7,7 @@ import {
   btnPrimary,
   fieldLabel,
   sliderBounds,
+  alertError,
 } from "@/styles/classes";
 import PageHead from "@/components/shared/PageHead";
 import { useTheme } from "@/contexts/ThemeContext";
@@ -14,13 +15,7 @@ import type { RagQueryPayload, RagResponse } from "@/types/rag";
 import RagResultsPanel from "@/components/fetchcontext/RagResultsPanel";
 import FilterSelect from "@/components/fetchcontext/FilterSelect";
 
-const SLIDER_CONFIG = [
-  { key: "limit", label: "Results Limit", min: 5, max: 100, step: 5 },
-] as const;
-
 const FetchContext: React.FC = () => {
-  console.log("Rendering FetchContext component");
-
   const { theme } = useTheme();
   const [collection, setCollection] = useState<"codebase" | "general">(
     "codebase",
@@ -36,11 +31,6 @@ const FetchContext: React.FC = () => {
     rag_response?: RagResponse;
     error?: string;
   } | null>(null);
-
-  const sliderValues: Record<string, number> = { limit };
-  const sliderSetters: Record<string, (v: number) => void> = {
-    limit: setLimit,
-  };
 
   useEffect(() => {
     setSelectedFilters(new Set());
@@ -108,7 +98,6 @@ const FetchContext: React.FC = () => {
       <PageHead
         title="Fetch Context – Semantic Search"
         description="Search embedded documents and code and return matching context chunks."
-        path="/query/fetch"
       />
       <h1 className="text-2xl font-bold text-foreground mb-4">Fetch Context</h1>
       <p className="text-muted-foreground mb-6">
@@ -163,29 +152,26 @@ const FetchContext: React.FC = () => {
           />
         </div>
 
-        {/* Sliders */}
+        {/* Results limit */}
         <div className="grid grid-cols-2 gap-6">
-          {SLIDER_CONFIG.map(({ key, label, min, max, step }) => (
-            <div key={key}>
-              <label className={fieldLabel}>
-                {label}:{" "}
-                <span className="text-primary">{sliderValues[key]}</span>
-              </label>
-              <input
-                type="range"
-                min={min}
-                max={max}
-                step={step}
-                value={sliderValues[key]}
-                onChange={(e) => sliderSetters[key](Number(e.target.value))}
-                className="w-full accent-primary"
-              />
-              <div className={sliderBounds}>
-                <span>{min}</span>
-                <span>{max}</span>
-              </div>
+          <div>
+            <label className={fieldLabel}>
+              Results Limit: <span className="text-primary">{limit}</span>
+            </label>
+            <input
+              type="range"
+              min={5}
+              max={100}
+              step={5}
+              value={limit}
+              onChange={(e) => setLimit(Number(e.target.value))}
+              className="w-full accent-primary"
+            />
+            <div className={sliderBounds}>
+              <span>5</span>
+              <span>100</span>
             </div>
-          ))}
+          </div>
         </div>
 
         <button
@@ -202,6 +188,12 @@ const FetchContext: React.FC = () => {
             "Fetch Context"
           )}
         </button>
+
+        {result?.error && (
+          <div className={alertError} role="alert">
+            {result.error}
+          </div>
+        )}
 
         <RagResultsPanel data={result?.rag_response} theme={theme} />
       </div>

@@ -32,11 +32,11 @@ after installation.
 | `src-tauri/src/db/` | SQLite pool setup and access; migrations in `src-tauri/migrations/`. |
 | `src-tauri/src/worker/` | Background job worker: poll loop, `TaskRegistry`, async `ProgressCallback`. |
 | `src-tauri/src/qdrant.rs` | Qdrant sidecar lifecycle, client connect/retry, and startup collection/index init. |
-| `src-tauri/tests/` | Integration tests (separate crates). `embedder_models.rs` (6 tests, needs downloaded model files), `qdrant_e2e.rs` (2 `#[ignore]` tests, needs bundled Qdrant binary + models), `common/mod.rs` re-exports `controllers::debug`. |
+| `src-tauri/tests/` | Integration tests (separate crates; see Testing table for counts and skip-safe external deps). `common/mod.rs` re-exports `controllers::debug`. |
 
 ## Current Status
 
-- The frontend and its 27-command IPC surface are ported.
+- The frontend and its 27-command IPC surface are ported and fully wired.
 - Qdrant startup is wired: `setup()` spawns the sidecar, then a background task
   connects with retry, ensures the `codebase`/`general` collections (dense 384
   Cosine + sparse BM25 vectors) and payload indexes exist, and registers
@@ -48,14 +48,17 @@ after installation.
   `mcp_servers`, `tool_definitions`, `tool_code_search`,
   `tool_document_search`) with all `user_id` columns and indexes dropped for
   single-user local mode.
-- Rust controllers currently return placeholder responses. Models and required
-  Cargo dependencies are scaffolded, but core backend behavior is not yet
-  implemented.
-- Implement the rewrite in the phases documented in `rust_rewrite.md`; avoid
-  building later layers before their dependencies are in place.
-- Known frontend gaps are documented in the rewrite plan: browser-only dev has
-  no `invoke()` mock, tests still mock the removed HTTP API module, and upload
-  controls still pass file names rather than native paths.
+- All ingestion paths (zip, documents, code files, website crawl/embed), the
+  RAG query pipeline (dense + BM25 hybrid, rerank), MCP tool config + dynamic
+  streamable-HTTP endpoint, and the background worker are implemented.
+- The command surface is exactly the documented 27-command contract in
+  `rust_rewrite.md`; commands the plan excluded (`get_collections`,
+  `get_metadata_keys`, `get_embedders_status`, `get_all_jobs`, `retry_job`,
+  `delete_pending_jobs`, `delete_all_jobs`, `get_worker_status`,
+  `update_mcp_server`, `toggle_mcp_server`) are intentionally not registered.
+- Known frontend gap: browser-only dev has no `invoke()` mock (`npm run dev`
+  outside Tauri fails on Tauri API calls); the vitest suite mocks
+  `@tauri-apps/api/event`/`core` and `@/icons` instead.
 
 ## Architecture Rules
 
@@ -121,9 +124,16 @@ only the library's public API.
 
 | Location | Type | Count | External deps |
 | --- | --- | --- | --- |
-| `src-tauri/src/**/mod tests` | Unit (inline) | 46 | None (temp SQLite in-process) |
+| `src-tauri/src/**/mod tests` | Unit (inline) | 121 | None (temp SQLite in-process) |
+| `src-tauri/tests/code_chunker.rs` | Integration (tree-sitter chunkers) | 20 | None |
+| `src-tauri/tests/data_management.rs` | Integration (SQLite metadata) | 8 | None |
+| `src-tauri/tests/document_loaders.rs` | Integration (loaders) | 7 | None |
 | `src-tauri/tests/embedder_models.rs` | Integration | 6 | `resources/models/` files on disk (skip-safe) |
+| `src-tauri/tests/mcp_config.rs` | Integration (MCP CRUD) | 8 | None |
+| `src-tauri/tests/mcp_endpoint.rs` | Integration (HTTP MCP) | 2 | None |
 | `src-tauri/tests/qdrant_e2e.rs` | Integration (E2E) | 2 `#[ignore]` | Bundled Qdrant binary + downloaded models |
+| `src-tauri/tests/rag_response.rs` | Integration (formatting) | 2 | None |
+| `src-tauri/tests/website.rs` | Integration (crawler) | 10 | Live network for one E2E test |
 | `src-tauri/tests/common/mod.rs` | Shared helpers | — | Re-exports `controllers::debug` |
 
 ### Shared scenario helpers

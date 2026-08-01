@@ -1,6 +1,4 @@
-import { useEffect, useState } from "react";
-import { listen } from "@tauri-apps/api/event";
-import { getBackendStatus, type BackendStatus } from "@/utils/apicalls";
+import { useBackendStatus } from "@/hooks/use-backend-status";
 
 function isGpu(device: string | null | undefined): boolean {
   if (!device) return false;
@@ -21,35 +19,9 @@ function shortLabel(device: string | null | undefined): string {
 }
 
 const EmbeddingDeviceBadge: React.FC = () => {
-  const [device, setDevice] = useState<string | null>(null);
-  const [ready, setReady] = useState(false);
-
-  useEffect(() => {
-    let unlisten: (() => void) | undefined;
-    let cancelled = false;
-
-    const apply = (s: BackendStatus) => {
-      if (cancelled) return;
-      setDevice(s.embedding_device);
-      setReady(s.embedders_ready);
-    };
-
-    getBackendStatus().then(apply).catch(() => {
-      if (!cancelled) {
-        setDevice(null);
-        setReady(false);
-      }
-    });
-
-    listen<BackendStatus>("backend_status", (e) => apply(e.payload)).then((fn) => {
-      unlisten = fn;
-    });
-
-    return () => {
-      cancelled = true;
-      unlisten?.();
-    };
-  }, []);
+  const status = useBackendStatus();
+  const device = status?.embedding_device ?? null;
+  const ready = status?.embedders_ready ?? false;
 
   const label = ready ? shortLabel(device) : "…";
   const title = ready

@@ -5,11 +5,9 @@ import { statusDot } from "@/styles/classes";
 
 interface Props {
   embedJob: EmbedJob;
-  key: string | number;
 }
 
-// Shared select-or-create-new picker used for repo names and group names
-const JobStatusRow: React.FC<Props> = ({ embedJob, key }) => {
+const JobStatusRow: React.FC<Props> = ({ embedJob }) => {
   const [percentComplete, setPercentComplete] = useState<number>(
     embedJob.progress_percentage || 0,
   );
@@ -17,21 +15,23 @@ const JobStatusRow: React.FC<Props> = ({ embedJob, key }) => {
   useEffect(() => {
     const incoming = embedJob.progress_percentage ?? 0;
 
-    //setter based on current value
+    // Progress bars only move forward; stale events can't rewind them.
     setPercentComplete((prev) => (incoming > prev ? incoming : prev));
   }, [embedJob.progress_percentage]);
 
+  const displayName = embedJob.file_name?.trim() || "Untitled";
+
   return (
-    <div key={key} className="space-y-1">
+    <div className="space-y-1">
       <div className="flex items-center gap-3">
         <span
           className={`${statusDot} ${embedJob.status === "RUNNING" ? "bg-info" : "bg-warning"}`}
         />
         <span
           className="text-sm text-foreground truncate"
-          title={embedJob.file_name?.trim()}
+          title={displayName}
         >
-          {embedJob.file_name?.trim()}
+          {displayName}
         </span>
         <span className="text-xs text-muted-foreground uppercase">
           {embedJob.status}

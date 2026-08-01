@@ -22,7 +22,7 @@
 
 use std::path::Path;
 
-use serde_json::{Map, Value};
+use serde_json::Value;
 
 use super::types::DocumentChunk;
 
@@ -341,17 +341,7 @@ where
 {
     match std::panic::catch_unwind(f) {
         Ok(v) => Ok(v),
-        Err(payload) => Err(panic_payload_msg(&payload)),
-    }
-}
-
-fn panic_payload_msg(payload: &Box<dyn std::any::Any + Send>) -> String {
-    if let Some(s) = payload.downcast_ref::<&str>() {
-        (*s).to_string()
-    } else if let Some(s) = payload.downcast_ref::<String>() {
-        s.clone()
-    } else {
-        "unknown panic".to_string()
+        Err(payload) => Err(crate::panic_payload_to_string(&*payload)),
     }
 }
 
@@ -360,17 +350,6 @@ fn load_docx(path: &Path, file_name: &str) -> anyhow::Result<Vec<DocumentChunk>>
         .map_err(|e| anyhow::anyhow!("extracting docx: {e}"))?;
     Ok(one_chunk(file_name, "docx", text))
 }
-
-/// Convert a list of language-aware code chunks to `DocumentChunk`s using
-/// the loaded text-splitter for further token-based sizing. Wraps
-/// `code_chunker::code_chunks_to_document_chunks` so callers don't need to
-/// import that submodule.
-pub fn from_code_chunks(code_chunks: Vec<super::types::CodeChunk>) -> Vec<DocumentChunk> {
-    super::code_chunker::code_chunks_to_document_chunks(code_chunks)
-}
-
-#[allow(dead_code)]
-fn _unused_metadata(_m: &Map<String, Value>) {}
 
 #[cfg(test)]
 mod tests {
@@ -427,23 +406,5 @@ mod tests {
         std::fs::write(&path, b"%PDF-1.4 not a real pdf").unwrap();
         let result = load_document(&path);
         assert!(result.is_err(), "expected error, got {result:?}");
-    }
-
-    #[test]
-    fn load_bedrock_pdf_via_pdftotext_when_available() {
-        let path = Path::new("/home/chris/Downloads/aws/bedrock-0001-1000.pdf");
-        if !path.exists() {
-            return;
-        }
-        if std::process::Command::new("pdftotext")
-            .arg("-v")
-            .output()
-            .is_err()
-        {
-            return;
-        }
-        let chunks = load_document(path).expect("bedrock pdf should load");
-        assert!(!chunks.is_empty());
-        assert!(chunks[0].content.contains("Amazon Bedrock"));
     }
 }

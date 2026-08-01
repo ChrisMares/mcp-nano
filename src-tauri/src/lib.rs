@@ -57,6 +57,17 @@ fn chrono_lite_now() -> String {
     format!("{secs}")
 }
 
+/// Extract a human-readable message from a `catch_unwind` panic payload.
+pub fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
+    }
+}
+
 fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -64,13 +75,7 @@ fn install_panic_hook() {
             .location()
             .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
             .unwrap_or_else(|| "unknown".into());
-        let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
-            (*s).to_string()
-        } else if let Some(s) = info.payload().downcast_ref::<String>() {
-            s.clone()
-        } else {
-            "unknown panic payload".into()
-        };
+        let payload = panic_payload_to_string(info.payload());
         let thread = std::thread::current();
         let thread_name = thread.name().unwrap_or("<unnamed>");
         let breadcrumb = LOG_DIR
@@ -393,20 +398,12 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             rag::rag_query,
             rag::get_metadata_values,
-            rag::get_collections,
-            rag::get_metadata_keys,
-            rag::get_embedders_status,
             rag::get_backend_status,
             jobs::upload_repo_zip,
             jobs::upload_documents,
             jobs::upload_code_files,
             jobs::get_active_jobs,
             jobs::get_job_status,
-            jobs::get_all_jobs,
-            jobs::retry_job,
-            jobs::delete_pending_jobs,
-            jobs::delete_all_jobs,
-            jobs::get_worker_status,
             data::get_files,
             data::delete_repo,
             data::delete_document,
@@ -419,8 +416,6 @@ pub fn run() {
             mcpconfig::get_mcp_servers,
             mcpconfig::create_mcp_server,
             mcpconfig::get_mcp_server,
-            mcpconfig::update_mcp_server,
-            mcpconfig::toggle_mcp_server,
             mcpconfig::delete_mcp_server,
             mcpconfig::create_mcp_tool,
             mcpconfig::update_mcp_tool,

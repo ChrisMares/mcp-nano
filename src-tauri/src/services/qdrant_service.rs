@@ -51,10 +51,6 @@ impl QdrantService {
         Self { client }
     }
 
-    pub fn from_state(state: &crate::qdrant::QdrantState) -> Self {
-        Self::new(state.client.clone())
-    }
-
     /// List all collection names.
     pub async fn list_collections(&self) -> Result<Vec<String>> {
         let resp = self
@@ -148,13 +144,7 @@ impl QdrantService {
                 bm25.embed_sparse(&doc_refs)
             }))
             .map_err(|payload| {
-                let msg = if let Some(s) = payload.downcast_ref::<&str>() {
-                    (*s).to_string()
-                } else if let Some(s) = payload.downcast_ref::<String>() {
-                    s.clone()
-                } else {
-                    "unknown".into()
-                };
+                let msg = crate::panic_payload_to_string(&*payload);
                 anyhow!("BM25 sparse embed panicked during upsert: {msg}")
             })?
             .context("BM25 sparse embed during upsert")?;
@@ -383,54 +373,6 @@ impl QdrantService {
             return Ok(());
         }
         Err(anyhow!("delete_items: must provide ids or filter"))
-    }
-
-    /// Delete all points matching `filter`, then upsert the new ones. Returns
-    /// the count of deleted points.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn replace_items(
-        &self,
-        collection: &str,
-        where_filter: Filter,
-        ids: &[Uuid],
-        documents: &[String],
-        dense_embeddings: &[Vec<f32>],
-        metadatas: &[serde_json::Value],
-        bm25: &Bm25Embedder,
-        batch_size: usize,
-    ) -> Result<i64> {
-        use qdrant_client::qdrant::CountPointsBuilder;
-        let count_resp = self
-            .client
-            .count(
-                CountPointsBuilder::new(collection)
-                    .filter(where_filter.clone())
-                    .exact(true),
-            )
-            .await
-            .context("count before replace")?;
-        let deleted = count_resp.result.map(|r| r.count as i64).unwrap_or(0);
-        if deleted > 0 {
-            self.client
-                .delete_points(
-                    DeletePointsBuilder::new(collection)
-                        .points(where_filter)
-                        .wait(true),
-                )
-                .await
-                .context("delete before replace")?;
-        }
-        self.upsert_items(
-            collection,
-            ids,
-            documents,
-            dense_embeddings,
-            metadatas,
-            bm25,
-            batch_size,
-        )
-        .await?;
-        Ok(deleted)
     }
 
     /// Create a payload index. `field_type` accepts the same string literals
@@ -662,26 +604,6 @@ impl QdrantService {
     }
 }
 
-/// Helper: build a `Filter` from a single equality map. Used by tests + the
-/// ingestion service where the filter is constructed in Rust rather than from
-/// JSON.
-pub fn filter_eq(pairs: &[(&str, &str)]) -> Filter {
-    let conds: Vec<Condition> = pairs
-        .iter()
-        .map(|(k, v)| Condition::matches((*k).to_string(), (*v).to_string()))
-        .collect();
-    Filter::must(conds)
-}
-
-/// Recursive `Filter` construction from a JSON `where` value, for the
-/// `query_items`/`delete_items` callers that accept `Option<serde_json::Value>`.
-pub fn optional_filter(where_clause: Option<&serde_json::Value>) -> Result<Option<Filter>> {
-    match where_clause {
-        Some(v) if !v.is_null() => Ok(Some(QdrantService::build_filter(v)?)),
-        _ => Ok(None),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -746,17 +668,5 @@ mod tests {
     fn build_filter_rejects_unsupported_value_type() {
         let err = QdrantService::build_filter(&json!({"key": [1, 2]}));
         assert!(err.is_err());
-    }
-
-    #[test]
-    fn optional_filter_none_for_null_or_absent() {
-        assert!(optional_filter(None).unwrap().is_none());
-        assert!(optional_filter(Some(&json!(null))).unwrap().is_none());
-    }
-
-    #[test]
-    fn filter_eq_helper_builds_must() {
-        let f = filter_eq(&[("repo_name", "r1"), ("user_id", "u1")]);
-        assert_eq!(f.must.len(), 2);
     }
 }

@@ -31,26 +31,13 @@ fn validate_server_name(name: &str) -> Result<String, String> {
     Ok(name)
 }
 
-async fn ensure_unique_server_name(
-    pool: &SqlitePool,
-    name: &str,
-    exclude_id: Option<&str>,
-) -> Result<(), String> {
-    let existing = if let Some(id) = exclude_id {
-        sqlx::query_scalar::<_, String>(
-            "SELECT id FROM mcp_servers WHERE name = ? AND id != ? LIMIT 1",
-        )
-        .bind(name)
-        .bind(id)
-        .fetch_optional(pool)
-        .await
-    } else {
+async fn ensure_unique_server_name(pool: &SqlitePool, name: &str) -> Result<(), String> {
+    let existing =
         sqlx::query_scalar::<_, String>("SELECT id FROM mcp_servers WHERE name = ? LIMIT 1")
             .bind(name)
             .fetch_optional(pool)
             .await
-    }
-    .map_err(|e| format!("checking server name uniqueness: {e}"))?;
+            .map_err(|e| format!("checking server name uniqueness: {e}"))?;
 
     if existing.is_some() {
         return Err(format!("Server name already exists: {name}"));
@@ -78,7 +65,7 @@ pub async fn create_server(
     description: Option<String>,
 ) -> Result<ServerResponse, String> {
     let name = validate_server_name(&name)?;
-    ensure_unique_server_name(pool, &name, None).await?;
+    ensure_unique_server_name(pool, &name).await?;
     let id = Uuid::new_v4().to_string();
     let now = now_iso();
     sqlx::query(
@@ -108,57 +95,6 @@ pub async fn create_server(
 
 pub async fn get_server(pool: &SqlitePool, server_id: &str) -> Result<ServerResponse, String> {
     let mut server = get_server_row(pool, server_id).await?;
-    server.tools = Some(load_tools_for_server(pool, server_id).await?);
-    Ok(ServerResponse { server })
-}
-
-pub async fn update_server(
-    pool: &SqlitePool,
-    server_id: &str,
-    name: String,
-    description: Option<String>,
-) -> Result<ServerResponse, String> {
-    let name = validate_server_name(&name)?;
-    let _ = get_server_row(pool, server_id).await?;
-    ensure_unique_server_name(pool, &name, Some(server_id)).await?;
-    let now = now_iso();
-    sqlx::query(
-        "UPDATE mcp_servers SET name = ?, description = ?, updated_at = ? WHERE id = ?",
-    )
-    .bind(&name)
-    .bind(&description)
-    .bind(&now)
-    .bind(server_id)
-    .execute(pool)
-    .await
-    .map_err(|e| format!("updating mcp server: {e}"))?;
-
-    let mut server = get_server_row(pool, server_id).await?;
-    server.name = name;
-    server.description = description;
-    server.updated_at = Some(now);
-    server.tools = Some(load_tools_for_server(pool, server_id).await?);
-    Ok(ServerResponse { server })
-}
-
-pub async fn toggle_server(
-    pool: &SqlitePool,
-    server_id: &str,
-    active: bool,
-) -> Result<ServerResponse, String> {
-    let _ = get_server_row(pool, server_id).await?;
-    let now = now_iso();
-    sqlx::query("UPDATE mcp_servers SET active = ?, updated_at = ? WHERE id = ?")
-        .bind(active)
-        .bind(&now)
-        .bind(server_id)
-        .execute(pool)
-        .await
-        .map_err(|e| format!("toggling mcp server: {e}"))?;
-
-    let mut server = get_server_row(pool, server_id).await?;
-    server.active = active;
-    server.updated_at = Some(now);
     server.tools = Some(load_tools_for_server(pool, server_id).await?);
     Ok(ServerResponse { server })
 }
@@ -378,50 +314,43 @@ pub async fn find_active_tool_by_name(
     Ok(tools.into_iter().find(|t| t.name == name))
 }
 
+/// Build one RAG request payload for a scope: equality filter for a single
+/// value, `$or` for several, empty filter for none.
+fn scope_request(
+    collection: &str,
+    default_collection: &str,
+    filter_key: &str,
+    values: &[String],
+) -> serde_json::Value {
+    let values: Vec<&str> = values
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let where_clause = match values.as_slice() {
+        [] => json!({}),
+        [one] => json!({ filter_key: one }),
+        many => json!({
+            "$or": many.iter().map(|v| json!({ filter_key: v })).collect::<Vec<_>>()
+        }),
+    };
+    json!({
+        "collection": if collection.is_empty() { default_collection } else { collection },
+        "where": where_clause,
+    })
+}
+
 /// Build per-collection RAG request payloads from a tool's scopes.
 /// Mirrors Python `_collection_requests` in `protocol.py`.
 pub fn collection_requests(tool: &ToolDefinition) -> Vec<serde_json::Value> {
-    let mut requests = Vec::new();
-
-    for scope in &tool.code_search_scopes {
-        let repo_names: Vec<&str> = scope
-            .repo_names
-            .iter()
-            .map(|s| s.as_str())
-            .filter(|s| !s.is_empty())
-            .collect();
-        let where_clause = match repo_names.as_slice() {
-            [] => json!({}),
-            [one] => json!({ "repo_name": one }),
-            many => json!({
-                "$or": many.iter().map(|n| json!({ "repo_name": n })).collect::<Vec<_>>()
-            }),
-        };
-        requests.push(json!({
-            "collection": if scope.collection.is_empty() { "codebase" } else { &scope.collection },
-            "where": where_clause,
-        }));
-    }
-
-    for scope in &tool.document_search_scopes {
-        let group_ids: Vec<&str> = scope
-            .group_ids
-            .iter()
-            .map(|s| s.as_str())
-            .filter(|s| !s.is_empty())
-            .collect();
-        let where_clause = match group_ids.as_slice() {
-            [] => json!({}),
-            [one] => json!({ "group": one }),
-            many => json!({
-                "$or": many.iter().map(|g| json!({ "group": g })).collect::<Vec<_>>()
-            }),
-        };
-        requests.push(json!({
-            "collection": if scope.collection.is_empty() { "general" } else { &scope.collection },
-            "where": where_clause,
-        }));
-    }
+    let mut requests: Vec<serde_json::Value> = tool
+        .code_search_scopes
+        .iter()
+        .map(|s| scope_request(&s.collection, "codebase", "repo_name", &s.repo_names))
+        .chain(tool.document_search_scopes.iter().map(|s| {
+            scope_request(&s.collection, "general", "group", &s.group_ids)
+        }))
+        .collect();
 
     if requests.is_empty() {
         requests.push(json!({ "collection": "codebase", "where": {} }));
@@ -626,5 +555,65 @@ mod tests {
             reqs[0]["where"],
             json!({ "$or": [{ "repo_name": "a" }, { "repo_name": "b" }] })
         );
+    }
+
+    #[test]
+    fn collection_requests_mixed_scopes_preserve_order() {
+        let tool = ToolDefinition {
+            code_search_scopes: vec![ToolCodeSearchScope {
+                id: "1".into(),
+                tool_definition_id: "t".into(),
+                collection: "codebase".into(),
+                repo_names: vec!["r".into()],
+            }],
+            document_search_scopes: vec![crate::models::entities::ToolDocumentSearchScope {
+                id: "2".into(),
+                tool_definition_id: "t".into(),
+                collection: "general".into(),
+                group_ids: vec!["g".into()],
+            }],
+            ..Default::default()
+        };
+        let reqs = collection_requests(&tool);
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[0]["collection"], "codebase");
+        assert_eq!(reqs[0]["where"], json!({ "repo_name": "r" }));
+        assert_eq!(reqs[1]["collection"], "general");
+        assert_eq!(reqs[1]["where"], json!({ "group": "g" }));
+    }
+
+    #[test]
+    fn collection_requests_skips_empty_scope_values() {
+        let tool = ToolDefinition {
+            code_search_scopes: vec![ToolCodeSearchScope {
+                id: "1".into(),
+                tool_definition_id: "t".into(),
+                collection: String::new(),
+                repo_names: vec![String::new()],
+            }],
+            ..Default::default()
+        };
+        let reqs = collection_requests(&tool);
+        // Empty collection falls back to codebase; empty values mean no filter.
+        assert_eq!(reqs[0]["collection"], "codebase");
+        assert_eq!(reqs[0]["where"], json!({}));
+    }
+
+    #[test]
+    fn validate_server_name_trims_and_accepts() {
+        assert_eq!(validate_server_name("  My_Server1 ").unwrap(), "My_Server1");
+    }
+
+    #[test]
+    fn validate_server_name_rejects_empty() {
+        assert!(validate_server_name("").is_err());
+        assert!(validate_server_name("   ").is_err());
+    }
+
+    #[test]
+    fn validate_server_name_rejects_invalid_chars() {
+        for bad in ["has space", "dash-name", "dot.name", "slash/name", "emoji🦀"] {
+            assert!(validate_server_name(bad).is_err(), "{bad} should fail");
+        }
     }
 }

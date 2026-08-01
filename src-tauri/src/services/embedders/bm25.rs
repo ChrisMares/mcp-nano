@@ -74,14 +74,6 @@ impl Bm25Embedder {
         }
     }
 
-    pub fn with_params(k1: f32, b: f32) -> Self {
-        Self {
-            k1,
-            b,
-            ..Self::new()
-        }
-    }
-
     pub fn with_avg_len(mut self, avg_len: f32) -> Self {
         self.avg_len = avg_len.max(1.0);
         self

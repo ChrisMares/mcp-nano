@@ -3,7 +3,6 @@
 //!
 //! Chunk size is 768 tokens with 64 overlap (Python `CODE_CHUNK_SIZE=768`).
 
-mod common;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};

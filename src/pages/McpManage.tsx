@@ -194,7 +194,6 @@ const McpManage: React.FC = () => {
       <PageHead
         title="Manage MCP Servers"
         description="Manage MCP servers and tools."
-        path="/mcp/manage"
       />
       <h1 className="text-2xl font-bold text-foreground mb-2">Manage MCP Servers</h1>
       <p className="text-muted-foreground mb-6">

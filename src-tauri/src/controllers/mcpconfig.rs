@@ -40,25 +40,6 @@ pub async fn get_mcp_server(app: AppHandle, server_id: String) -> Result<ServerR
 }
 
 #[tauri::command]
-pub async fn update_mcp_server(
-    app: AppHandle,
-    server_id: String,
-    name: String,
-    description: Option<String>,
-) -> Result<ServerResponse, String> {
-    mcp_config::update_server(&pool(&app)?, &server_id, name, description).await
-}
-
-#[tauri::command]
-pub async fn toggle_mcp_server(
-    app: AppHandle,
-    server_id: String,
-    active: bool,
-) -> Result<ServerResponse, String> {
-    mcp_config::toggle_server(&pool(&app)?, &server_id, active).await
-}
-
-#[tauri::command]
 pub async fn delete_mcp_server(
     app: AppHandle,
     server_id: String,

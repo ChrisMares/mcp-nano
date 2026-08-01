@@ -18,21 +18,6 @@ vi.mock('@/icons', () => ({
   PlugIn: () => 'PlugInIcon',
 }))
 
-// Mock API client
-vi.mock('@/utils/api', () => ({
-  default: {
-    get: vi.fn(),
-    post: vi.fn(),
-    put: vi.fn(),
-    patch: vi.fn(),
-    delete: vi.fn(),
-    interceptors: {
-      request: { use: vi.fn() },
-      response: { use: vi.fn() },
-    },
-  },
-}))
-
 vi.mock('@tauri-apps/api/event', () => ({
   listen: vi.fn().mockResolvedValue(() => {}),
 }))

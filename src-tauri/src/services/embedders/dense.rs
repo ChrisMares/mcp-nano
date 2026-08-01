@@ -132,35 +132,8 @@ impl DenseEmbedder {
             .max(1);
         let batch = encodings.len();
 
-        let mut input_ids = Vec::with_capacity(batch * seq_len);
-        let mut attention_mask = Vec::with_capacity(batch * seq_len);
-        let mut token_type_ids = Vec::with_capacity(batch * seq_len);
-        for enc in &encodings {
-            let ids = enc.get_ids();
-            let mask = enc.get_attention_mask();
-            let type_ids = enc.get_type_ids();
-            let n = ids.len().min(seq_len);
-            for i in 0..seq_len {
-                if i < n {
-                    input_ids.push(ids[i] as i64);
-                    attention_mask.push(if i < mask.len() { mask[i] as i64 } else { 1 });
-                    token_type_ids.push(if i < type_ids.len() {
-                        type_ids[i] as i64
-                    } else {
-                        0
-                    });
-                } else {
-                    input_ids.push(0);
-                    attention_mask.push(0);
-                    token_type_ids.push(0);
-                }
-            }
-        }
-
-        let shape = vec![batch as i64, seq_len as i64];
-        let input_ids = Tensor::from_array((shape.clone(), input_ids))?;
-        let attention_mask_t = Tensor::from_array((shape.clone(), attention_mask.clone()))?;
-        let token_type_ids = Tensor::from_array((shape, token_type_ids))?;
+        let (input_ids, attention_mask_t, token_type_ids, attention_mask) =
+            build_bert_input_tensors(&encodings, seq_len)?;
 
         let mut session = self
             .session
@@ -240,6 +213,48 @@ impl EncodeDocuments for DenseEmbedder {
         let owned: Vec<String> = documents.iter().map(|s| s.to_string()).collect();
         self.encode(&owned, batch_size)
     }
+}
+
+/// Zero-pad a batch of encodings to `seq_len` and build the three BERT
+/// input tensors. Also returns the unpadded attention mask values so
+/// callers can do mask-aware pooling over the model outputs.
+pub(crate) type BertInputTensors = (Tensor<i64>, Tensor<i64>, Tensor<i64>, Vec<i64>);
+
+pub(crate) fn build_bert_input_tensors(
+    encodings: &[tokenizers::Encoding],
+    seq_len: usize,
+) -> Result<BertInputTensors> {
+    let batch = encodings.len();
+    let mut input_ids = Vec::with_capacity(batch * seq_len);
+    let mut attention_mask = Vec::with_capacity(batch * seq_len);
+    let mut token_type_ids = Vec::with_capacity(batch * seq_len);
+    for enc in encodings {
+        let ids = enc.get_ids();
+        let mask = enc.get_attention_mask();
+        let type_ids = enc.get_type_ids();
+        let n = ids.len().min(seq_len);
+        for i in 0..seq_len {
+            if i < n {
+                input_ids.push(ids[i] as i64);
+                attention_mask.push(if i < mask.len() { mask[i] as i64 } else { 1 });
+                token_type_ids.push(if i < type_ids.len() {
+                    type_ids[i] as i64
+                } else {
+                    0
+                });
+            } else {
+                input_ids.push(0);
+                attention_mask.push(0);
+                token_type_ids.push(0);
+            }
+        }
+    }
+
+    let shape = vec![batch as i64, seq_len as i64];
+    let input_ids = Tensor::from_array((shape.clone(), input_ids))?;
+    let attention_mask_t = Tensor::from_array((shape.clone(), attention_mask.clone()))?;
+    let token_type_ids = Tensor::from_array((shape, token_type_ids))?;
+    Ok((input_ids, attention_mask_t, token_type_ids, attention_mask))
 }
 
 pub(crate) fn build_session(model_path: &Path, device: InferenceDevice) -> Result<Session> {

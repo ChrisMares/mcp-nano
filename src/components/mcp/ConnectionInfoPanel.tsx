@@ -2,6 +2,7 @@ import React, { useState } from "react";
 import { Copy, Check } from "lucide-react";
 import type { ConnectionInfo } from "@/types/mcp";
 import { fieldLabel, btnCopy, codeBlock } from "@/styles/classes";
+import { copyTextToClipboard } from "@/lib/clipboard";
 
 interface ConnectionInfoPanelProps {
   info: ConnectionInfo;
@@ -24,22 +25,17 @@ const CopyButton: React.FC<CopyButtonProps> = ({ field, text, copiedField, onCop
 const ConnectionInfoPanel: React.FC<ConnectionInfoPanelProps> = ({ info }) => {
   const [copiedField, setCopiedField] = useState<string | null>(null);
 
-  const copyToClipboard = async (text: string, field: string) => {
-    try {
-      await navigator.clipboard.writeText(text);
-    } catch {
-      const ta = document.createElement("textarea");
-      ta.value = text;
-      ta.style.position = "fixed";
-      ta.style.left = "-9999px";
-      document.body.appendChild(ta);
-      ta.select();
-      document.execCommand("copy");
-      document.body.removeChild(ta);
-    }
+  const handleCopy = async (text: string, field: string) => {
+    await copyTextToClipboard(text);
     setCopiedField(field);
     setTimeout(() => setCopiedField(null), 2000);
   };
+
+  const snippetSections = [
+    { field: "claude_desktop", label: "Claude Desktop Config", snippet: info.config_snippets.claude_desktop },
+    { field: "opencode", label: "OpenCode Config", snippet: info.config_snippets.opencode },
+    { field: "vscode", label: "VS Code Config", snippet: info.config_snippets.vscode },
+  ];
 
   return (
     <div className="space-y-4">
@@ -47,39 +43,22 @@ const ConnectionInfoPanel: React.FC<ConnectionInfoPanelProps> = ({ info }) => {
         <label className={fieldLabel}>Server URL</label>
         <div className="flex items-center gap-2">
           <code className={`flex-1 ${codeBlock}`}>{info.full_url}</code>
-          <CopyButton field="url" text={info.full_url} copiedField={copiedField} onCopy={copyToClipboard} />
+          <CopyButton field="url" text={info.full_url} copiedField={copiedField} onCopy={handleCopy} />
         </div>
       </div>
 
-      <div>
-        <div className="flex items-center justify-between mb-1">
-          <label className={fieldLabel}>Claude Desktop Config</label>
-          <CopyButton field="claude_desktop" text={JSON.stringify(info.config_snippets.claude_desktop, null, 2)} copiedField={copiedField} onCopy={copyToClipboard} />
-        </div>
-        <pre className={`${codeBlock} text-xs overflow-x-auto`}>
-          {JSON.stringify(info.config_snippets.claude_desktop, null, 2)}
-        </pre>
-      </div>
-
-      <div>
-        <div className="flex items-center justify-between mb-1">
-          <label className={fieldLabel}>OpenCode Config</label>
-          <CopyButton field="opencode" text={JSON.stringify(info.config_snippets.opencode, null, 2)} copiedField={copiedField} onCopy={copyToClipboard} />
-        </div>
-        <pre className={`${codeBlock} text-xs overflow-x-auto`}>
-          {JSON.stringify(info.config_snippets.opencode, null, 2)}
-        </pre>
-      </div>
-
-      <div>
-        <div className="flex items-center justify-between mb-1">
-          <label className={fieldLabel}>VS Code Config</label>
-          <CopyButton field="vscode" text={JSON.stringify(info.config_snippets.vscode, null, 2)} copiedField={copiedField} onCopy={copyToClipboard} />
-        </div>
-        <pre className={`${codeBlock} text-xs overflow-x-auto`}>
-          {JSON.stringify(info.config_snippets.vscode, null, 2)}
-        </pre>
-      </div>
+      {snippetSections.map(({ field, label, snippet }) => {
+        const text = JSON.stringify(snippet, null, 2);
+        return (
+          <div key={field}>
+            <div className="flex items-center justify-between mb-1">
+              <label className={fieldLabel}>{label}</label>
+              <CopyButton field={field} text={text} copiedField={copiedField} onCopy={handleCopy} />
+            </div>
+            <pre className={`${codeBlock} text-xs overflow-x-auto`}>{text}</pre>
+          </div>
+        );
+      })}
     </div>
   );
 };

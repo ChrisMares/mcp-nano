@@ -76,8 +76,3 @@ export interface UrlTreeNode {
   children: UrlTreeNode[];
   url: string | null;
 }
-
-export interface FileMetadataResponse {
-  repos: { repo_name: string }[];
-  documents: { filename: string }[];
-}

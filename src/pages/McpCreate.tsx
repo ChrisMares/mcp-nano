@@ -4,7 +4,7 @@ import { useScopeOptions } from "@/hooks/useScopeOptions";
 import { useToolForm } from "@/hooks/useToolForm";
 import { getMcpServers, createMcpServer, createMcpTool } from "@/utils/apicalls";
 import PageHead from "@/components/shared/PageHead";
-import StepIndicator from "@/components/mcp/StepIndicator";
+import StepIndicator from "@/components/shared/StepIndicator";
 import ServerSelectStep from "@/components/mcp/ServerSelectStep";
 import DataSelectStep from "@/components/mcp/DataSelectStep";
 import ToolDetailsStep from "@/components/mcp/ToolDetailsStep";
@@ -106,7 +106,6 @@ const McpCreate: React.FC = () => {
       <PageHead
         title="Create MCP Server"
         description="Create an MCP server and define tool scopes for your data."
-        path="/mcp/create"
       />
       <h1 className="text-2xl font-bold text-foreground mb-1">Create MCP Tool</h1>
       <p className="text-muted-foreground mb-6 text-sm">

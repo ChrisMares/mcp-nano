@@ -6,9 +6,6 @@
 //! `chunk_metadata` / `chunk_embedding_text` so the ingestion pipeline can
 //! serialize payloads and build embedding text uniformly.
 
-use std::collections::BTreeMap;
-
-use chrono::Utc;
 use serde_json::{Map, Value};
 
 /// `{name, type}` pair used by every language variant to describe function
@@ -673,34 +670,13 @@ fn python_embedding_parts(f: &PythonFields) -> Vec<String> {
         v.push(format!("Alias Target: {a}"));
     }
     if !f.parameters.is_empty() {
-        v.push(format!(
-            "Parameters: {}",
-            f.parameters
-                .iter()
-                .map(|p| p.r#type.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
+        v.push(format!("Parameters: {}", format_param_types(&f.parameters)));
     }
     if let Some(rt) = &f.return_type {
         v.push(format!("Return Type: {rt}"));
     }
     if !f.properties.is_empty() {
-        v.push(format!(
-            "Properties: {}",
-            f.properties
-                .iter()
-                .map(|p| {
-                    if p.r#type.is_empty() {
-                        p.name.clone()
-                    } else {
-                        format!("{}: {}", p.name, p.r#type)
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
+        v.push(format!("Properties: {}", format_props_python(&f.properties)));
     }
     if !f.decorators.is_empty() {
         v.push(format!("Decorators: {}", f.decorators.join(", ")));
@@ -815,10 +791,33 @@ impl DocumentChunk {
 
 // --- shared helpers ---------------------------------------------------------
 
-/// ISO 8601 UTC timestamp. Same format as `worker::progress::now_iso` so
+/// ISO 8601 UTC timestamp. Delegates to `worker::progress::now_iso` so
 /// chunk `created_at` columns align with `job_status.updated_at`.
 pub fn now_iso() -> String {
-    Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
+    crate::worker::progress::now_iso()
+}
+
+/// Force-split `text` into pieces of at most `max_chars` (char boundary
+/// safe). Used when the token splitter cannot break minified one-liners.
+pub fn hard_split_chars(text: &str, max_chars: usize) -> Vec<String> {
+    if max_chars == 0 || text.chars().count() <= max_chars {
+        return vec![text.to_string()];
+    }
+    let mut out = Vec::new();
+    let mut buf = String::with_capacity(max_chars);
+    let mut n = 0usize;
+    for ch in text.chars() {
+        if n >= max_chars {
+            out.push(std::mem::take(&mut buf));
+            n = 0;
+        }
+        buf.push(ch);
+        n += 1;
+    }
+    if !buf.is_empty() {
+        out.push(buf);
+    }
+    out
 }
 
 /// Normalize code: strip trailing whitespace per line and collapse 3+
@@ -833,19 +832,7 @@ pub fn normalize_code(code: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let mut out = String::with_capacity(normalized.len());
-    let mut blanks = 0usize;
-    for ch in normalized.chars() {
-        if ch == '\n' {
-            blanks += 1;
-            if blanks <= 2 {
-                out.push(ch);
-            }
-        } else {
-            blanks = 0;
-            out.push(ch);
-        }
-    }
+    let out = collapse_blank_lines(&normalized);
     if out.trim_matches('\n').is_empty() {
         return "\n".to_string();
     }
@@ -956,18 +943,6 @@ fn collapse_blank_lines(s: &str) -> String {
         }
     }
     out
-}
-
-/// Serialize a `Map<String, Value>` to a deterministic JSON object with
-/// sorted keys. Used in tests to compare metadata payloads structurally
-/// regardless of insertion order.
-#[allow(dead_code)]
-pub fn sorted_json(m: &Map<String, Value>) -> Value {
-    let mut tree: BTreeMap<String, Value> = BTreeMap::new();
-    for (k, v) in m {
-        tree.insert(k.clone(), v.clone());
-    }
-    serde_json::to_value(tree).unwrap_or(Value::Null)
 }
 
 #[cfg(test)]

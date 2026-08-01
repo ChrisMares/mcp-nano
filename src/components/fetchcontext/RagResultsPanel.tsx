@@ -3,6 +3,7 @@ import { Copy, Check, ChevronsDownUp, ChevronsUpDown } from "lucide-react";
 import { JsonView, collapseAllNested, allExpanded, darkStyles, defaultStyles } from "react-json-view-lite";
 import "react-json-view-lite/dist/index.css";
 import { btnCopy } from "@/styles/classes";
+import { copyTextToClipboard } from "@/lib/clipboard";
 import type { RagResponse } from "@/types/rag";
 
 interface Props {
@@ -17,19 +18,7 @@ const RagResultsPanel: React.FC<Props> = ({ data, theme }) => {
   const copyTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const handleCopy = async () => {
-    const text = JSON.stringify(data, null, 2);
-    try {
-      await navigator.clipboard.writeText(text);
-    } catch {
-      const ta = document.createElement("textarea");
-      ta.value = text;
-      ta.style.position = "fixed";
-      ta.style.left = "-9999px";
-      document.body.appendChild(ta);
-      ta.select();
-      document.execCommand("copy");
-      document.body.removeChild(ta);
-    }
+    await copyTextToClipboard(JSON.stringify(data, null, 2));
     setCopied(true);
     if (copyTimeout.current) clearTimeout(copyTimeout.current);
     copyTimeout.current = setTimeout(() => setCopied(false), 2000);

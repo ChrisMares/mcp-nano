@@ -2,6 +2,8 @@ import { useState, useCallback } from "react";
 import type { ToolFormData } from "@/types/mcp";
 import { emptyToolForm } from "@/types/mcp";
 
+type SelectionKey = "selectedRepos" | "selectedGroups" | "selectedWebsites";
+
 // Manages tool form state with scope toggle helpers
 export function useToolForm(initial?: ToolFormData) {
   const [form, setForm] = useState<ToolFormData>(initial ?? emptyToolForm());
@@ -10,41 +12,25 @@ export function useToolForm(initial?: ToolFormData) {
     setForm((prev) => ({ ...prev, ...updates }));
   }, []);
 
-  const toggleRepo = useCallback((repo: string) => {
+  const toggleItem = useCallback((key: SelectionKey, item: string) => {
     setForm((prev) => {
-      const next = new Set(prev.selectedRepos);
-      if (next.has(repo)) next.delete(repo); else next.add(repo);
-      return { ...prev, selectedRepos: next };
+      const next = new Set(prev[key]);
+      if (next.has(item)) next.delete(item); else next.add(item);
+      return { ...prev, [key]: next };
     });
   }, []);
 
-  const toggleGroup = useCallback((group: string) => {
-    setForm((prev) => {
-      const next = new Set(prev.selectedGroups);
-      if (next.has(group)) next.delete(group); else next.add(group);
-      return { ...prev, selectedGroups: next };
-    });
+  const setItems = useCallback((key: SelectionKey, items: Set<string>) => {
+    setForm((prev) => ({ ...prev, [key]: items }));
   }, []);
 
-  const setRepos = useCallback((repos: Set<string>) => {
-    setForm((prev) => ({ ...prev, selectedRepos: repos }));
-  }, []);
+  const toggleRepo = useCallback((repo: string) => toggleItem("selectedRepos", repo), [toggleItem]);
+  const toggleGroup = useCallback((group: string) => toggleItem("selectedGroups", group), [toggleItem]);
+  const toggleWebsite = useCallback((website: string) => toggleItem("selectedWebsites", website), [toggleItem]);
 
-  const setGroups = useCallback((groups: Set<string>) => {
-    setForm((prev) => ({ ...prev, selectedGroups: groups }));
-  }, []);
-
-  const toggleWebsite = useCallback((website: string) => {
-    setForm((prev) => {
-      const next = new Set(prev.selectedWebsites);
-      if (next.has(website)) next.delete(website); else next.add(website);
-      return { ...prev, selectedWebsites: next };
-    });
-  }, []);
-
-  const setWebsites = useCallback((websites: Set<string>) => {
-    setForm((prev) => ({ ...prev, selectedWebsites: websites }));
-  }, []);
+  const setRepos = useCallback((repos: Set<string>) => setItems("selectedRepos", repos), [setItems]);
+  const setGroups = useCallback((groups: Set<string>) => setItems("selectedGroups", groups), [setItems]);
+  const setWebsites = useCallback((websites: Set<string>) => setItems("selectedWebsites", websites), [setItems]);
 
   const resetForm = useCallback(() => {
     setForm(emptyToolForm());

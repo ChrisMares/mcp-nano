@@ -1,4 +1,4 @@
-//! Code-aware chunker dispatch and file walker. Direct port of
+//! Code-aware chunker dispatch. Direct port of
 //! `embedding/code_embedder/chunk_code_base.py`.
 //!
 //! Each language lives in its own submodule (`c.rs`, `cpp.rs`, ...) and
@@ -7,16 +7,14 @@
 //! The [`Language`] enum + `match` in [`extract_for`] maps a file extension
 //! to its chunker pair.
 //!
-//! The shared entry points are:
-//! - [`chunk_single_code_file`]: parse one file, dispatch by extension.
-//! - [`crawl_directories_chunk_code`]: walk a directory and chunk every
-//!   file in it.
+//! The shared entry point is [`chunk_single_code_file`]: parse one file,
+//! dispatch by extension.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use tree_sitter::{Language as TsLanguage, Node, Parser};
 
-use super::types::{CodeChunk, CodeChunkKind, DocumentChunk};
+use super::types::{CodeChunk, DocumentChunk};
 
 pub mod c;
 pub mod cpp;
@@ -254,99 +252,6 @@ fn chunk_generic_file(
         .collect()
 }
 
-/// Walk a directory and chunk every file in it. Mirrors
-/// `crawl_directories_chunk_code`. Ignore directory/file patterns are read
-/// from the same env vars the Python code reads (`CODE_DIR_IGNORES`,
-/// `CODE_FILE_IGNORES`).
-pub fn crawl_directories_chunk_code(
-    src_dir: &Path,
-    repo_name: Option<&str>,
-    splitter: &text_splitter::TextSplitter<tokenizers::Tokenizer>,
-    max_chunk_tokens: usize,
-) -> Vec<CodeChunk> {
-    let repo_chunk_name = repo_name
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| get_repo_from_path(src_dir));
-
-    let ignore_dirs = parse_ignore_env("CODE_DIR_IGNORES");
-    let ignore_files = parse_ignore_env("CODE_FILE_IGNORES");
-
-    let mut chunks: Vec<CodeChunk> = Vec::new();
-    for entry in walkdir::WalkDir::new(src_dir)
-        .into_iter()
-        .filter_entry(|e| filter_entry(e, &ignore_dirs))
-    {
-        let Ok(entry) = entry else { continue };
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let path = entry.path();
-        if ignore_files.is_match(
-            path.file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(""),
-        ) {
-            continue;
-        }
-        let chunks_for_file = chunk_single_code_file(path, &repo_chunk_name, None, splitter, max_chunk_tokens);
-        chunks.extend(chunks_for_file);
-    }
-    chunks
-}
-
-fn parse_ignore_env(var: &str) -> globset::GlobSet {
-    let mut builder = globset::GlobSetBuilder::new();
-    if let Ok(v) = std::env::var(var) {
-        for pat in v.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-            if let Ok(g) = globset::Glob::new(pat) {
-                builder.add(g);
-            }
-        }
-    }
-    builder.build().unwrap_or_default()
-}
-
-fn filter_entry(entry: &walkdir::DirEntry, ignore_dirs: &globset::GlobSet) -> bool {
-    if !entry.file_type().is_dir() {
-        return true;
-    }
-    let name = entry.file_name().to_string_lossy().to_lowercase();
-    !ignore_dirs.is_match(&name)
-}
-
-/// Derive a repo name from a path's parent directory. Mirrors
-/// `get_repo_from_path`.
-pub fn get_repo_from_path(path: &Path) -> String {
-    let normalized: String = path
-        .to_string_lossy()
-        .replace('\\', "/")
-        .trim_matches('/')
-        .to_string();
-    let parts: Vec<&str> = normalized
-        .split('/')
-        .filter(|p| !p.is_empty())
-        .collect();
-    let repo_containers = [
-        "git",
-        "github",
-        "repos",
-        "repositories",
-        "workspace",
-        "workspaces",
-        "projects",
-        "project",
-    ];
-    for (idx, part) in parts.iter().enumerate() {
-        if repo_containers.contains(&part.to_lowercase().as_str()) {
-            if idx + 1 < parts.len() {
-                return parts[idx + 1].to_string();
-            }
-        }
-    }
-    normalized
-}
-
 /// Detect a file's encoding from its BOM or first 4 bytes. Mirrors
 /// `_detect_encoding`.
 pub fn detect_encoding(bytes: &[u8]) -> &'static str {
@@ -452,9 +357,6 @@ pub fn chunk_file_to_documents(
     code_chunks_to_document_chunks(split)
 }
 
-#[allow(dead_code)]
-fn _suppress_unused(_node_len: &PathBuf, _kind: &CodeChunkKind) {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -465,20 +367,6 @@ mod tests {
         assert_eq!(detect_encoding(&[0xff, 0xfe, 0x00, 0x00]), "utf-16-le");
         assert_eq!(detect_encoding(&[0xfe, 0xff, 0x00, 0x00]), "utf-16-be");
         assert_eq!(detect_encoding(b"plain ascii"), "utf-8");
-    }
-
-    #[test]
-    fn get_repo_from_path_finds_github_repo() {
-        let p = Path::new("/home/u/github/myrepo/src");
-        assert_eq!(get_repo_from_path(p), "myrepo");
-    }
-
-    #[test]
-    fn get_repo_from_path_falls_back_to_path() {
-        // The fallback returns the normalized form (leading/trailing '/'
-        // stripped) since no `github/repos/...` segment was found.
-        let p = Path::new("/some/random/path");
-        assert_eq!(get_repo_from_path(p), "some/random/path");
     }
 
     #[test]

@@ -42,6 +42,13 @@ interface TypeConfirmTarget {
 const stripGuidPrefix = (name: string) =>
   name.replace(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}_/, "");
 
+const sortGroupsDefaultFirst = (names: string[]) =>
+  names.sort((a, b) => {
+    if (a === "default") return -1;
+    if (b === "default") return 1;
+    return a.localeCompare(b);
+  });
+
 const formatBytes = (bytes: number | null) => {
   if (!bytes) return "—";
   if (bytes < 1024) return `${bytes} B`;
@@ -180,13 +187,10 @@ const DataManagement: React.FC = () => {
     }, {});
   }, [userFiles?.documents]);
 
-  const sortedGroupNames = useMemo(() => {
-    return Object.keys(documentsByGroup).sort((a, b) => {
-      if (a === "default") return -1;
-      if (b === "default") return 1;
-      return a.localeCompare(b);
-    });
-  }, [documentsByGroup]);
+  const sortedGroupNames = useMemo(
+    () => sortGroupsDefaultFirst(Object.keys(documentsByGroup)),
+    [documentsByGroup],
+  );
 
   const websitesByGroup = useMemo(() => {
     return websites.reduce<Record<string, WebsiteItem[]>>((acc, w) => {
@@ -196,13 +200,10 @@ const DataManagement: React.FC = () => {
     }, {});
   }, [websites]);
 
-  const sortedWebsiteGroups = useMemo(() => {
-    return Object.keys(websitesByGroup).sort((a, b) => {
-      if (a === "default") return -1;
-      if (b === "default") return 1;
-      return a.localeCompare(b);
-    });
-  }, [websitesByGroup]);
+  const sortedWebsiteGroups = useMemo(
+    () => sortGroupsDefaultFirst(Object.keys(websitesByGroup)),
+    [websitesByGroup],
+  );
 
   return (
     <div className="max-w-[788px] space-y-4">
@@ -210,7 +211,6 @@ const DataManagement: React.FC = () => {
         <PageHead
           title="Manage Embedded Data"
           description="View and manage your embedded documents and code repositories. Delete or update vector embeddings for your RAG pipeline."
-          path="/embed/data"
         />
         <h1 className="text-2xl font-bold text-foreground mb-1">Data Management</h1>
         <p className="text-sm text-muted-foreground">View and delete your embedded data.</p>

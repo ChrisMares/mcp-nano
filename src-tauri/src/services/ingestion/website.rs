@@ -530,22 +530,14 @@ impl RawSection {
 }
 
 fn detect_code_language(elem: &scraper::node::Element) -> String {
-    let mut classes: Vec<String> = elem
-        .attr("class")
+    // The common convention is `language-*` on <pre>; nested <code> classes
+    // aren't reachable from `scraper::node::Element`, so we accept that
+    // limitation.
+    elem.attr("class")
         .unwrap_or("")
         .split_whitespace()
-        .map(|s| s.to_string())
-        .collect();
-    // Also check nested <code> child class. We can't get nested elements
-    // from `scraper::node::Element` directly; the common convention is that
-    // `language-*` is on <pre>, so we accept that limitation.
-    for c in &classes {
-        if let Some(rest) = c.strip_prefix("language-") {
-            return rest.to_string();
-        }
-    }
-    classes.clear();
-    String::new()
+        .find_map(|c| c.strip_prefix("language-").map(str::to_string))
+        .unwrap_or_default()
 }
 
 /// Build a `website_key` JSON serialization used in the DocumentChunk
@@ -759,13 +751,23 @@ fn simple_chunk(text: &str, chunk_size: usize, _chunk_overlap: usize) -> Vec<Str
         return vec![text.to_string()];
     }
     let mut chunks: Vec<String> = Vec::new();
-    let bytes = text.as_bytes();
     let mut start = 0usize;
-    while start < bytes.len() {
-        let end = (start + target_chars).min(bytes.len());
+    while start < text.len() {
+        // Never slice mid-codepoint (multibyte pages panicked here before).
+        let mut end = (start + target_chars).min(text.len());
+        while end > start && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == start {
+            // Single codepoint wider than the window: advance one char.
+            end = start + 1;
+            while !text.is_char_boundary(end) {
+                end += 1;
+            }
+        }
         // Walk back to the last whitespace if we're mid-word.
         let mut e = end;
-        while e > start && e < bytes.len() && !bytes[e].is_ascii_whitespace() {
+        while e > start && e < text.len() && !text.as_bytes()[e].is_ascii_whitespace() {
             e -= 1;
         }
         if e == start {
@@ -817,5 +819,42 @@ mod tests {
             normalize_url("/page#section", &base).as_deref(),
             Some("https://example.com/page")
         );
+    }
+
+    #[test]
+    fn simple_chunk_splits_on_whitespace_when_possible() {
+        let text = "word ".repeat(2000); // 10_000 bytes > 768*4 target
+        let chunks = simple_chunk(&text, 768, 50);
+        assert!(chunks.len() > 1);
+        let rejoined: String = chunks.concat();
+        assert_eq!(rejoined, text);
+        for c in &chunks {
+            assert!(c.len() <= 768 * 4, "chunk over target: {}", c.len());
+        }
+    }
+
+    #[test]
+    fn simple_chunk_multibyte_text_does_not_panic_or_lose_content() {
+        // CJK text has no ASCII whitespace: the old byte-slicing version
+        // panicked on non-char-boundary slices (failing whole website jobs).
+        let text = "日本語のテキスト。".repeat(1000);
+        let chunks = simple_chunk(&text, 1, 0); // tiny window forces splits
+        assert!(chunks.len() > 1);
+        let rejoined: String = chunks.concat();
+        assert_eq!(rejoined, text);
+    }
+
+    #[test]
+    fn simple_chunk_emoji_does_not_panic() {
+        let text = "🦀".repeat(5000); // 4-byte chars, no whitespace
+        let chunks = simple_chunk(&text, 1, 0);
+        assert!(chunks.len() > 1);
+        assert_eq!(chunks.concat(), text);
+    }
+
+    #[test]
+    fn simple_chunk_short_text_passthrough() {
+        assert_eq!(simple_chunk("hello world", 768, 50), vec!["hello world"]);
+        assert_eq!(simple_chunk("anything", 0, 0), vec!["anything"]);
     }
 }

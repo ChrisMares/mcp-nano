@@ -18,18 +18,12 @@ describe('UserDropdown', () => {
     expect(screen.getByText('Account')).toBeInTheDocument()
   })
 
-  it('shows Account link in dropdown', async () => {
+  it('shows Account as a disabled placeholder without a link', async () => {
     const user = userEvent.setup()
     renderWithProviders(<UserDropdown />)
     await user.click(screen.getByText('Local'))
-    expect(screen.getByText('Account')).toBeInTheDocument()
-  })
-
-  it('Account link points to /account', async () => {
-    const user = userEvent.setup()
-    renderWithProviders(<UserDropdown />)
-    await user.click(screen.getByText('Local'))
-    const link = screen.getByText('Account').closest('a')
-    expect(link).toHaveAttribute('href', '/account')
+    const item = screen.getByText('Account')
+    expect(item.closest('a')).toBeNull()
+    expect(item.closest('[aria-disabled="true"]')).not.toBeNull()
   })
 })

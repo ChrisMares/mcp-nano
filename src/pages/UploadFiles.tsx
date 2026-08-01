@@ -1,14 +1,10 @@
-import React, { useState, useMemo, useCallback, useEffect, useRef } from "react";
+import React, { useState, useMemo, useCallback, useEffect } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useLocalUpload } from "@/hooks/use-local-upload";
-import { useJobEvents, type JobProgressEvent } from "@/hooks/use-job-events";
-import { getActiveJobs, crawlWebsite, embedWebsite, getMetadataValues } from "@/utils/apicalls";
-import { CheckCircle } from "lucide-react";
+import { useJobTracking } from "@/hooks/use-job-tracking";
+import { crawlWebsite, embedWebsite, getMetadataValues } from "@/utils/apicalls";
 import PageHead from "@/components/shared/PageHead";
-import {
-  wizardStepDot, wizardStepDotActive, wizardStepDotCompleted, wizardStepDotPending,
-  wizardStepLabel, wizardConnector,
-} from "@/styles/classes";
+import StepIndicator from "@/components/shared/StepIndicator";
 
 import EmbeddingTypeStep from "@/components/uploadfiles/EmbeddingTypeStep";
 import ConfigureCodeStep from "@/components/uploadfiles/ConfigureCodeStep";
@@ -17,22 +13,13 @@ import ConfigureWebsiteStep from "@/components/uploadfiles/ConfigureWebsiteStep"
 import UploadStep from "@/components/uploadfiles/UploadStep";
 import WebsiteProcessingStep from "@/components/uploadfiles/WebsiteProcessingStep";
 import JobStatusPanel from "@/components/uploadfiles/JobStatusPanel";
-import type { EmbedJob, UploadJobEntry } from "@/types/embed";
+import type { UploadJobEntry } from "@/types/embed";
 
 interface CrawlProgressEvent {
   url: string;
   phase: string;
   found_count: number;
 }
-
-const mergeJobFromEvent = (prev: EmbedJob | undefined, e: JobProgressEvent, status: string): EmbedJob => ({
-  job_id: e.job_id,
-  status,
-  progress_percentage: e.percentage ?? prev?.progress_percentage ?? 0,
-  file_name: e.file_name ?? prev?.file_name ?? null,
-  created_at: prev?.created_at ?? new Date().toISOString(),
-  message: e.message ?? prev?.message ?? null,
-});
 
 const isZipFile = (f: { name: string }) => f.name.toLowerCase().endsWith(".zip");
 
@@ -52,37 +39,6 @@ const getStepLabels = (collection: CollectionType) =>
   collection === "website"
     ? ["Embedding Type", "Configure", "Processing"]
     : ["Embedding Type", "Configure", "Upload Files"];
-
-const StepIndicator: React.FC<{ current: number; total: number; labels: string[]; onStepClick: (step: number) => void }> = ({ current, total, labels, onStepClick }) => (
-  <div className="flex items-center justify-center mb-8">
-    {Array.from({ length: total }, (_, i) => {
-      const stepNum = i + 1;
-      const isCompleted = stepNum < current;
-      const isActive = stepNum === current;
-      const canClick = isCompleted;
-      return (
-        <React.Fragment key={i}>
-          <div className="flex flex-col items-center min-w-[70px]">
-            <button
-              type="button"
-              disabled={!canClick}
-              onClick={() => canClick && onStepClick(stepNum)}
-              className={`${wizardStepDot} ${isCompleted ? wizardStepDotCompleted : isActive ? wizardStepDotActive : wizardStepDotPending} ${canClick ? "cursor-pointer hover:scale-110 transition-transform" : "cursor-default"}`}
-            >
-              {isCompleted ? <CheckCircle size={16} /> : stepNum}
-            </button>
-            <span className={`${wizardStepLabel} ${isActive ? "text-foreground" : "text-muted-foreground"}`}>
-              {labels[i]}
-            </span>
-          </div>
-          {i < total - 1 && (
-            <div className={`${wizardConnector} ${stepNum < current ? "bg-success" : "bg-border"} self-start mt-4`} />
-          )}
-        </React.Fragment>
-      );
-    })}
-  </div>
-);
 
 const UploadFiles: React.FC = () => {
   const [step, setStep] = useState(1);
@@ -104,90 +60,8 @@ const UploadFiles: React.FC = () => {
   const [crawlFoundCount, setCrawlFoundCount] = useState(0);
   const [websiteEmbedJobId, setWebsiteEmbedJobId] = useState<string | null>(null);
   const [mixWarning, setMixWarning] = useState("");
-  const [activeJobs, setActiveJobs] = useState<EmbedJob[]>([]);
-  const [completedJobs, setCompletedJobs] = useState<EmbedJob[]>([]);
   const [lastSubmittedCount, setLastSubmittedCount] = useState(0);
-  const trackedJobsRef = useRef<Map<string, EmbedJob>>(new Map());
-
-  useEffect(() => {
-    let cancelled = false;
-    const fetchInitial = async () => {
-      try {
-        const res = await getActiveJobs();
-        if (cancelled) return;
-        const jobs = (res.jobs ?? []).map((j) => ({
-          job_id: j.job_id,
-          status: j.status,
-          progress_percentage: j.progress_percentage,
-          file_name: j.file_name,
-          created_at: j.created_at,
-          message: null,
-        }));
-        setActiveJobs(jobs);
-        trackedJobsRef.current = new Map(jobs.map((j) => [j.job_id, j]));
-      } catch {
-        // sidecars may not be ready yet
-      }
-    };
-    void fetchInitial();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  const upsertActive = useCallback((job: EmbedJob) => {
-    trackedJobsRef.current.set(job.job_id, job);
-    setActiveJobs((prev) => {
-      const idx = prev.findIndex((j) => j.job_id === job.job_id);
-      if (idx < 0) return [...prev, job];
-      const next = [...prev];
-      next[idx] = job;
-      return next;
-    });
-  }, []);
-
-  useJobEvents({
-    onQueued: (e: JobProgressEvent) => {
-      const prev = trackedJobsRef.current.get(e.job_id);
-      upsertActive(mergeJobFromEvent(prev, e, e.status ?? "PENDING"));
-    },
-    onProgress: (e: JobProgressEvent) => {
-      const prev = trackedJobsRef.current.get(e.job_id);
-      const next = mergeJobFromEvent(prev, e, e.status ?? "RUNNING");
-      if (
-        prev &&
-        prev.progress_percentage === next.progress_percentage &&
-        prev.status === next.status &&
-        prev.message === next.message &&
-        prev.file_name === next.file_name
-      ) {
-        return;
-      }
-      upsertActive(next);
-    },
-    onFinished: (e: JobProgressEvent) => {
-      const prev = trackedJobsRef.current.get(e.job_id);
-      trackedJobsRef.current.delete(e.job_id);
-      setActiveJobs((prevJobs) => prevJobs.filter((j) => j.job_id !== e.job_id));
-      const done = mergeJobFromEvent(prev, e, "COMPLETED");
-      done.progress_percentage = 100;
-      setCompletedJobs((prevDone) => {
-        if (prevDone.find((j) => j.job_id === e.job_id)) return prevDone;
-        return [...prevDone, done];
-      });
-    },
-    onFailed: (e: JobProgressEvent) => {
-      const prev = trackedJobsRef.current.get(e.job_id);
-      trackedJobsRef.current.delete(e.job_id);
-      setActiveJobs((prevJobs) => prevJobs.filter((j) => j.job_id !== e.job_id));
-      const failed = mergeJobFromEvent(prev, e, "FAILED");
-      failed.progress_percentage = 100;
-      setCompletedJobs((prevDone) => {
-        if (prevDone.find((j) => j.job_id === e.job_id)) return prevDone;
-        return [...prevDone, failed];
-      });
-    },
-  });
+  const { activeJobs, completedJobs, trackUploadedJobs, trackQueuedJob } = useJobTracking();
 
   useEffect(() => {
     let unlisten: UnlistenFn | undefined;
@@ -213,33 +87,8 @@ const UploadFiles: React.FC = () => {
 
   const handleUploadSuccess = useCallback((submittedCount: number, jobs: UploadJobEntry[]) => {
     setLastSubmittedCount(submittedCount);
-    for (const entry of jobs) {
-      const job: EmbedJob = {
-        job_id: entry.job_id,
-        status: entry.status || "PENDING",
-        progress_percentage: 0,
-        file_name: entry.filename,
-        created_at: new Date().toISOString(),
-        message: "Queued",
-      };
-      trackedJobsRef.current.set(job.job_id, job);
-    }
-    setActiveJobs((prev) => {
-      const byId = new Map(prev.map((j) => [j.job_id, j]));
-      for (const entry of jobs) {
-        const existing = byId.get(entry.job_id);
-        byId.set(entry.job_id, {
-          job_id: entry.job_id,
-          status: existing?.status === "RUNNING" ? existing.status : entry.status || "PENDING",
-          progress_percentage: existing?.progress_percentage ?? 0,
-          file_name: entry.filename || existing?.file_name || null,
-          created_at: existing?.created_at ?? new Date().toISOString(),
-          message: existing?.message ?? "Queued",
-        });
-      }
-      return Array.from(byId.values());
-    });
-  }, []);
+    trackUploadedJobs(jobs);
+  }, [trackUploadedJobs]);
 
   const handleWebsiteSubmit = useCallback(async () => {
     setWebsiteCrawlError(false);
@@ -264,22 +113,17 @@ const UploadFiles: React.FC = () => {
       const res = await embedWebsite(urls, urlToGroupName(websiteUrl));
       const jobId = res.job_id;
       setWebsiteEmbedJobId(jobId);
-      const newJob: EmbedJob = {
+      trackQueuedJob({
         job_id: jobId,
         status: "PENDING",
         progress_percentage: 0,
         file_name: urls[0],
         created_at: new Date().toISOString(),
-      };
-      trackedJobsRef.current.set(jobId, newJob);
-      setActiveJobs(prev => {
-        const existingIds = new Set(prev.map(j => j.job_id));
-        return [...prev, ...(existingIds.has(jobId) ? [] : [newJob])];
       });
     } catch (err) {
       console.error("Failed to start website embedding:", err);
     }
-  }, [websiteUrl]);
+  }, [websiteUrl, trackQueuedJob]);
 
   // Fetch repo names when codebase is selected
   useEffect(() => {
@@ -335,22 +179,24 @@ const UploadFiles: React.FC = () => {
     return { disableUpload: false, disableReason: "" };
   }, [collection, codeUploadMode, repoName]);
 
+  const resetWebsiteState = () => {
+    setWebsiteUrl("");
+    setWebsiteDepth(1);
+    setWebsiteSameDomainOnly(true);
+    setWebsiteUrls([]);
+    setWebsiteCrawlError(false);
+    setWebsiteCrawling(false);
+    setCrawlCurrentUrl(null);
+    setCrawlFoundCount(0);
+    setWebsiteEmbedJobId(null);
+  };
+
   const handleCollectionSelect = (val: "codebase" | "general" | "website") => {
     setCollection(val);
     setCodeUploadMode("");
     if (val !== "codebase") { setRepoName(""); setRepoMode("existing"); }
     if (val !== "general" && val !== "website") { setGroupName(""); setGroupMode("existing"); }
-    if (val !== "website") {
-      setWebsiteUrl("");
-      setWebsiteDepth(1);
-      setWebsiteSameDomainOnly(true);
-      setWebsiteUrls([]);
-      setWebsiteCrawlError(false);
-      setWebsiteCrawling(false);
-      setCrawlCurrentUrl(null);
-      setCrawlFoundCount(0);
-      setWebsiteEmbedJobId(null);
-    }
+    if (val !== "website") resetWebsiteState();
     setStep(2);
   };
 
@@ -361,15 +207,7 @@ const UploadFiles: React.FC = () => {
     setCodeUploadMode("");
     setRepoName("");
     setRepoMode("existing");
-    setWebsiteUrl("");
-    setWebsiteDepth(1);
-    setWebsiteSameDomainOnly(true);
-    setWebsiteUrls([]);
-    setWebsiteCrawlError(false);
-    setWebsiteCrawling(false);
-    setCrawlCurrentUrl(null);
-    setCrawlFoundCount(0);
-    setWebsiteEmbedJobId(null);
+    resetWebsiteState();
     setStep(1);
   };
 
@@ -380,7 +218,6 @@ const UploadFiles: React.FC = () => {
       <PageHead
         title="Embed Files & Code Repos"
         description="Upload documents and code repositories for embedding and search."
-        path="/embed/upload"
       />
       <h1 className="text-2xl font-bold text-foreground mb-1">Upload &amp; Embed Files</h1>
       <p className="text-muted-foreground mb-6 text-sm">

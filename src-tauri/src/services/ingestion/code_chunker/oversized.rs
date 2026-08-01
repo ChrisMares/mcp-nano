@@ -10,7 +10,7 @@
 use text_splitter::TextSplitter;
 use tokenizers::Tokenizer;
 
-use crate::services::ingestion::types::CodeChunk;
+use crate::services::ingestion::types::{hard_split_chars, CodeChunk};
 
 /// Split chunks that exceed `max_tokens` into sub-chunks of <=`max_tokens`,
 /// preserving the per-language variant on each sub-chunk.
@@ -45,27 +45,6 @@ pub fn split_oversized_code_chunks(
                 out.push(chunk.split(new_id, piece));
             }
         }
-    }
-    out
-}
-
-fn hard_split_chars(text: &str, max_chars: usize) -> Vec<String> {
-    if max_chars == 0 || text.chars().count() <= max_chars {
-        return vec![text.to_string()];
-    }
-    let mut out = Vec::new();
-    let mut buf = String::with_capacity(max_chars);
-    let mut n = 0usize;
-    for ch in text.chars() {
-        if n >= max_chars {
-            out.push(std::mem::take(&mut buf));
-            n = 0;
-        }
-        buf.push(ch);
-        n += 1;
-    }
-    if !buf.is_empty() {
-        out.push(buf);
     }
     out
 }

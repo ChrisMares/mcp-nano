@@ -4,7 +4,6 @@
 //! Qdrant-backed tests (get_files facet, get_websites facet) are marked
 //! `#[ignore]` and require the bundled Qdrant binary.
 
-mod common;
 
 use sqlx::SqlitePool;
 use uuid::Uuid;

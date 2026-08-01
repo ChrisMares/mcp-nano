@@ -4,23 +4,23 @@ import { statusDot } from "@/styles/classes";
 
 interface Props {
   embedJob: EmbedJob;
-  key: string | number;
 }
 
-const JobStatusCompleteRow: React.FC<Props> = ({ embedJob, key }) => {
+const JobStatusCompleteRow: React.FC<Props> = ({ embedJob }) => {
   const failed = embedJob.status === "FAILED";
+  const displayName = embedJob.file_name?.trim() || "Untitled";
 
   return (
-    <div key={key} className="space-y-1">
+    <div className="space-y-1">
       <div className="flex items-center gap-3">
         <span
           className={`${statusDot} ${failed ? "bg-destructive" : "bg-success"}`}
         />
         <span
           className="text-sm text-foreground truncate"
-          title={embedJob.file_name?.trim()}
+          title={displayName}
         >
-          {embedJob.file_name?.trim()}
+          {displayName}
         </span>
         <span
           className={`text-xs uppercase ${failed ? "text-destructive" : "text-success"}`}

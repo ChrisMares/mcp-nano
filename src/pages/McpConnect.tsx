@@ -58,7 +58,6 @@ const McpConnect: React.FC = () => {
       <PageHead
         title="Connect MCP Server"
         description="View MCP server connection URLs and client configuration snippets."
-        path="/mcp/connect"
       />
       <h1 className="text-2xl font-bold text-foreground mb-2">MCP Connection</h1>
       <p className="text-muted-foreground mb-6">

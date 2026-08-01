@@ -1,11 +1,10 @@
 import { Helmet } from "react-helmet-async";
 
-const SITE_NAME = "VectorFlowUI";
+const SITE_NAME = "NASA MCP";
 
 interface PageHeadProps {
   title: string;
   description: string;
-  path?: string;
   type?: string;
 }
 

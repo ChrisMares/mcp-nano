@@ -33,15 +33,7 @@ const UPSERT_BATCH_SIZE: usize = 250;
 /// Batch size for dense embedding forward passes.
 const EMBED_BATCH_SIZE: usize = 16;
 
-fn panic_payload_to_string(payload: &Box<dyn std::any::Any + Send>) -> String {
-    if let Some(s) = payload.downcast_ref::<&str>() {
-        (*s).to_string()
-    } else if let Some(s) = payload.downcast_ref::<String>() {
-        s.clone()
-    } else {
-        "unknown panic".to_string()
-    }
-}
+use crate::panic_payload_to_string;
 
 fn record_caught_panic(label: &str, msg: &str) {
     error!("{label} panicked: {msg}");
@@ -71,7 +63,7 @@ fn record_caught_panic(label: &str, msg: &str) {
 /// one bad unit of work instead of aborting the whole task.
 fn catch_sync_panic<T>(label: &str, f: impl FnOnce() -> T) -> Result<T> {
     std::panic::catch_unwind(AssertUnwindSafe(f)).map_err(|payload| {
-        let msg = panic_payload_to_string(&payload);
+        let msg = panic_payload_to_string(&*payload);
         record_caught_panic(label, &msg);
         anyhow!("{label} panicked: {msg}")
     })
@@ -85,7 +77,7 @@ where
     match AssertUnwindSafe(fut).catch_unwind().await {
         Ok(result) => result,
         Err(payload) => {
-            let msg = panic_payload_to_string(&payload);
+            let msg = panic_payload_to_string(&*payload);
             record_caught_panic(label, &msg);
             Err(anyhow!("{label} panicked: {msg}"))
         }
@@ -117,10 +109,8 @@ pub fn zip_file_progress_bounds(idx: usize, total_files: usize) -> (i32, i32) {
 /// End-to-end ingestion pipeline: chunk text, embed via the dense model,
 /// and upsert into Qdrant with hybrid (dense + BM25 sparse) vectors.
 ///
-/// Three of the four Python ingestion entry points are wired end-to-end
-/// here; `process_website_embed` returns an explicit "not yet implemented"
-/// error and is realized in Phase 5 alongside the `reqwest`+`scraper`
-/// crawler.
+/// All four Python ingestion entry points (zip, documents, code files,
+/// website embed) are wired end-to-end here.
 pub struct IngestionService {
     embedders: Arc<EmbedderState>,
     qdrant: QdrantService,
@@ -532,7 +522,14 @@ impl IngestionService {
         progress(30, Some(format!("Embedding {} chunks", chunks.len()))).await;
         let n = catch_async_panic(
             "website embed",
-            self.embed_and_upsert_documents(&chunks, "general", None, &progress, 30, 100),
+            self.embed_and_upsert_documents(
+                &chunks,
+                "general",
+                serde_json::Value::Object(serde_json::Map::new()),
+                &progress,
+                30,
+                100,
+            ),
         )
         .await?;
         progress(100, Some("Website embedding complete".to_string())).await;
@@ -710,7 +707,7 @@ impl IngestionService {
 
         let extra_meta = build_base_metadata(&file_name, &doc_type, repo_name, options);
         let n = self
-            .embed_and_upsert_documents_inner(
+            .embed_and_upsert_documents(
                 &chunks,
                 collection,
                 extra_meta,
@@ -724,32 +721,10 @@ impl IngestionService {
         Ok(n)
     }
 
-    /// Embed a list of prebuilt `DocumentChunk`s into Qdrant. Used by the
-    /// website embedder where the chunks come directly from
-    /// `ingestion::website::process_website`. The progress range is mapped
-    /// onto `[range_start, range_end]` percent.
+    /// Embed a list of prebuilt `DocumentChunk`s into Qdrant, merging
+    /// `extra_meta` into every chunk's metadata. The progress range is
+    /// mapped onto `[range_start, range_end]` percent.
     async fn embed_and_upsert_documents(
-        &self,
-        chunks: &[ingestion::DocumentChunk],
-        collection: &str,
-        _repo_name: Option<&str>,
-        progress: &crate::worker::ProgressCallback,
-        range_start: i32,
-        range_end: i32,
-    ) -> Result<usize> {
-        let extra = serde_json::Value::Object(serde_json::Map::new());
-        self.embed_and_upsert_documents_inner(
-            chunks,
-            collection,
-            extra,
-            progress,
-            range_start,
-            range_end,
-        )
-        .await
-    }
-
-    async fn embed_and_upsert_documents_inner(
         &self,
         chunks: &[ingestion::DocumentChunk],
         collection: &str,
@@ -892,7 +867,7 @@ pub fn split_document_chunks(
         };
         let mut local_idx = 0i64;
         for sub in parts {
-            for piece in hard_split_chars(&sub, MAX_CHUNK_CHARS) {
+            for piece in ingestion::types::hard_split_chars(&sub, MAX_CHUNK_CHARS) {
                 let mut child = chunk.clone();
                 child.id = Uuid::new_v4().to_string();
                 child.content = piece;
@@ -901,31 +876,6 @@ pub fn split_document_chunks(
                 out.push(child);
             }
         }
-    }
-    out
-}
-
-/// Force-split `text` into pieces of at most `max_chars` (char boundary safe).
-fn hard_split_chars(text: &str, max_chars: usize) -> Vec<String> {
-    if max_chars == 0 {
-        return vec![text.to_string()];
-    }
-    if text.chars().count() <= max_chars {
-        return vec![text.to_string()];
-    }
-    let mut out = Vec::new();
-    let mut buf = String::with_capacity(max_chars);
-    let mut n = 0usize;
-    for ch in text.chars() {
-        if n >= max_chars {
-            out.push(std::mem::take(&mut buf));
-            n = 0;
-        }
-        buf.push(ch);
-        n += 1;
-    }
-    if !buf.is_empty() {
-        out.push(buf);
     }
     out
 }
@@ -1105,7 +1055,7 @@ fn enforce_max_chunk_chars(chunks: Vec<ingestion::DocumentChunk>) -> Vec<ingesti
             out.push(chunk);
             continue;
         }
-        for (i, piece) in hard_split_chars(&chunk.content, MAX_CHUNK_CHARS)
+        for (i, piece) in ingestion::types::hard_split_chars(&chunk.content, MAX_CHUNK_CHARS)
             .into_iter()
             .enumerate()
         {
@@ -1428,7 +1378,7 @@ mod tests {
     #[test]
     fn hard_split_chars_respects_char_boundaries() {
         let s = "a😀b😀c";
-        let parts = hard_split_chars(s, 2);
+        let parts = ingestion::types::hard_split_chars(s, 2);
         assert!(parts.len() >= 2);
         let rejoined: String = parts.concat();
         assert_eq!(rejoined, s);

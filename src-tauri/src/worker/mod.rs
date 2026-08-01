@@ -23,16 +23,6 @@ use crate::models::entities::JobStatus;
 /// `MAX_CONCURRENT_JOBS = 2`.
 const MAX_CONCURRENT_JOBS: usize = 2;
 
-fn panic_payload_msg(payload: &Box<dyn std::any::Any + Send>) -> String {
-    if let Some(s) = payload.downcast_ref::<&str>() {
-        (*s).to_string()
-    } else if let Some(s) = payload.downcast_ref::<String>() {
-        s.clone()
-    } else {
-        "unknown panic".to_string()
-    }
-}
-
 /// Poll interval between worker sweeps. Mirrors `POLL_INTERVAL = 2.0` (sec).
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -127,7 +117,7 @@ async fn run_loop(
                             if let Err(join_err) = inner.await {
                                 let msg = if join_err.is_panic() {
                                     let payload = join_err.into_panic();
-                                    let detail = panic_payload_msg(&payload);
+                                    let detail = crate::panic_payload_to_string(&*payload);
                                     format!("task panicked: {detail}")
                                 } else {
                                     format!("task cancelled: {join_err}")

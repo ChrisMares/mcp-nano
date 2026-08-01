@@ -121,21 +121,11 @@ pub async fn delete_repo(app: AppHandle, repo_name: String) -> Result<DeleteResp
         .map_err(|e| format!("delete repo vectors: {e:#}"))?;
 
     let pool = pool(&app)?;
-    let rows = sqlx::query_as::<_, FileMetadata>(
-        "SELECT * FROM file_metadata WHERE repo_name = ? AND status = 'completed'",
-    )
-    .bind(&repo_name)
-    .fetch_all(&pool)
-    .await
-    .map_err(|e| format!("querying file_metadata: {e}"))?;
-
-    for row in &rows {
-        sqlx::query("DELETE FROM file_metadata WHERE storage_object_id = ?")
-            .bind(&row.storage_object_id)
-            .execute(&pool)
-            .await
-            .map_err(|e| format!("deleting file_metadata: {e}"))?;
-    }
+    sqlx::query("DELETE FROM file_metadata WHERE repo_name = ? AND status = 'completed'")
+        .bind(&repo_name)
+        .execute(&pool)
+        .await
+        .map_err(|e| format!("deleting file_metadata: {e}"))?;
 
     Ok(DeleteResponse { deleted: true })
 }
@@ -156,16 +146,12 @@ pub async fn delete_document(app: AppHandle, filename: String) -> Result<DeleteR
     .await
     .map_err(|e| format!("querying file_metadata: {e}"))?;
 
-    for row in rows
-        .iter()
-        .filter(|f| f.filename() == Some(filename.as_str()))
-    {
+    if let Some(row) = rows.iter().find(|f| f.filename() == Some(filename.as_str())) {
         sqlx::query("DELETE FROM file_metadata WHERE storage_object_id = ?")
             .bind(&row.storage_object_id)
             .execute(&pool)
             .await
             .map_err(|e| format!("deleting file_metadata: {e}"))?;
-        break;
     }
 
     Ok(DeleteResponse { deleted: true })
@@ -184,21 +170,13 @@ pub async fn delete_group(app: AppHandle, group_name: String) -> Result<DeleteRe
         .map_err(|e| format!("delete group vectors: {e:#}"))?;
 
     let pool = pool(&app)?;
-    let rows = sqlx::query_as::<_, FileMetadata>(
-        "SELECT * FROM file_metadata WHERE group_id = ? AND status = 'completed' AND collection = 'general'",
+    sqlx::query(
+        "DELETE FROM file_metadata WHERE group_id = ? AND status = 'completed' AND collection = 'general'",
     )
     .bind(&group_name)
-    .fetch_all(&pool)
+    .execute(&pool)
     .await
-    .map_err(|e| format!("querying file_metadata: {e}"))?;
-
-    for row in &rows {
-        sqlx::query("DELETE FROM file_metadata WHERE storage_object_id = ?")
-            .bind(&row.storage_object_id)
-            .execute(&pool)
-            .await
-            .map_err(|e| format!("deleting file_metadata: {e}"))?;
-    }
+    .map_err(|e| format!("deleting file_metadata: {e}"))?;
 
     Ok(DeleteResponse { deleted: true })
 }

@@ -7,8 +7,6 @@ import { card, cardInner, btnPrimary } from "@/styles/classes";
 import type { DashboardStats } from "@/types/dashboard";
 import { emptyDashboardStats } from "@/types/dashboard";
 
-const emptyStats: DashboardStats = emptyDashboardStats;
-
 const steps = [
   {
     num: 1,
@@ -53,7 +51,7 @@ const statCards = [
 ];
 
 const Dashboard: React.FC = () => {
-  const [stats, setStats] = useState<DashboardStats>(emptyStats);
+  const [stats, setStats] = useState<DashboardStats>(emptyDashboardStats);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
@@ -89,7 +87,6 @@ const Dashboard: React.FC = () => {
       <PageHead
         title="Dashboard"
         description="Dashboard for embedding data, searching context, and managing MCP tools."
-        path="/dashboard"
       />
 
       {/* Welcome header */}
