@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use futures_util::FutureExt;
+use qdrant_client::qdrant::{Condition, Filter};
 use serde::Deserialize;
 use text_splitter::{ChunkConfig, TextSplitter};
 use tokenizers::Tokenizer;
@@ -114,10 +115,10 @@ pub fn zip_file_progress_bounds(idx: usize, total_files: usize) -> (i32, i32) {
 pub struct IngestionService {
     embedders: Arc<EmbedderState>,
     qdrant: QdrantService,
-    splitter: TextSplitter<Tokenizer>,
+    splitter: Arc<TextSplitter<Tokenizer>>,
     /// Second splitter used by `split_oversized_code_chunks`; mirrors the
     /// Python `CODE_CHUNK_SIZE=768, chunk_overlap=64` config.
-    code_splitter: TextSplitter<Tokenizer>,
+    code_splitter: Arc<TextSplitter<Tokenizer>>,
 }
 
 impl IngestionService {
@@ -148,8 +149,8 @@ impl IngestionService {
         Ok(Self {
             embedders,
             qdrant,
-            splitter,
-            code_splitter,
+            splitter: Arc::new(splitter),
+            code_splitter: Arc::new(code_splitter),
         })
     }
 
@@ -216,6 +217,27 @@ impl IngestionService {
                     }
                 }
             }
+        }
+        if collection == "codebase" {
+            if let Some(repo_name) = embedding_options.repo_name.as_deref().filter(|name| !name.is_empty()) {
+                self.qdrant
+                    .delete_items(
+                        &collection,
+                        None,
+                        Some(Filter::must([Condition::matches("repo_name", repo_name.to_string())])),
+                    )
+                    .await
+                    .context("deleting prior codebase vectors for zip")?;
+            }
+        } else if let Some(zip_filename) = p.zip_filename.as_deref().filter(|name| !name.is_empty()) {
+            self.qdrant
+                .delete_items(
+                    &collection,
+                    None,
+                    Some(Filter::must([Condition::matches("zip_filename", zip_filename.to_string())])),
+                )
+                .await
+                .context("deleting prior document vectors for zip")?;
         }
         let repo_name_for_dispatch = if collection == "codebase" {
             embedding_options.repo_name.as_deref()
@@ -390,6 +412,23 @@ impl IngestionService {
         }
         let collection = p.collection.unwrap_or_else(|| "general".to_string());
         self.qdrant.ensure_collection(&collection).await?;
+        let display = strip_job_prefix(display).unwrap_or_else(|| display.to_string());
+        let mut delete_conditions = vec![Condition::matches("file_name", display.clone())];
+        if let Some(group) = p.group.as_deref().filter(|group| !group.is_empty()) {
+            delete_conditions.push(Condition::matches("group", group.to_string()));
+        }
+        if let Some(user_id) = p
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.pointer("/user_id"))
+            .and_then(|value| value.as_str())
+        {
+            delete_conditions.push(Condition::matches("user_id", user_id.to_string()));
+        }
+        self.qdrant
+            .delete_items(&collection, None, Some(Filter::must(delete_conditions)))
+            .await
+            .context("deleting prior document vectors")?;
 
         let n = catch_async_panic(
             &format!("document {}", p.path),
@@ -509,7 +548,11 @@ impl IngestionService {
             )
             .await;
             let page_chunks = catch_async_panic("website scrape", async {
-                ingestion::website::process_website(std::slice::from_ref(url), &base_metadata)
+                ingestion::website::process_website_with_splitter(
+                    std::slice::from_ref(url),
+                    &base_metadata,
+                    Some(&self.splitter),
+                )
                     .await
                     .context("scraping + chunking website pages")
             })
@@ -519,6 +562,7 @@ impl IngestionService {
         if chunks.is_empty() {
             return Err(anyhow!("No content extracted from any URL"));
         }
+        self.qdrant.ensure_collection("general").await?;
         progress(30, Some(format!("Embedding {} chunks", chunks.len()))).await;
         let n = catch_async_panic(
             "website embed",
@@ -584,12 +628,13 @@ impl IngestionService {
         if should_skip_ingest_path(path) {
             return Ok(0);
         }
-        let file_name = path
+        let raw_file_name = path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("unknown")
             .to_string();
-        let display = strip_job_prefix(&file_name).unwrap_or_else(|| file_name.clone());
+        let file_name = strip_job_prefix(&raw_file_name).unwrap_or(raw_file_name);
+        let display = file_name.clone();
         let doc_type = path
             .extension()
             .and_then(|e| e.to_str())
@@ -604,12 +649,14 @@ impl IngestionService {
 
         let path_buf = path.to_path_buf();
         let path_display = path.display().to_string();
-        let is_code = ingestion::code_chunker::is_code_file(path);
+        // Match Python ZIP routing: general uploads treat every file as a
+        // document; only codebase uploads use language-specific chunkers.
+        let is_code = collection == "codebase" && ingestion::code_chunker::is_code_file(path);
         let chunks: Vec<ingestion::DocumentChunk> = if is_code {
             progress(chunk_pct, Some(format!("Chunking code in {display}"))).await;
             crate::write_ingest_breadcrumb("chunk_code", &path_display);
             let repo = repo_name.unwrap_or("");
-            let name_override = strip_job_prefix(&file_name);
+            let name_override = Some(file_name.clone());
             let t0 = std::time::Instant::now();
             let code_chunks = catch_sync_panic(&format!("code chunker {path_display}"), || {
                 ingestion::code_chunker::chunk_file_to_documents(
@@ -645,7 +692,7 @@ impl IngestionService {
             crate::write_ingest_breadcrumb("load_document", &path_display);
             let path_for_load = path_buf.clone();
             let load_t0 = std::time::Instant::now();
-            let loaded = tokio::task::spawn_blocking(move || {
+            let mut loaded = tokio::task::spawn_blocking(move || {
                 catch_sync_panic(
                     &format!("document loader {}", path_for_load.display()),
                     || ingestion::document_loaders::load_document(&path_for_load),
@@ -664,24 +711,83 @@ impl IngestionService {
                     anyhow!("load task join error for {path_display}: {e}")
                 }
             })??;
+            for chunk in &mut loaded {
+                chunk.file_name = file_name.clone();
+                chunk.metadata.insert(
+                    "source".into(),
+                    serde_json::Value::String(file_name.clone()),
+                );
+            }
             let load_ms = load_t0.elapsed().as_millis();
             crate::write_ingest_breadcrumb(
                 "load_document_done",
                 &format!("path={path_display} ms={load_ms}"),
             );
 
-            progress(chunk_pct, Some(format!("Chunking text from {display}"))).await;
+            let source_pages = loaded.len();
+            let source_chars: usize = loaded.iter().map(|chunk| chunk.content.len()).sum();
+            progress(
+                chunk_pct,
+                Some(format!(
+                    "Chunking text from {display} ({source_pages} source document(s))"
+                )),
+            )
+            .await;
             crate::write_ingest_breadcrumb("chunk_text", &path_display);
             let split_t0 = std::time::Instant::now();
-            let split_chunks = catch_sync_panic(&format!("text splitter {path_display}"), || {
-                split_document_chunks(loaded, &self.splitter)
-            })?;
+            info!(
+                "ingest: splitting document path={} source_documents={} source_chars={}",
+                path_display, source_pages, source_chars
+            );
+            let splitter = self.splitter.clone();
+            let split_path_display = path_display.clone();
+            let (split_progress_tx, mut split_progress_rx) =
+                tokio::sync::mpsc::channel::<ChunkingProgress>(8);
+            let split_task = tokio::task::spawn_blocking(move || {
+                catch_sync_panic(&format!("text splitter {split_path_display}"), || {
+                    split_document_chunks_with_progress(loaded, &splitter, |snapshot| {
+                        let _ = split_progress_tx.blocking_send(snapshot);
+                    })
+                })
+            });
+            while let Some(snapshot) = split_progress_rx.recv().await {
+                let pct = chunking_progress_percent(chunk_pct, range_start, snapshot.completed, snapshot.total);
+                progress(
+                    pct,
+                    Some(format!(
+                        "Chunking text: {}/{} source document(s), {} chunks",
+                        snapshot.completed, snapshot.total, snapshot.output_chunks
+                    )),
+                )
+                .await;
+                crate::write_ingest_breadcrumb(
+                    "chunk_text_progress",
+                    &format!(
+                        "path={path_display} documents={}/{} chunks={}",
+                        snapshot.completed, snapshot.total, snapshot.output_chunks
+                    ),
+                );
+            }
+            let split_chunks = split_task.await.map_err(|e| {
+                if e.is_panic() {
+                    let msg = panic_payload_to_string(&e.into_panic());
+                    record_caught_panic(&format!("split task {path_display}"), &msg);
+                    anyhow!("split task panicked for {path_display}: {msg}")
+                } else {
+                    anyhow!("split task join error for {path_display}: {e}")
+                }
+            })??;
+            let split_ms = split_t0.elapsed().as_millis();
+            info!(
+                "ingest: split document path={} source_documents={} source_chars={} chunks={} elapsed_ms={split_ms}",
+                path_display, source_pages, source_chars, split_chunks.len()
+            );
             crate::write_ingest_breadcrumb(
                 "chunk_text_done",
                 &format!(
                     "path={path_display} chunks={} ms={}",
                     split_chunks.len(),
-                    split_t0.elapsed().as_millis()
+                    split_ms
                 ),
             );
             split_chunks
@@ -854,27 +960,58 @@ pub fn split_document_chunks(
     chunks: Vec<ingestion::DocumentChunk>,
     splitter: &TextSplitter<Tokenizer>,
 ) -> Vec<ingestion::DocumentChunk> {
+    split_document_chunks_with_progress(chunks, splitter, |_| {})
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ChunkingProgress {
+    completed: usize,
+    total: usize,
+    output_chunks: usize,
+}
+
+fn chunking_progress_percent(start: i32, end: i32, completed: usize, total: usize) -> i32 {
+    let span = (end - start).max(0);
+    let total = total.max(1) as i32;
+    (start + span * completed as i32 / total).clamp(0, 100)
+}
+
+fn split_document_chunks_with_progress(
+    chunks: Vec<ingestion::DocumentChunk>,
+    splitter: &TextSplitter<Tokenizer>,
+    mut report: impl FnMut(ChunkingProgress),
+) -> Vec<ingestion::DocumentChunk> {
     if chunks.is_empty() {
         return chunks;
     }
+    let total = chunks.len();
     let mut out: Vec<ingestion::DocumentChunk> = Vec::new();
-    for chunk in chunks {
+    for (source_index, chunk) in chunks.into_iter().enumerate() {
         let parts: Vec<String> = splitter.chunks(&chunk.content).map(String::from).collect();
         let parts = if parts.is_empty() {
             vec![chunk.content.clone()]
         } else {
             parts
         };
-        let mut local_idx = 0i64;
         for sub in parts {
             for piece in ingestion::types::hard_split_chars(&sub, MAX_CHUNK_CHARS) {
                 let mut child = chunk.clone();
                 child.id = Uuid::new_v4().to_string();
                 child.content = piece;
-                child.chunk_index = chunk.chunk_index + local_idx;
-                local_idx += 1;
+                // Python assigns indexes after splitting every source document.
+                child.chunk_index = out.len() as i64;
                 out.push(child);
             }
+        }
+        // Avoid one database/event write per PDF page while preserving useful
+        // visibility for very large documents.
+        let completed = source_index + 1;
+        if completed == total || completed % 100 == 0 {
+            report(ChunkingProgress {
+                completed,
+                total,
+                output_chunks: out.len(),
+            });
         }
     }
     out
@@ -1255,6 +1392,19 @@ mod tests {
     }
 
     #[test]
+    fn chunking_progress_stays_within_its_reserved_band() {
+        let updates = [
+            chunking_progress_percent(7, 10, 1, 4),
+            chunking_progress_percent(7, 10, 2, 4),
+            chunking_progress_percent(7, 10, 3, 4),
+            chunking_progress_percent(7, 10, 4, 4),
+        ];
+        assert_eq!(updates.last(), Some(&10));
+        assert!(updates.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert!(updates.iter().all(|pct| (7..=10).contains(pct)));
+    }
+
+    #[test]
     fn zip_file_progress_bounds_cover_post_extract_band() {
         let (s0, e0) = zip_file_progress_bounds(0, 4);
         let (s3, e3) = zip_file_progress_bounds(3, 4);
@@ -1305,6 +1455,32 @@ mod tests {
         );
         let total: usize = split.iter().map(|c| c.content.len()).sum();
         assert!(total >= 900_000 - 100, "lost content during split: {total}");
+        assert!(
+            split
+                .iter()
+                .enumerate()
+                .all(|(index, chunk)| chunk.chunk_index == index as i64),
+            "split chunks must have globally sequential indexes"
+        );
+    }
+
+    #[test]
+    fn split_document_chunks_keeps_page_metadata() {
+        let Some(splitter) = test_doc_splitter() else {
+            eprintln!("skipping: arctic tokenizer not present");
+            return;
+        };
+        let mut first = ingestion::DocumentChunk::new("id1", "guide.pdf", "first page", "pdf", 0);
+        first.page = Some(0);
+        let mut second = ingestion::DocumentChunk::new("id2", "guide.pdf", "second page", "pdf", 1);
+        second.page = Some(1);
+
+        let split = split_document_chunks(vec![first, second], &splitter);
+        assert_eq!(split.len(), 2);
+        assert_eq!(split[0].page, Some(0));
+        assert_eq!(split[1].page, Some(1));
+        assert_eq!(split[0].chunk_index, 0);
+        assert_eq!(split[1].chunk_index, 1);
     }
 
     #[test]

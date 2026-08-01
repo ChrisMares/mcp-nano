@@ -66,7 +66,11 @@ fn one_chunk(file_name: &str, doc_type: &str, content: String) -> Vec<DocumentCh
     if content.trim().is_empty() {
         return Vec::new();
     }
-    vec![DocumentChunk::new(uuid::Uuid::new_v4().to_string(), file_name, content, doc_type, 0)]
+    let mut chunk = DocumentChunk::new(uuid::Uuid::new_v4().to_string(), file_name, content, doc_type, 0);
+    chunk
+        .metadata
+        .insert("source".into(), Value::String(file_name.to_string()));
+    vec![chunk]
 }
 
 fn load_text(path: &Path, file_name: &str, doc_type: &str) -> anyhow::Result<Vec<DocumentChunk>> {
@@ -94,6 +98,7 @@ fn load_csv(path: &Path, file_name: &str) -> anyhow::Result<Vec<DocumentChunk>> 
             .collect();
         let content = format!("row {}: \n{}", idx + 1, lines.join("\n"));
         let mut chunk = DocumentChunk::new(uuid::Uuid::new_v4().to_string(), file_name, content, "csv", idx);
+        chunk.metadata.insert("source".into(), Value::String(file_name.to_string()));
         chunk.metadata.insert("row".into(), Value::Number((idx + 1).into()));
         chunks.push(chunk);
         idx += 1;
@@ -244,7 +249,8 @@ fn load_spreadsheet(path: &Path, file_name: &str, doc_type: &str) -> anyhow::Res
         }
         if !rendered.trim().is_empty() {
             let mut chunk = DocumentChunk::new(uuid::Uuid::new_v4().to_string(), file_name, rendered, doc_type, idx);
-            chunk.metadata.insert("sheet".into(), Value::String(sheet_name.clone()));
+            chunk.metadata.insert("source".into(), Value::String(file_name.to_string()));
+            chunk.metadata.insert("sheet_name".into(), Value::String(sheet_name.clone()));
             chunks.push(chunk);
             idx += 1;
         }
@@ -254,13 +260,59 @@ fn load_spreadsheet(path: &Path, file_name: &str, doc_type: &str) -> anyhow::Res
 
 fn load_pdf(path: &Path, file_name: &str) -> anyhow::Result<Vec<DocumentChunk>> {
     if let Some(text) = try_pdftotext(path) {
-        return Ok(one_chunk(file_name, "pdf", text));
+        let chunks = pdf_page_chunks(file_name, text.split('\x0c').map(str::to_string));
+        tracing::info!(
+            "pdf extraction complete path={} extractor=pdftotext pages={} chars={}",
+            path.display(),
+            chunks.len(),
+            chunks.iter().map(|chunk| chunk.content.len()).sum::<usize>()
+        );
+        return Ok(chunks);
     }
 
     let bytes = std::fs::read(path)?;
     let pages = extract_pdf_pages_fallback(&bytes)?;
-    let text = pages.join("\n\n");
-    Ok(one_chunk(file_name, "pdf", text))
+    let chunks = pdf_numbered_page_chunks(file_name, pages);
+    tracing::info!(
+        "pdf extraction complete path={} extractor=pdf-extract pages={} chars={}",
+        path.display(),
+        chunks.len(),
+        chunks.iter().map(|chunk| chunk.content.len()).sum::<usize>()
+    );
+    Ok(chunks)
+}
+
+/// Match PyPDFLoader: each non-empty PDF page becomes its own source document
+/// and carries a zero-based page index through subsequent token splitting.
+fn pdf_page_chunks(
+    file_name: &str,
+    pages: impl IntoIterator<Item = String>,
+) -> Vec<DocumentChunk> {
+    pdf_numbered_page_chunks(file_name, pages.into_iter().enumerate())
+}
+
+fn pdf_numbered_page_chunks(
+    file_name: &str,
+    pages: impl IntoIterator<Item = (usize, String)>,
+) -> Vec<DocumentChunk> {
+    pages
+        .into_iter()
+        .filter_map(|(page, content)| {
+            if content.trim().is_empty() {
+                return None;
+            }
+            let mut chunk = DocumentChunk::new(
+                uuid::Uuid::new_v4().to_string(),
+                file_name,
+                content,
+                "pdf",
+                page as i64,
+            );
+            chunk.page = Some(page as i64);
+            chunk.metadata.insert("source".into(), Value::String(file_name.to_string()));
+            Some(chunk)
+        })
+        .collect()
 }
 
 fn try_pdftotext(path: &Path) -> Option<String> {
@@ -283,7 +335,7 @@ fn try_pdftotext(path: &Path) -> Option<String> {
     }
 }
 
-fn extract_pdf_pages_fallback(bytes: &[u8]) -> anyhow::Result<Vec<String>> {
+fn extract_pdf_pages_fallback(bytes: &[u8]) -> anyhow::Result<Vec<(usize, String)>> {
     let doc = catch_panic(|| {
         let mut doc = pdf_extract::Document::load_mem(bytes)?;
         if doc.is_encrypted() {
@@ -315,7 +367,11 @@ fn extract_pdf_pages_fallback(bytes: &[u8]) -> anyhow::Result<Vec<String>> {
             Ok::<String, pdf_extract::OutputError>(s)
         }));
         match page_result {
-            Ok(Ok(text)) if !text.trim().is_empty() => pages.push(text),
+            // pdf-extract page numbers are one-based; match PyPDFLoader's
+            // zero-based page metadata even when preceding pages are blank.
+            Ok(Ok(text)) if !text.trim().is_empty() => {
+                pages.push((page_num.saturating_sub(1) as usize, text))
+            }
             Ok(Ok(_)) => {}
             Ok(Err(_)) | Err(_) => failures += 1,
         }
@@ -364,6 +420,7 @@ mod tests {
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].content, "hello world");
         assert_eq!(chunks[0].doc_type, "txt");
+        assert_eq!(chunks[0].metadata.get("source").and_then(Value::as_str), Some("foo.txt"));
     }
 
     #[test]
@@ -376,6 +433,7 @@ mod tests {
         assert!(chunks[0].content.contains("Alice"));
         assert!(chunks[1].content.contains("Bob"));
         assert_eq!(chunks[0].doc_type, "csv");
+        assert_eq!(chunks[0].metadata.get("source").and_then(Value::as_str), Some("data.csv"));
     }
 
     #[test]
@@ -406,5 +464,19 @@ mod tests {
         std::fs::write(&path, b"%PDF-1.4 not a real pdf").unwrap();
         let result = load_document(&path);
         assert!(result.is_err(), "expected error, got {result:?}");
+    }
+
+    #[test]
+    fn pdf_page_chunks_preserve_zero_based_page_metadata() {
+        let chunks = pdf_page_chunks(
+            "guide.pdf",
+            ["first page".to_string(), "".to_string(), "third page".to_string()],
+        );
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].page, Some(0));
+        assert_eq!(chunks[0].metadata.get("source").and_then(Value::as_str), Some("guide.pdf"));
+        assert_eq!(chunks[0].chunk_index, 0);
+        assert_eq!(chunks[1].page, Some(2));
+        assert_eq!(chunks[1].chunk_index, 2);
     }
 }

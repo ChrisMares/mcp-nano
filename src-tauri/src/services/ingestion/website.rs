@@ -21,6 +21,8 @@ use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::{Map, Value};
+use text_splitter::TextSplitter;
+use tokenizers::Tokenizer;
 use url::Url;
 
 use super::types::DocumentChunk;
@@ -432,6 +434,9 @@ pub fn scrape_html(html: &str) -> (String, Vec<WebSection>) {
     let mut raw: Vec<RawSection> = Vec::new();
 
     for elem in container.select(&combined_sel) {
+        if is_in_noise(&elem) || has_selected_text_descendant(&elem, &combined_sel) {
+            continue;
+        }
         let tag = elem.value().name();
         if tag == "h1" {
             current_h1 = elem.text().collect::<String>().trim().to_string();
@@ -451,7 +456,7 @@ pub fn scrape_html(html: &str) -> (String, Vec<WebSection>) {
 
         if tag == "pre" {
             let raw_text: String = elem.text().collect();
-            let language = detect_code_language(elem.value());
+            let language = detect_code_language(&elem);
             last.code_blocks.push((raw_text, language));
             continue;
         }
@@ -529,15 +534,35 @@ impl RawSection {
     }
 }
 
-fn detect_code_language(elem: &scraper::node::Element) -> String {
-    // The common convention is `language-*` on <pre>; nested <code> classes
-    // aren't reachable from `scraper::node::Element`, so we accept that
-    // limitation.
+fn is_in_noise(elem: &scraper::ElementRef<'_>) -> bool {
+    let mut current = Some(*elem);
+    while let Some(node) = current {
+        if matches!(node.value().name(), "script" | "style" | "nav" | "footer" | "header" | "aside") {
+            return true;
+        }
+        current = node.parent().and_then(scraper::ElementRef::wrap);
+    }
+    false
+}
+
+fn has_selected_text_descendant(elem: &scraper::ElementRef<'_>, selector: &scraper::Selector) -> bool {
+    elem.select(selector).any(|child| child.id() != elem.id())
+}
+
+fn language_from_element(elem: &scraper::node::Element) -> Option<String> {
     elem.attr("class")
         .unwrap_or("")
         .split_whitespace()
         .find_map(|c| c.strip_prefix("language-").map(str::to_string))
-        .unwrap_or_default()
+}
+
+fn detect_code_language(elem: &scraper::ElementRef<'_>) -> String {
+    language_from_element(elem.value()).or_else(|| {
+        scraper::Selector::parse("code")
+            .ok()
+            .and_then(|selector| elem.select(&selector).next())
+            .and_then(|code| language_from_element(code.value()))
+    }).unwrap_or_default()
 }
 
 /// Build a `website_key` JSON serialization used in the DocumentChunk
@@ -572,6 +597,16 @@ pub fn merge_small_chunks(chunks: Vec<String>, min_tokens: usize) -> Vec<String>
 /// produces prose + code chunks with prev/next id linkage.
 /// Direct port of `process_website`.
 pub async fn process_website(urls: &[String], metadata: &Map<String, Value>) -> anyhow::Result<Vec<DocumentChunk>> {
+    process_website_with_splitter(urls, metadata, None).await
+}
+
+/// Production website path. Uses the same tokenizer-backed splitter as local
+/// documents, matching the Python TokenTextSplitter behavior.
+pub async fn process_website_with_splitter(
+    urls: &[String],
+    metadata: &Map<String, Value>,
+    splitter: Option<&TextSplitter<Tokenizer>>,
+) -> anyhow::Result<Vec<DocumentChunk>> {
     let chunk_size: usize = std::env::var("DOC_CHUNK_SIZE")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -636,9 +671,9 @@ pub async fn process_website(urls: &[String], metadata: &Map<String, Value>) -> 
             .collect::<Vec<_>>()
             .join("\n");
 
-        // Approximate a token splitter using whitespace split for the prose;
-        // the real text-splitter is a per-invocation dependency.
-        let prose_docs = simple_chunk(&full_page_text, chunk_size, chunk_overlap);
+        let prose_docs = splitter
+            .map(|splitter| splitter.chunks(&full_page_text).map(str::to_string).collect())
+            .unwrap_or_else(|| simple_chunk(&full_page_text, chunk_size, chunk_overlap));
         let prose_docs = if prose_docs.len() > 1 {
             merge_small_chunks(prose_docs, MERGE_MIN_TOKENS)
         } else {
@@ -782,6 +817,23 @@ fn simple_chunk(text: &str, chunk_size: usize, _chunk_overlap: usize) -> Vec<Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scrape_html_excludes_noise_and_does_not_duplicate_nested_text() {
+        let html = r#"<html><head><title>Guide</title></head><body>
+            <header><p>header noise</p></header><nav><p>nav noise</p></nav>
+            <main><h1>Guide</h1><ul><li><p>keep once</p></li></ul>
+            <pre><code class="language-python">print('hello')</code></pre></main>
+            <footer><p>footer noise</p></footer></body></html>"#;
+        let (_, sections) = scrape_html(html);
+        let content = sections.iter().map(|section| section.content.as_str()).collect::<String>();
+        assert!(content.contains("keep once"));
+        assert_eq!(content.matches("keep once").count(), 1);
+        assert!(!content.contains("header noise"));
+        assert!(!content.contains("nav noise"));
+        assert!(!content.contains("footer noise"));
+        assert_eq!(sections[0].code_blocks[0].language, "python");
+    }
 
     #[test]
     fn normalize_url_joins_relative_against_directory_base() {

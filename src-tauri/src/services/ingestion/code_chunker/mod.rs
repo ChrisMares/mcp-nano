@@ -302,7 +302,8 @@ fn decode_utf16(bytes: &[u8], little_endian: bool) -> String {
 pub fn code_chunks_to_document_chunks(code_chunks: Vec<CodeChunk>) -> Vec<DocumentChunk> {
     code_chunks
         .into_iter()
-        .map(|cc| {
+        .enumerate()
+        .map(|(chunk_index, cc)| {
             let metadata = cc.chunk_metadata();
             let ext = Path::new(&cc.file_name)
                 .extension()
@@ -314,7 +315,7 @@ pub fn code_chunks_to_document_chunks(code_chunks: Vec<CodeChunk>) -> Vec<Docume
                 file_name: cc.file_name.clone(),
                 content: cc.code.clone(),
                 doc_type: ext,
-                chunk_index: 0,
+                chunk_index: chunk_index as i64,
                 page: None,
                 metadata,
                 created_at: cc.created_at.clone(),
@@ -387,5 +388,16 @@ mod tests {
         assert_eq!(language_for_extension("sql"), Some(Language::Sql));
         assert_eq!(language_for_extension("java"), Some(Language::Java));
         assert_eq!(language_for_extension("nope"), None);
+    }
+
+    #[test]
+    fn code_documents_have_sequential_chunk_indexes() {
+        let chunks = vec![
+            CodeChunk::generic("one", "repo", "file.txt", "first"),
+            CodeChunk::generic("two", "repo", "file.txt", "second"),
+        ];
+        let documents = code_chunks_to_document_chunks(chunks);
+        assert_eq!(documents[0].chunk_index, 0);
+        assert_eq!(documents[1].chunk_index, 1);
     }
 }
