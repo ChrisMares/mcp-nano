@@ -14,6 +14,7 @@ import McpCreate from "./pages/McpCreate";
 import McpManage from "./pages/McpManage";
 import McpConnect from "./pages/McpConnect";
 import Dashboard from "./pages/Dashboard";
+import Settings from "./pages/Settings";
 
 function App() {
   return (
@@ -24,6 +25,7 @@ function App() {
             <Route element={<AppLayout />}>
               <Route path="/" element={<Navigate to="/dashboard" replace />} />
               <Route path="/dashboard" element={<Dashboard />} />
+              <Route path="/settings" element={<Settings />} />
               <Route path="/embed/upload" element={<UploadFiles />} />
               <Route path="/embed/data" element={<DataManagement />} />
               <Route path="/query/fetch" element={<FetchContext />} />

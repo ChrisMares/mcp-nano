@@ -9,7 +9,7 @@ pub struct DbState {
     pub pool: SqlitePool,
 }
 
-fn db_path(app: &AppHandle) -> Result<PathBuf, String> {
+pub fn db_path(app: &AppHandle) -> Result<PathBuf, String> {
     let data_dir = app
         .path()
         .app_local_data_dir()

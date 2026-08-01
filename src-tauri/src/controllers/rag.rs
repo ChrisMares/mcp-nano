@@ -34,6 +34,17 @@ pub async fn get_backend_status(app: AppHandle) -> Result<BackendStatusResponse,
                 db_ready: guard.db_ready,
                 embedders_ready: guard.embedders_ready,
                 embedding_device: guard.embedding_device.clone(),
+                model_statuses: guard.model_statuses.clone(),
+                qdrant_storage_path: crate::qdrant::storage_path(&app)
+                    .ok()
+                    .map(|path| path.display().to_string()),
+                sqlite_path: crate::db::db_path(&app)
+                    .ok()
+                    .map(|path| path.display().to_string()),
+                logs_path: crate::log_directory(&app)
+                    .ok()
+                    .map(|path| path.display().to_string()),
+                logs_size_bytes: crate::log_size_bytes(&app),
                 worker_ready: guard.worker_ready,
             });
         }
@@ -48,6 +59,20 @@ pub async fn get_backend_status(app: AppHandle) -> Result<BackendStatusResponse,
         embedding_device: app
             .try_state::<Arc<EmbedderState>>()
             .map(|state| state.device_mode().to_string()),
+        model_statuses: app
+            .try_state::<Arc<EmbedderState>>()
+            .map(|state| state.model_statuses())
+            .unwrap_or_default(),
+        qdrant_storage_path: crate::qdrant::storage_path(&app)
+            .ok()
+            .map(|path| path.display().to_string()),
+        sqlite_path: crate::db::db_path(&app)
+            .ok()
+            .map(|path| path.display().to_string()),
+        logs_path: crate::log_directory(&app)
+            .ok()
+            .map(|path| path.display().to_string()),
+        logs_size_bytes: crate::log_size_bytes(&app),
         worker_ready: app.try_state::<Arc<RagService>>().is_some(),
     })
 }

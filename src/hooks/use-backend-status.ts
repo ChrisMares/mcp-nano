@@ -10,6 +10,11 @@ const unreachableStatus: BackendStatus = {
   db_ready: false,
   embedders_ready: false,
   embedding_device: null,
+  model_statuses: [],
+  qdrant_storage_path: null,
+  sqlite_path: null,
+  logs_path: null,
+  logs_size_bytes: null,
   worker_ready: false,
 };
 

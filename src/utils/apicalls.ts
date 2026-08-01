@@ -66,7 +66,19 @@ export interface BackendStatus {
   db_ready: boolean;
   embedders_ready: boolean;
   embedding_device: string | null;
+  model_statuses: ModelStatus[];
+  qdrant_storage_path: string | null;
+  sqlite_path: string | null;
+  logs_path: string | null;
+  logs_size_bytes: number | null;
   worker_ready: boolean;
+}
+
+export interface ModelStatus {
+  role: string;
+  model: string;
+  device: string;
+  cpu_reason: string | null;
 }
 
 export async function getBackendStatus(): Promise<BackendStatus> {

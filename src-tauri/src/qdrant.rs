@@ -17,6 +17,7 @@ use qdrant_client::qdrant::{
 use qdrant_client::Qdrant;
 use tauri::{AppHandle, Emitter, Manager};
 use tracing::{error, info, warn};
+use crate::models::response::ModelStatusResponse;
 
 /// Schema stamp: bump when on-disk Qdrant/SQLite layout is incompatible.
 /// Missing or mismatched stamp triggers a full local data wipe.
@@ -35,6 +36,7 @@ pub struct BackendStatus {
     pub db_ready: bool,
     pub embedders_ready: bool,
     pub embedding_device: Option<String>,
+    pub model_statuses: Vec<ModelStatusResponse>,
     pub worker_ready: bool,
 }
 
@@ -48,6 +50,7 @@ impl Default for BackendStatus {
             db_ready: false,
             embedders_ready: false,
             embedding_device: None,
+            model_statuses: Vec::new(),
             worker_ready: false,
         }
     }
@@ -134,7 +137,7 @@ fn data_dir(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
-fn storage_path(app: &AppHandle) -> Result<PathBuf, String> {
+pub fn storage_path(app: &AppHandle) -> Result<PathBuf, String> {
     let storage = data_dir(app)?.join("qdrant");
     fs::create_dir_all(&storage)
         .map_err(|error| format!("failed to create Qdrant storage directory: {error}"))?;

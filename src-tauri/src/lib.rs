@@ -28,6 +28,25 @@ pub fn log_dir() -> Option<&'static std::path::PathBuf> {
     LOG_DIR.get()
 }
 
+pub fn log_directory(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    app.path()
+        .app_local_data_dir()
+        .map(|path| path.join("logs"))
+        .map_err(|error| format!("failed to resolve log directory: {error}"))
+}
+
+pub fn log_size_bytes(app: &tauri::AppHandle) -> Option<u64> {
+    let entries = std::fs::read_dir(log_directory(app).ok()?).ok()?;
+    Some(
+        entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.metadata().ok())
+        .filter(|metadata| metadata.is_file())
+        .map(|metadata| metadata.len())
+        .sum(),
+    )
+}
+
 /// Write a single-line breadcrumb that survives panics (flushed). Overwrites
 /// `logs/ingest-current.txt` so the last in-flight stage is always visible.
 pub fn write_ingest_breadcrumb(stage: &str, detail: &str) {
@@ -317,11 +336,13 @@ pub fn run() {
                 Ok(dir) => match EmbedderState::load(&dir) {
                     Ok(state) => {
                         let device_mode = state.device_mode().to_string();
+                        let model_statuses = state.model_statuses();
                         info!("Embedder models loaded from {} using {device_mode}", dir.display());
                         app.manage(Arc::new(state));
                         qdrant::publish_status(app.handle(), |s| {
                             s.embedders_ready = true;
                             s.embedding_device = Some(device_mode);
+                            s.model_statuses = model_statuses;
                         });
                     }
                     Err(error) => {

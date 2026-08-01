@@ -56,7 +56,6 @@ const EmbeddingDeviceBadge: React.FC = () => {
                 : "bg-muted-foreground"
         }`}
       />
-      <span className="hidden sm:inline">Embed</span>
       <span className="font-semibold">{label}</span>
     </span>
   );

@@ -26,4 +26,11 @@ describe('UserDropdown', () => {
     expect(item.closest('a')).toBeNull()
     expect(item.closest('[aria-disabled="true"]')).not.toBeNull()
   })
+
+  it('links to settings', async () => {
+    const user = userEvent.setup()
+    renderWithProviders(<UserDropdown />)
+    await user.click(screen.getByText('Local'))
+    expect(screen.getByRole('link', { name: 'Settings' })).toHaveAttribute('href', '/settings')
+  })
 })
