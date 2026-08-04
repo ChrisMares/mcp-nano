@@ -1,7 +1,7 @@
 import React, { useState, useMemo, useEffect, useCallback } from "react";
-import { Globe, RefreshCw, AlertTriangle, CheckCircle, Loader2, ChevronDown, ChevronRight, ChevronsDownUp, ChevronsUpDown } from "lucide-react";
+import { Globe, RefreshCw, AlertTriangle, Loader2, ChevronDown, ChevronRight, ChevronsDownUp, ChevronsUpDown } from "lucide-react";
 import { btnPrimary, btnSecondary } from "@/styles/classes";
-import type { EmbedJob, UrlTreeNode } from "@/types/embed";
+import type { UrlTreeNode } from "@/types/embed";
 import PathTreeList from "@/components/uploadfiles/PathTreeList";
 
 interface UrlGroup {
@@ -14,10 +14,7 @@ interface Props {
   websiteUrl: string;
   crawledUrls: string[];
   crawlError: boolean;
-  groupName: string;
   embedJobId: string | null;
-  activeJobs: EmbedJob[];
-  completedJobs: EmbedJob[];
   onEmbed: (urls: string[]) => void;
   onStartAnother: () => void;
 }
@@ -113,8 +110,7 @@ function findNode(nodes: UrlTreeNode[], fullPath: string): UrlTreeNode | null {
 }
 
 const WebsiteProcessingStep: React.FC<Props> = ({
-  websiteUrl, crawledUrls, crawlError, groupName,
-  embedJobId, activeJobs, completedJobs,
+  websiteUrl, crawledUrls, crawlError, embedJobId,
   onEmbed, onStartAnother,
 }) => {
   const [checked, setChecked] = useState<Set<string>>(new Set());
@@ -203,14 +199,6 @@ const WebsiteProcessingStep: React.FC<Props> = ({
 
   const expandAllPaths = useCallback(() => setCollapsedPaths(new Set()), []);
   const collapseAllPaths = useCallback(() => setCollapsedPaths(new Set(allBranchPaths)), [allBranchPaths]);
-
-  const embedJob = useMemo(() => {
-    if (!embedJobId) return null;
-    return activeJobs.find(j => j.job_id === embedJobId) ?? completedJobs.find(j => j.job_id === embedJobId) ?? null;
-  }, [embedJobId, activeJobs, completedJobs]);
-
-  const isEmbedding = !!embedJobId && !!embedJob && embedJob.progress_percentage < 100;
-  const isEmbedDone = !!embedJobId && !!embedJob && embedJob.progress_percentage >= 100 && embedJob.status === "COMPLETED";
 
   if (!embedJobId) {
     return (
@@ -350,41 +338,9 @@ const WebsiteProcessingStep: React.FC<Props> = ({
         <h2 className="text-lg font-semibold text-foreground">Embedding Website</h2>
       </div>
 
-      {isEmbedding && (
-        <>
-          <p className="text-sm text-muted-foreground mb-4">
-            Embedding {totalChecked} page{totalChecked !== 1 && "s"} into group <span className="font-medium text-foreground">{groupName}</span>.
-          </p>
-          <div className="rounded-lg border border-border bg-muted/30 p-4 mb-4">
-            <div className="w-full bg-muted rounded-full h-3 overflow-hidden">
-              <div
-                className="bg-primary h-full rounded-full transition-[width] duration-300"
-                style={{ width: `${embedJob?.progress_percentage ?? 0}%` }}
-              />
-            </div>
-            <p className="text-xs text-muted-foreground mt-2 text-center">
-              {embedJob?.progress_percentage ?? 0}%
-            </p>
-          </div>
-        </>
-      )}
-
-      {isEmbedDone && (
-        <div className="rounded-lg border border-border bg-success/5 p-4 mb-6 space-y-2 text-sm">
-          <div className="flex items-center gap-2 text-success">
-            <CheckCircle size={18} />
-            <span className="font-semibold">Embedding complete</span>
-          </div>
-          <p className="text-muted-foreground">
-            {totalChecked} page{totalChecked !== 1 && "s"} embedded into group{" "}
-            <span className="font-medium text-foreground">{groupName}</span>.
-          </p>
-        </div>
-      )}
-
-      {!isEmbedding && !isEmbedDone && (
-        <p className="text-sm text-muted-foreground mb-4">Waiting for embedding to start...</p>
-      )}
+      <p className="text-sm text-muted-foreground mb-4">
+        Embedding {totalChecked} page{totalChecked !== 1 && "s"}. Progress is shown below.
+      </p>
 
       <button onClick={onStartAnother} className={btnPrimary}>
         <RefreshCw size={16} /> Start Another

@@ -3243,7 +3243,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-nano"
-version = "0.1.4"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "axum 0.8.9",

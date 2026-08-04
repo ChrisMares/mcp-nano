@@ -49,24 +49,77 @@ const MIN_ANCHOR_LEN: usize = 4;
 /// Domains that social sharing / analytics / app-store pages live on which
 /// we refuse to crawl. Direct port of `IGNORED_DOMAINS`.
 const IGNORED_DOMAINS: &[&str] = &[
-    "facebook.com", "fb.com", "instagram.com", "threads.net", "twitter.com",
-    "x.com", "t.co", "linkedin.com", "youtube.com", "youtu.be", "tiktok.com",
-    "reddit.com", "redd.it", "snapchat.com", "pinterest.com", "pin.it",
-    "tumblr.com", "twitch.tv", "discord.com", "discord.gg", "telegram.org",
-    "t.me", "whatsapp.com", "wa.me", "weibo.com", "vk.com", "mail.google.com",
-    "gmail.com", "outlook.live.com", "outlook.com", "mail.yahoo.com",
-    "protonmail.com", "proton.me", "zendesk.com", "freshdesk.com",
-    "freshservice.com", "helpscout.net", "helpscoutdocs.com", "intercom.com",
-    "intercom.io", "statuspage.io", "atlassian.net", "google-analytics.com",
-    "googletagmanager.com", "doubleclick.net", "facebook.net", "hotjar.com",
-    "clarity.ms", "apps.apple.com", "play.google.com", "addthis.com",
-    "sharethis.com", "disqus.com",
+    "facebook.com",
+    "fb.com",
+    "instagram.com",
+    "threads.net",
+    "twitter.com",
+    "x.com",
+    "t.co",
+    "linkedin.com",
+    "youtube.com",
+    "youtu.be",
+    "tiktok.com",
+    "reddit.com",
+    "redd.it",
+    "snapchat.com",
+    "pinterest.com",
+    "pin.it",
+    "tumblr.com",
+    "twitch.tv",
+    "discord.com",
+    "discord.gg",
+    "telegram.org",
+    "t.me",
+    "whatsapp.com",
+    "wa.me",
+    "weibo.com",
+    "vk.com",
+    "mail.google.com",
+    "gmail.com",
+    "outlook.live.com",
+    "outlook.com",
+    "mail.yahoo.com",
+    "protonmail.com",
+    "proton.me",
+    "zendesk.com",
+    "freshdesk.com",
+    "freshservice.com",
+    "helpscout.net",
+    "helpscoutdocs.com",
+    "intercom.com",
+    "intercom.io",
+    "statuspage.io",
+    "atlassian.net",
+    "google-analytics.com",
+    "googletagmanager.com",
+    "doubleclick.net",
+    "facebook.net",
+    "hotjar.com",
+    "clarity.ms",
+    "apps.apple.com",
+    "play.google.com",
+    "addthis.com",
+    "sharethis.com",
+    "disqus.com",
 ];
 
 /// Tag names that emit a leaf text section.
 const LEAF_TEXT_TAGS: &[&str] = &[
-    "p", "li", "h3", "h4", "h5", "h6", "td", "th", "blockquote", "figcaption",
-    "dd", "dt", "caption", "summary",
+    "p",
+    "li",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "td",
+    "th",
+    "blockquote",
+    "figcaption",
+    "dd",
+    "dt",
+    "caption",
+    "summary",
 ];
 
 /// Maximum pages crawled in a single `crawl_website` call. Mirrors Python
@@ -83,9 +136,7 @@ fn headers() -> reqwest::header::HeaderMap {
     let mut map = reqwest::header::HeaderMap::new();
     let _ = map.insert(
         reqwest::header::USER_AGENT,
-        reqwest::header::HeaderValue::from_static(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        ),
+        reqwest::header::HeaderValue::from_static("Mozilla/5.0 (Windows NT 10.0; Win64; x64)"),
     );
     map
 }
@@ -120,28 +171,104 @@ fn canonical_url(url: &Url) -> String {
     s
 }
 
-/// True when the last path segment looks like a file (`name.ext`).
-fn path_looks_like_file(url: &Url) -> bool {
-    let path = url.path();
-    let last = path.rsplit('/').next().unwrap_or("");
-    !last.is_empty() && last.contains('.')
+/// URL string used for the actual HTTP GET.
+///
+/// Preserve the discovered path exactly. Adding a slash to every path that
+/// does not look like a file turns extensionless pages such as
+/// `/get-started-installation` into a different URL, which some static sites
+/// return as 404. `response.url()` remains the authoritative base for joins.
+fn fetch_url_string(url: &Url) -> String {
+    url.to_string()
 }
 
-/// URL string used for the actual HTTP GET. Directory-like paths keep a
-/// trailing slash so relative joins on the response and strict static
-/// servers (`/docs/` only) both work.
-fn fetch_url_string(url: &Url) -> String {
-    if path_looks_like_file(url) || url.path().ends_with('/') {
-        return url.to_string();
+/// Return the conventional sitemap location for a site. Sitemap discovery is
+/// deliberately independent from robots.txt so crawls do not need to fetch it.
+fn sitemap_url(start: &Url) -> Url {
+    let mut sitemap = start.clone();
+    sitemap.set_path("/sitemap.xml");
+    sitemap.set_query(None);
+    sitemap.set_fragment(None);
+    sitemap
+}
+
+/// Parse a sitemap URL set or sitemap index, returning whether its locations
+/// refer to nested sitemaps and the contained URLs.
+fn parse_sitemap(xml: &[u8]) -> Option<(bool, Vec<String>)> {
+    use quick_xml::events::Event;
+    use quick_xml::Reader;
+
+    let mut reader = Reader::from_reader(xml);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    let mut is_index = false;
+    let mut in_loc = false;
+    let mut locations = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(event)) => match event.local_name().as_ref() {
+                b"sitemapindex" => is_index = true,
+                b"loc" => in_loc = true,
+                _ => {}
+            },
+            Ok(Event::Text(event)) if in_loc => {
+                if let Ok(location) = event.decode() {
+                    let location = location.trim();
+                    if !location.is_empty() {
+                        locations.push(location.to_string());
+                    }
+                }
+            }
+            Ok(Event::End(event)) if event.local_name().as_ref() == b"loc" => in_loc = false,
+            Ok(Event::Eof) => break,
+            Err(_) => return None,
+            _ => {}
+        }
+        buf.clear();
     }
-    let mut u = url.clone();
-    let path = u.path().to_string();
-    if path.is_empty() {
-        u.set_path("/");
-    } else {
-        u.set_path(&format!("{path}/"));
+
+    (!locations.is_empty()).then_some((is_index, locations))
+}
+
+async fn discover_sitemap_urls(client: &reqwest::Client, start: &Url) -> Vec<String> {
+    const MAX_SITEMAPS: usize = 20;
+
+    let base_domain = start.host_str().unwrap_or_default().to_lowercase();
+    let mut pending = VecDeque::from([sitemap_url(start)]);
+    let mut seen_sitemaps = HashSet::new();
+    let mut urls = Vec::new();
+
+    while let Some(sitemap) = pending.pop_front() {
+        let sitemap_key = canonical_url(&sitemap);
+        if !seen_sitemaps.insert(sitemap_key) || seen_sitemaps.len() > MAX_SITEMAPS {
+            continue;
+        }
+        let Ok(response) = client.get(sitemap).send().await else {
+            continue;
+        };
+        if !response.status().is_success() {
+            continue;
+        }
+        let Ok(body) = response.bytes().await else {
+            continue;
+        };
+        let Some((is_index, locations)) = parse_sitemap(&body) else {
+            continue;
+        };
+        if is_index {
+            for location in locations {
+                if let Ok(sitemap) = Url::parse(&location) {
+                    if same_domain(&sitemap, &base_domain) {
+                        pending.push_back(sitemap);
+                    }
+                }
+            }
+        } else {
+            urls.extend(locations);
+        }
     }
-    u.to_string()
+
+    urls
 }
 
 /// Turn a user-entered website address into an absolute HTTP URL.
@@ -172,7 +299,7 @@ pub fn normalize_website_url(raw: &str) -> anyhow::Result<String> {
     Ok(parsed.to_string())
 }
 
-/// Resolve `href` against the document base URL, then canonicalize.
+/// Resolve `href` against the document base URL and remove its fragment.
 ///
 /// Important: `base` must be the document URL *as the browser sees it*
 /// (typically `response.url()` after redirects, which preserves a trailing
@@ -180,11 +307,12 @@ pub fn normalize_website_url(raw: &str) -> anyhow::Result<String> {
 /// against `https://example.com/api` (no slash) incorrectly yields
 /// `https://example.com/symbols/X.html` per URL RFC 3986.
 pub fn normalize_url(href: &str, base: &Url) -> Option<String> {
-    let joined = base.join(href).ok()?;
+    let mut joined = base.join(href).ok()?;
     if !matches!(joined.scheme(), "http" | "https") {
         return None;
     }
-    Some(canonical_url(&joined))
+    joined.set_fragment(None);
+    Some(joined.to_string())
 }
 
 /// BFS-crawl a website starting from `start_url`, returning the list of
@@ -216,6 +344,8 @@ pub async fn crawl_website(
         .build()?;
     let max_pages = max_pages();
 
+    let sitemap_urls = discover_sitemap_urls(&client, &start).await;
+
     let visited: std::sync::Arc<tokio::sync::Mutex<HashSet<String>>> =
         std::sync::Arc::new(tokio::sync::Mutex::new(HashSet::new()));
     let seen: std::sync::Arc<tokio::sync::Mutex<HashSet<String>>> =
@@ -224,9 +354,28 @@ pub async fn crawl_website(
         std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
 
     // Queue stores the fetch URL string (directory paths keep trailing slash) + depth.
-    let queue: std::sync::Arc<tokio::sync::Mutex<VecDeque<(String, usize)>>> = std::sync::Arc::new(
-        tokio::sync::Mutex::new(VecDeque::from([(fetch_url_string(&start), 0)])),
-    );
+    let mut initial_queue = VecDeque::from([(fetch_url_string(&start), 0)]);
+    {
+        let mut s = seen.lock().await;
+        for sitemap_url in sitemap_urls {
+            let Some(url) = normalize_url(&sitemap_url, &start) else {
+                continue;
+            };
+            let Ok(parsed) = Url::parse(&url) else {
+                continue;
+            };
+            let host = parsed.host_str().unwrap_or("").to_lowercase();
+            if is_ignored_domain(&host) || (same_domain_only && !same_domain(&parsed, &base_domain))
+            {
+                continue;
+            }
+            if s.insert(url.clone()) {
+                initial_queue.push_back((fetch_url_string(&parsed), 0));
+            }
+        }
+    }
+    let queue: std::sync::Arc<tokio::sync::Mutex<VecDeque<(String, usize)>>> =
+        std::sync::Arc::new(tokio::sync::Mutex::new(initial_queue));
 
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(10));
     let mut handles = Vec::new();
@@ -303,9 +452,15 @@ pub async fn crawl_website(
             if !content_type.contains("text/html") {
                 return;
             }
-            // Final URL after redirects is the correct join base (preserves
-            // trailing slash on directory indexes like /api/ → /api/).
-            let document_base = resp.url().clone();
+            // Use the final URL after redirects, unless the HTTP client has
+            // removed a slash from the directory URL we requested. That slash
+            // changes how relative links such as `../learn/` are resolved.
+            let response_url = resp.url().clone();
+            let document_base = if url_str.ends_with('/') && !response_url.path().ends_with('/') {
+                Url::parse(&url_str).unwrap_or(response_url)
+            } else {
+                response_url
+            };
             let result_key = canonical_url(&document_base);
             let body = match resp.text().await {
                 Ok(t) => t,
@@ -356,9 +511,7 @@ pub async fn crawl_website(
                 for nu in found {
                     if !s.contains(&nu) {
                         s.insert(nu.clone());
-                        let fetch = Url::parse(&nu)
-                            .map(|u| fetch_url_string(&u))
-                            .unwrap_or(nu);
+                        let fetch = Url::parse(&nu).map(|u| fetch_url_string(&u)).unwrap_or(nu);
                         q.push_back((fetch, cur_depth + 1));
                     }
                 }
@@ -411,7 +564,11 @@ pub async fn scrape_website(url: &str) -> anyhow::Result<(String, Vec<WebSection
         .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
         .default_headers(headers())
         .build()?;
-    let resp = client.get(&url).send().await.map_err(|e| anyhow::anyhow!("fetching {url}: {e}"))?;
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("fetching {url}: {e}"))?;
     let status = resp.status();
     let content_type = resp
         .headers()
@@ -425,7 +582,10 @@ pub async fn scrape_website(url: &str) -> anyhow::Result<(String, Vec<WebSection
     if !content_type.contains("text/html") {
         anyhow::bail!("page is not HTML (Content-Type: {content_type})");
     }
-    let body = resp.text().await.map_err(|e| anyhow::anyhow!("reading body: {e}"))?;
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| anyhow::anyhow!("reading body: {e}"))?;
     Ok(scrape_html(&body))
 }
 
@@ -451,10 +611,7 @@ pub fn scrape_html(html: &str) -> (String, Vec<WebSection>) {
 
     // Combined selector for everything we walk: h1/h2 boundaries + leaf text
     // tags + pre code blocks.
-    let combined_sel_str = format!(
-        "h1, h2, pre, {}",
-        LEAF_TEXT_TAGS.join(", ")
-    );
+    let combined_sel_str = format!("h1, h2, pre, {}", LEAF_TEXT_TAGS.join(", "));
     let combined_sel = scraper::Selector::parse(&combined_sel_str).unwrap();
     let links_sel = scraper::Selector::parse("a[href]").unwrap();
 
@@ -534,8 +691,22 @@ pub fn scrape_html(html: &str) -> (String, Vec<WebSection>) {
         sections.push(WebSection {
             heading_path,
             content,
-            code_blocks: s.code_blocks.into_iter().map(|(raw, lang)| CodeBlock { raw, language: lang }).collect(),
-            links: s.links.into_iter().map(|(h, a)| Link { href: h, anchor_text: a }).collect(),
+            code_blocks: s
+                .code_blocks
+                .into_iter()
+                .map(|(raw, lang)| CodeBlock {
+                    raw,
+                    language: lang,
+                })
+                .collect(),
+            links: s
+                .links
+                .into_iter()
+                .map(|(h, a)| Link {
+                    href: h,
+                    anchor_text: a,
+                })
+                .collect(),
         });
     }
 
@@ -566,7 +737,10 @@ impl RawSection {
 fn is_in_noise(elem: &scraper::ElementRef<'_>) -> bool {
     let mut current = Some(*elem);
     while let Some(node) = current {
-        if matches!(node.value().name(), "script" | "style" | "nav" | "footer" | "header" | "aside") {
+        if matches!(
+            node.value().name(),
+            "script" | "style" | "nav" | "footer" | "header" | "aside"
+        ) {
             return true;
         }
         current = node.parent().and_then(scraper::ElementRef::wrap);
@@ -574,7 +748,10 @@ fn is_in_noise(elem: &scraper::ElementRef<'_>) -> bool {
     false
 }
 
-fn has_selected_text_descendant(elem: &scraper::ElementRef<'_>, selector: &scraper::Selector) -> bool {
+fn has_selected_text_descendant(
+    elem: &scraper::ElementRef<'_>,
+    selector: &scraper::Selector,
+) -> bool {
     elem.select(selector).any(|child| child.id() != elem.id())
 }
 
@@ -586,12 +763,14 @@ fn language_from_element(elem: &scraper::node::Element) -> Option<String> {
 }
 
 fn detect_code_language(elem: &scraper::ElementRef<'_>) -> String {
-    language_from_element(elem.value()).or_else(|| {
-        scraper::Selector::parse("code")
-            .ok()
-            .and_then(|selector| elem.select(&selector).next())
-            .and_then(|code| language_from_element(code.value()))
-    }).unwrap_or_default()
+    language_from_element(elem.value())
+        .or_else(|| {
+            scraper::Selector::parse("code")
+                .ok()
+                .and_then(|selector| elem.select(&selector).next())
+                .and_then(|code| language_from_element(code.value()))
+        })
+        .unwrap_or_default()
 }
 
 /// Build a `website_key` JSON serialization used in the DocumentChunk
@@ -625,7 +804,10 @@ pub fn merge_small_chunks(chunks: Vec<String>, min_tokens: usize) -> Vec<String>
 /// Build `DocumentChunk`s from a list of URLs. Fetches each, scrapes, and
 /// produces prose + code chunks with prev/next id linkage.
 /// Direct port of `process_website`.
-pub async fn process_website(urls: &[String], metadata: &Map<String, Value>) -> anyhow::Result<Vec<DocumentChunk>> {
+pub async fn process_website(
+    urls: &[String],
+    metadata: &Map<String, Value>,
+) -> anyhow::Result<Vec<DocumentChunk>> {
     process_website_with_splitter(urls, metadata, None).await
 }
 
@@ -662,10 +844,13 @@ pub async fn process_website_with_splitter(
         let page_id = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, url.as_bytes()).to_string();
 
         // Build a link_map: anchor_text -> href (first occurrence wins).
-        let mut link_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut link_map: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
         for section in &sections {
             for link in &section.links {
-                link_map.entry(link.anchor_text.clone()).or_insert_with(|| link.href.clone());
+                link_map
+                    .entry(link.anchor_text.clone())
+                    .or_insert_with(|| link.href.clone());
             }
         }
 
@@ -701,7 +886,12 @@ pub async fn process_website_with_splitter(
             .join("\n");
 
         let prose_docs = splitter
-            .map(|splitter| splitter.chunks(&full_page_text).map(str::to_string).collect())
+            .map(|splitter| {
+                splitter
+                    .chunks(&full_page_text)
+                    .map(str::to_string)
+                    .collect()
+            })
             .unwrap_or_else(|| simple_chunk(&full_page_text, chunk_size, chunk_overlap));
         let prose_docs = if prose_docs.len() > 1 {
             merge_small_chunks(prose_docs, MERGE_MIN_TOKENS)
@@ -764,10 +954,15 @@ pub async fn process_website_with_splitter(
             let mut hasher = Sha256::new();
             hasher.update(c.content.as_bytes());
             let hash_hex = hasher.finalize();
-            let chunk_hash = hash_hex.iter().take(8).map(|b| format!("{:02x}", b)).collect::<String>();
+            let chunk_hash = hash_hex
+                .iter()
+                .take(8)
+                .map(|b| format!("{:02x}", b))
+                .collect::<String>();
             c.metadata
                 .insert("chunk_hash".into(), Value::String(chunk_hash));
-            c.metadata.insert("total_chunks".into(), Value::Number(total.into()));
+            c.metadata
+                .insert("total_chunks".into(), Value::Number(total.into()));
             c.metadata.insert(
                 "prev_chunk_id".into(),
                 if i > 0 {
@@ -787,9 +982,7 @@ pub async fn process_website_with_splitter(
             let matches: Vec<Value> = link_map
                 .iter()
                 .filter(|(anchor, _)| c.content.contains(anchor.as_str()))
-                .map(|(anchor, href)| {
-                    serde_json::json!({"href": href, "anchor_text": anchor})
-                })
+                .map(|(anchor, href)| serde_json::json!({"href": href, "anchor_text": anchor}))
                 .collect();
             c.metadata.insert("links".into(), Value::Array(matches));
         }
@@ -855,7 +1048,10 @@ mod tests {
             <pre><code class="language-python">print('hello')</code></pre></main>
             <footer><p>footer noise</p></footer></body></html>"#;
         let (_, sections) = scrape_html(html);
-        let content = sections.iter().map(|section| section.content.as_str()).collect::<String>();
+        let content = sections
+            .iter()
+            .map(|section| section.content.as_str())
+            .collect::<String>();
         assert!(content.contains("keep once"));
         assert_eq!(content.matches("keep once").count(), 1);
         assert!(!content.contains("header noise"));
@@ -896,7 +1092,7 @@ mod tests {
     }
 
     #[test]
-    fn normalize_url_strips_fragment_and_trailing_slash() {
+    fn normalize_url_strips_fragment_and_preserves_trailing_slash() {
         let base = Url::parse("https://example.com/docs/").unwrap();
         assert_eq!(
             normalize_url("page#section", &base).as_deref(),
@@ -904,7 +1100,7 @@ mod tests {
         );
         assert_eq!(
             normalize_url("../other/", &base).as_deref(),
-            Some("https://example.com/other")
+            Some("https://example.com/other/")
         );
     }
 
@@ -921,6 +1117,25 @@ mod tests {
         assert_eq!(
             normalize_url("/page#section", &base).as_deref(),
             Some("https://example.com/page")
+        );
+    }
+
+    #[test]
+    fn parse_sitemap_reads_url_sets_and_indexes() {
+        let urls = parse_sitemap(
+            br#"<?xml version="1.0"?><urlset><url><loc>https://example.com/guide</loc></url></urlset>"#,
+        );
+        assert_eq!(
+            urls,
+            Some((false, vec!["https://example.com/guide".to_string()]))
+        );
+
+        let index = parse_sitemap(
+            br#"<?xml version="1.0"?><sitemapindex><sitemap><loc>https://example.com/pages.xml</loc></sitemap></sitemapindex>"#,
+        );
+        assert_eq!(
+            index,
+            Some((true, vec!["https://example.com/pages.xml".to_string()]))
         );
     }
 

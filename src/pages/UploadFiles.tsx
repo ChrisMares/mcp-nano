@@ -293,10 +293,7 @@ const UploadFiles: React.FC = () => {
             websiteUrl={websiteUrl}
             crawledUrls={websiteUrls}
             crawlError={websiteCrawlError}
-            groupName={urlToGroupName(websiteUrl)}
             embedJobId={websiteEmbedJobId}
-            activeJobs={activeJobs}
-            completedJobs={completedJobs}
             onEmbed={handleWebsiteEmbed}
             onStartAnother={handleStartAnother}
           />

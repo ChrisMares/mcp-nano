@@ -324,13 +324,15 @@ pub fn start(app: &AppHandle) -> Result<(u16, u16, Child), String> {
                         #[cfg(unix)]
                         let alive = Path::new(&format!("/proc/{watch_pid}")).exists();
                         #[cfg(windows)]
-                        let mut tasklist = Command::new("tasklist");
-                        hide_console(&mut tasklist);
-                        let alive = tasklist
-                            .args(["/FI", &format!("PID eq {watch_pid}"), "/NH"])
-                            .output()
-                            .map(|o| String::from_utf8_lossy(&o.stdout).contains(&watch_pid.to_string()))
-                            .unwrap_or(false);
+                        let alive = {
+                            let mut tasklist = Command::new("tasklist");
+                            hide_console(&mut tasklist);
+                            tasklist
+                                .args(["/FI", &format!("PID eq {watch_pid}"), "/NH"])
+                                .output()
+                                .map(|o| String::from_utf8_lossy(&o.stdout).contains(&watch_pid.to_string()))
+                                .unwrap_or(false)
+                        };
                         #[cfg(not(any(unix, windows)))]
                         let alive = true;
                         if !alive {

@@ -24,7 +24,8 @@ fn website_dir() -> PathBuf {
 
 #[test]
 fn scrape_html_extracts_title_and_sections() {
-    let sample = std::fs::read_to_string(website_dir().join("section_packing_sample.html")).unwrap();
+    let sample =
+        std::fs::read_to_string(website_dir().join("section_packing_sample.html")).unwrap();
     let (title, sections) = website::scrape_html(&sample);
     assert_eq!(title, "Packing Sample");
     assert!(!sections.is_empty(), "expected at least one section");
@@ -37,11 +38,16 @@ fn scrape_html_extracts_title_and_sections() {
         heading_paths.iter().any(|p| p == "Guide"),
         "expected Guide heading: {heading_paths:?}"
     );
-    for sub in ["Intro", "Install", "Configure", "Execute", "Validate", "Troubleshoot"] {
+    for sub in [
+        "Intro",
+        "Install",
+        "Configure",
+        "Execute",
+        "Validate",
+        "Troubleshoot",
+    ] {
         assert!(
-            heading_paths
-                .iter()
-                .any(|p| p == &format!("Guide > {sub}")),
+            heading_paths.iter().any(|p| p == &format!("Guide > {sub}")),
             "expected Guide > {sub} heading: {heading_paths:?}"
         );
     }
@@ -112,10 +118,6 @@ async fn spawn_dir_site() -> (String, oneshot::Sender<()>) {
         r#"<!doctype html><html><head><title>Node</title></head>
         <body><h1>Node</h1><p>A Node is a Part that may have ports and connections.</p></body></html>"#,
     );
-    let learn = Html(
-        r#"<!doctype html><html><head><title>Learn</title></head>
-        <body><h1>Learn</h1><p>Learning materials.</p></body></html>"#,
-    );
 
     let app = Router::new()
         .route("/latest/api/", get(move || async move { index }))
@@ -131,7 +133,18 @@ async fn spawn_dir_site() -> (String, oneshot::Sender<()>) {
             "/latest/api/symbols/Node.html",
             get(move || async move { node }),
         )
-        .route("/latest/learn/", get(move || async move { learn }));
+        .route(
+            "/latest/learn",
+            get(|| async {
+                Html("<html><body><h1>Learn</h1><p>Learning materials.</p></body></html>")
+            }),
+        )
+        .route(
+            "/latest/learn/",
+            get(|| async {
+                Html("<html><body><h1>Learn</h1><p>Learning materials.</p></body></html>")
+            }),
+        );
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();
@@ -145,6 +158,57 @@ async fn spawn_dir_site() -> (String, oneshot::Sender<()>) {
             .ok();
     });
     (format!("http://{addr}"), tx)
+}
+
+/// Serve pages listed only in a nested sitemap. The index page intentionally
+/// contains no links, proving sitemap discovery supplements HTML BFS crawling.
+async fn spawn_sitemap_site() -> (String, oneshot::Sender<()>) {
+    let index = Html("<html><body><h1>Index</h1></body></html>");
+    let guide = Html("<html><body><h1>Guide</h1><p>Sitemap-only guide.</p></body></html>");
+    let reference =
+        Html("<html><body><h1>Reference</h1><p>Sitemap-only reference.</p></body></html>");
+    let installation = Html("<html><body><h1>Installation</h1><p>Extensionless sitemap page.</p></body></html>");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr: SocketAddr = listener.local_addr().unwrap();
+    let origin = format!("http://{addr}");
+    let sitemap_index = format!(
+        r#"<?xml version="1.0"?><sitemapindex><sitemap><loc>{origin}/pages.xml</loc></sitemap></sitemapindex>"#
+    );
+    let pages_sitemap = format!(
+        r#"<?xml version="1.0"?><urlset><url><loc>{origin}/guide.html</loc></url><url><loc>{origin}/reference.html</loc></url><url><loc>{origin}/get-started-installation</loc></url></urlset>"#
+    );
+    let app = Router::new()
+        .route("/", get(move || async move { index }))
+        .route("/guide.html", get(move || async move { guide }))
+        .route("/reference.html", get(move || async move { reference }))
+        .route(
+            "/get-started-installation",
+            get(move || async move { installation }),
+        )
+        .route(
+            "/sitemap.xml",
+            get(move || {
+                let sitemap_index = sitemap_index.clone();
+                async move { sitemap_index }
+            }),
+        )
+        .route(
+            "/pages.xml",
+            get(move || {
+                let pages_sitemap = pages_sitemap.clone();
+                async move { pages_sitemap }
+            }),
+        );
+    let (tx, rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = rx.await;
+            })
+            .await
+            .ok();
+    });
+    (origin, tx)
 }
 
 #[tokio::test]
@@ -177,6 +241,21 @@ async fn crawl_website_resolves_relative_links_from_directory_index() {
         "expected index + 3 symbols + learn, got {} ({urls:?})",
         urls.len()
     );
+}
+
+#[tokio::test]
+async fn crawl_website_discovers_urls_from_nested_sitemap() {
+    let (origin, shutdown) = spawn_sitemap_site().await;
+    let urls = website::crawl_website(&origin, 0, true, None)
+        .await
+        .expect("crawl");
+    let _ = shutdown.send(());
+
+    let set: HashSet<_> = urls.iter().cloned().collect();
+    for path in ["guide.html", "reference.html", "get-started-installation"] {
+        let expected = format!("{origin}/{path}");
+        assert!(set.contains(&expected), "missing {expected} in {urls:?}");
+    }
 }
 
 #[tokio::test]
@@ -329,11 +408,7 @@ async fn gojs_api_crawl_and_embed_e2e() {
                 v.push(u.clone());
             }
         }
-        for u in urls
-            .iter()
-            .filter(|u| u.contains("/api/symbols/"))
-            .take(10)
-        {
+        for u in urls.iter().filter(|u| u.contains("/api/symbols/")).take(10) {
             if !v.contains(u) {
                 v.push(u.clone());
             }
