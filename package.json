@@ -1,7 +1,7 @@
 {
   "name": "mcp-nano",
   "private": true,
-  "version": "0.1.1",
+  "version": "0.1.4",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -10,6 +10,7 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "tauri:dev:gpu": "tauri dev --features gpu",
+    "tauri:build:windows": "tauri build --features directml",
     "tauri:build:gpu": "tauri build --features gpu",
     "ensure:qdrant": "bash src-tauri/scripts/download-qdrant.sh",
     "download:qdrant": "bash src-tauri/scripts/download-qdrant.sh --force",

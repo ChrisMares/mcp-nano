@@ -144,6 +144,34 @@ fn fetch_url_string(url: &Url) -> String {
     u.to_string()
 }
 
+/// Turn a user-entered website address into an absolute HTTP URL.
+///
+/// Browsers commonly accept `example.com` in an address bar, but the URL
+/// parser and HTTP client require a scheme. HTTPS is the default for bare
+/// addresses; explicit HTTP/HTTPS URLs are preserved.
+pub fn normalize_website_url(raw: &str) -> anyhow::Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("website URL cannot be empty");
+    }
+
+    let candidate = if trimmed.starts_with("//") {
+        format!("https:{trimmed}")
+    } else if trimmed.contains("://") {
+        trimmed.to_string()
+    } else {
+        format!("https://{trimmed}")
+    };
+    let parsed = Url::parse(&candidate).map_err(|e| anyhow::anyhow!("invalid URL {raw:?}: {e}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        anyhow::bail!("unsupported URL scheme {:?}; use http or https", parsed.scheme());
+    }
+    if parsed.host_str().is_none() {
+        anyhow::bail!("website URL has no domain: {raw:?}");
+    }
+    Ok(parsed.to_string())
+}
+
 /// Resolve `href` against the document base URL, then canonicalize.
 ///
 /// Important: `base` must be the document URL *as the browser sees it*
@@ -174,8 +202,8 @@ pub async fn crawl_website(
     same_domain_only: bool,
     on_progress: Option<CrawlProgressCallback>,
 ) -> anyhow::Result<Vec<String>> {
-    let start = Url::parse(start_url.trim())
-        .map_err(|e| anyhow::anyhow!("invalid URL {start_url:?}: {e}"))?;
+    let normalized_start = normalize_website_url(start_url)?;
+    let start = Url::parse(&normalized_start)?;
     let base_domain = start
         .host_str()
         .ok_or_else(|| anyhow::anyhow!("no domain in {start_url}"))?
@@ -378,11 +406,12 @@ pub struct Link {
 
 /// Fetch + sectionize a single page. Direct port of `scrape_website`.
 pub async fn scrape_website(url: &str) -> anyhow::Result<(String, Vec<WebSection>)> {
+    let url = normalize_website_url(url)?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
         .default_headers(headers())
         .build()?;
-    let resp = client.get(url).send().await.map_err(|e| anyhow::anyhow!("fetching {url}: {e}"))?;
+    let resp = client.get(&url).send().await.map_err(|e| anyhow::anyhow!("fetching {url}: {e}"))?;
     let status = resp.status();
     let content_type = resp
         .headers()
@@ -833,6 +862,28 @@ mod tests {
         assert!(!content.contains("nav noise"));
         assert!(!content.contains("footer noise"));
         assert_eq!(sections[0].code_blocks[0].language, "python");
+    }
+
+    #[test]
+    fn normalize_website_url_adds_https_to_bare_domains() {
+        assert_eq!(
+            normalize_website_url("www.google.com").unwrap(),
+            "https://www.google.com/"
+        );
+        assert_eq!(
+            normalize_website_url("google.com/search?q=rust").unwrap(),
+            "https://google.com/search?q=rust"
+        );
+    }
+
+    #[test]
+    fn normalize_website_url_preserves_http_and_rejects_invalid_schemes() {
+        assert_eq!(
+            normalize_website_url("http://localhost:3000/docs").unwrap(),
+            "http://localhost:3000/docs"
+        );
+        assert!(normalize_website_url("ftp://example.com").is_err());
+        assert!(normalize_website_url("   ").is_err());
     }
 
     #[test]

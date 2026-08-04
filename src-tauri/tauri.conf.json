@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "mcp-nano",
-  "version": "0.1.0",
+  "version": "0.1.4",
   "identifier": "com.mcpquick.mcp-nano",
   "build": {
     "beforeDevCommand": "npm run ensure:qdrant && npm run dev",
@@ -13,8 +13,8 @@
     "windows": [
       {
         "title": "mcp-nano",
-        "width": 1200,
-        "height": 1000
+        "width": 1100,
+        "height": 780
       }
     ],
     "security": {

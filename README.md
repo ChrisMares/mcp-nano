@@ -50,8 +50,8 @@ npm run tauri dev
 Ensure model files and the Qdrant binary are downloaded:
 
 ```bash
-bash scripts/download-models.sh
-bash scripts/download-qdrant.sh
+bash src-tauri/scripts/download-models.sh
+bash src-tauri/scripts/download-qdrant.sh
 ```
 
 ### Linux (Ubuntu/Debian)
@@ -78,14 +78,23 @@ For an `.AppImage` instead of `.deb`, change `"targets"` in `tauri.conf.json` un
 # 1. Install Rust via rustup.msi (https://rustup.rs)
 # 2. Install Node.js 22+ (https://nodejs.org)
 # 3. Install Visual Studio Build Tools or VS 2022 with "Desktop development with C++"
-# 4. WebView2 is included on Windows 10+ / Microsoft Edge
+# 4. Install Git for Windows so bash is available on PATH
+# 5. WebView2 is included with current Windows / Microsoft Edge
 
-# Build the .msi installer
-npm install
-npm run tauri build
+# Build both MSI and NSIS installers. This downloads models, Qdrant,
+# installs locked npm dependencies, and enables DirectML with CPU fallback.
+.\build-windows.ps1
 
-# Output: src-tauri/target/release/bundle/msi/mcp-nano_*.msi
+# Outputs:
+# src-tauri/target/release/bundle/msi/mcp-nano_*.msi
+# src-tauri/target/release/bundle/nsis/mcp-nano_*-setup.exe
 ```
+
+The Windows package is a single adaptive build. At startup it attempts
+DirectML GPU inference, verifies that the models can run, and reloads the CPU
+execution provider if DirectML or the GPU driver is unavailable. Set
+`MCP_NANO_DEVICE=cpu` to force CPU inference. Use
+`.\build-windows.ps1 -SkipInstall` when dependencies are already installed.
 
 ### Frontend-only build
 

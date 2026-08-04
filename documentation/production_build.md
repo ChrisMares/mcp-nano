@@ -73,7 +73,8 @@ For `.deb` / `.rpm` / `.AppImage` packaging, also ensure `dpkg`, `rpmbuild` (opt
 2. Install Node.js 22+.
 3. Install **Visual Studio 2022 Build Tools** (or full VS) with workload **Desktop development with C++**.
 4. WebView2 is present on Windows 11 by default (Edge).
-5. Git Bash or WSL is convenient for the download scripts (they are bash). PowerShell alternatives: run the same `curl`/`tar`/`Expand-Archive` steps manually if needed.
+5. Install Git for Windows so `bash` is on `PATH`; the root build wrapper uses the repository Bash download scripts.
+6. NASM is optional. If it is unavailable, `build-windows.ps1` enables AWS-LC's prebuilt Windows assembler objects.
 
 Cross-compiling Windows installers from Linux is not covered here; build Windows packages on Windows 11.
 
@@ -135,7 +136,7 @@ npm run download:qdrant
 bash src-tauri/scripts/download-qdrant.sh --force
 ```
 
-`npm run tauri build` already runs `beforeBuildCommand`: `npm run ensure:qdrant && npm run build`. **Models are not auto-downloaded** — always run `download-models.sh` first or the package will ship empty `models/`.
+`npm run tauri build` already runs `beforeBuildCommand`: `npm run ensure:qdrant && npm run build`. **Models are not auto-downloaded by the raw Tauri command** — always run `download-models.sh` first, or use `build-windows.ps1` on Windows, which downloads them automatically.
 
 ---
 
@@ -148,13 +149,28 @@ npm install
 bash src-tauri/scripts/download-models.sh
 bash src-tauri/scripts/download-qdrant.sh
 
-# CPU default (both platforms)
+# Linux CPU default
 npm run tauri build
 ```
 
 `targets` is `"all"` in `tauri.conf.json`, so Linux produces deb/rpm/AppImage when tooling allows; Windows produces MSI/NSIS per Tauri defaults.
 
-### GPU-enabled builds (optional)
+### Windows adaptive build
+
+From PowerShell in the repository root:
+
+```powershell
+.\build-windows.ps1
+# or, when node_modules is already installed:
+.\build-windows.ps1 -SkipInstall
+```
+
+The wrapper performs `npm ci`, downloads both ONNX model sets, ensures the
+Windows Qdrant sidecar is present, and runs `tauri build --features directml`.
+The resulting executable uses DirectML when available and falls back to CPU at
+startup after a model capability check. It produces both MSI and NSIS bundles.
+
+### GPU-enabled builds (advanced)
 
 Cargo features in `src-tauri/Cargo.toml`:
 
@@ -297,7 +313,8 @@ com.mcpquick.mcp-nano/
 ├── app.db                      # SQLite (jobs, MCP config, file registry)
 ├── app.db-wal                  # SQLite WAL (when present)
 ├── app.db-shm
-├── data_schema_version         # stamp; mismatch wipes local vector/DB data
+├── backups/                    # recent SQLite backups before migrations
+│   └── app-*-before-migration-*.db
 ├── qdrant.pid                  # sidecar PID while running
 ├── qdrant/                     # Qdrant storage_path
 │   ├── collections/
@@ -333,18 +350,17 @@ Models are loaded from disk via ONNX Runtime (`ort`); they are **not** copied in
 When the user launches mcp-nano:
 
 1. **Logging** → `logs/` under app local data.
-2. **Schema check** → if `data_schema_version` ≠ current stamp, wipe `app.db*`, `qdrant/`, and `uploads/`, then restamp.
-3. **Spawn Qdrant sidecar** next to the exe, with env:
+2. **Spawn Qdrant sidecar** next to the exe, with env:
    - `QDRANT__SERVICE__HOST=127.0.0.1`
    - `QDRANT__SERVICE__HTTP_PORT` / `GRPC_PORT` → ephemeral free ports
    - `QDRANT__STORAGE__STORAGE_PATH` → `<app_local_data>/qdrant`
    - `QDRANT__STORAGE__SNAPSHOTS_PATH` → `<app_local_data>/qdrant/snapshots`
-4. Wait for `http://127.0.0.1:<http>/readyz`, connect gRPC, ensure collections `codebase` + `general` and payload indexes.
-5. **SQLite** → open/migrate `<app_local_data>/app.db`.
-6. **Embedders** → load `resource_dir()/models/{arctic-embed-xs,minilm-l6-v2}` (GPU EP if built-in and available, else CPU).
-7. **MCP HTTP** → `http://127.0.0.1:18651/mcp` (fallback to an ephemeral port if busy). Clients use `?server_id=<name>`.
-8. **Background worker** → polls jobs (max 2 concurrent).
-9. On app exit → cancel worker, kill Qdrant, clear `qdrant.pid`.
+3. Wait for `http://127.0.0.1:<http>/readyz`, connect gRPC, ensure collections `codebase` + `general` and additive payload indexes.
+4. **SQLite backup + migrations** → back up an existing database, then apply pending SQLx migrations without deleting rows.
+5. **Embedders** → load `resource_dir()/models/{arctic-embed-xs,minilm-l6-v2}` (GPU EP if built-in and available, else CPU).
+6. **MCP HTTP** → `http://127.0.0.1:18651/mcp` (fallback to an ephemeral port if busy). Clients use `?server_id=<name>`.
+7. **Background worker** → polls jobs (max 2 concurrent).
+8. On app exit → cancel worker, kill Qdrant, clear `qdrant.pid`.
 
 Nothing binds on public interfaces; Qdrant and MCP are localhost-only.
 
@@ -397,17 +413,12 @@ ls src-tauri/target/release/bundle/deb/
 ls src-tauri/target/release/bundle/appimage/
 ```
 
-### Windows 11 (Git Bash or similar)
+### Windows 11 (PowerShell)
 
 ```powershell
 git clone <repo-url> mcp-nano
 cd mcp-nano
-npm install
-bash src-tauri/scripts/download-models.sh
-bash src-tauri/scripts/download-qdrant.sh
-
-npm run tauri build
-# or: npm run tauri:build:gpu
+.\build-windows.ps1
 
 dir src-tauri\target\release\bundle\msi
 dir src-tauri\target\release\bundle\nsis
@@ -440,7 +451,7 @@ Next launch recreates DB, Qdrant storage, and empty collections. Installed binar
 | App starts but embedders fail | Forgot `download-models.sh` before build; empty `models/` in package |
 | “bundled Qdrant binary not found” | Forgot `download-qdrant.sh` / wrong triple in `binaries/` |
 | Huge link times / OOM | Do not embed models with `include_bytes!`; keep resource bundling |
-| Schema wipe on upgrade | Intentional when `DATA_SCHEMA_VERSION` changes in `qdrant.rs` |
+| Migration failure | Startup stops; restore the latest file from `backups/` after resolving the migration issue |
 | Port 18651 in use | MCP falls back to ephemeral port; check UI connection info |
 | GPU build crashes on user PC | Missing CUDA/cuDNN (Linux) or driver issue; set `MCP_NANO_DEVICE=cpu` |
 

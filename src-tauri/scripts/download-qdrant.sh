@@ -20,9 +20,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TAURI_DIR="$(dirname "$SCRIPT_DIR")"
 BINARIES_DIR="$TAURI_DIR/binaries"
 DOWNLOAD_DIR="$(mktemp -d)"
+WINDOWS_ARCHIVE_PATH="$TAURI_DIR/.qdrant-windows.zip"
+WINDOWS_EXTRACT_DIR="$TAURI_DIR/.qdrant-windows"
 
 cleanup() {
   rm -rf "$DOWNLOAD_DIR"
+  rm -rf "$WINDOWS_ARCHIVE_PATH" "$WINDOWS_EXTRACT_DIR"
 }
 trap cleanup EXIT
 
@@ -34,6 +37,17 @@ download_and_verify() {
 
   curl --fail --location --retry 3 --output "$destination" "$url"
   printf '%s  %s\n' "$checksum" "$destination" | sha256sum --check --status
+}
+
+windows_path() {
+  local path="$1"
+  if [[ "$path" =~ ^/mnt/([a-zA-Z])/(.*)$ ]]; then
+    local drive="${BASH_REMATCH[1]^^}"
+    local rest="${BASH_REMATCH[2]//\//\\}"
+    printf '%s:\\%s' "$drive" "$rest"
+  else
+    printf '%s' "$path"
+  fi
 }
 
 mkdir -p "$BINARIES_DIR"
@@ -60,9 +74,22 @@ fi
 
 if [[ "$force_download" == true || ! -f "$windows_destination" ]]; then
   download_and_verify "$WINDOWS_ARCHIVE" "$WINDOWS_SHA256"
-  unzip -q -o "$DOWNLOAD_DIR/$WINDOWS_ARCHIVE" -d "$DOWNLOAD_DIR/windows"
+  cp "$DOWNLOAD_DIR/$WINDOWS_ARCHIVE" "$WINDOWS_ARCHIVE_PATH"
+  rm -rf "$WINDOWS_EXTRACT_DIR"
 
-  windows_binary="$DOWNLOAD_DIR/windows/qdrant.exe"
+  if command -v unzip >/dev/null 2>&1; then
+    unzip -q -o "$WINDOWS_ARCHIVE_PATH" -d "$WINDOWS_EXTRACT_DIR"
+  elif command -v powershell.exe >/dev/null 2>&1; then
+    windows_archive_path="$(windows_path "$WINDOWS_ARCHIVE_PATH")"
+    windows_extract_dir="$(windows_path "$WINDOWS_EXTRACT_DIR")"
+    powershell.exe -NoProfile -Command \
+      "Expand-Archive -LiteralPath '$windows_archive_path' -DestinationPath '$windows_extract_dir' -Force"
+  else
+    printf 'Could not extract %s: install unzip or use Windows PowerShell\n' "$WINDOWS_ARCHIVE" >&2
+    exit 1
+  fi
+
+  windows_binary="$WINDOWS_EXTRACT_DIR/qdrant.exe"
   if [[ ! -f "$windows_binary" ]]; then
     printf 'Could not find qdrant.exe in %s\n' "$WINDOWS_ARCHIVE" >&2
     exit 1

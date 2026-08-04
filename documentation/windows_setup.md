@@ -9,7 +9,8 @@ Native desktop app: **Tauri 2 + Rust + React/Vite**. No Docker, no Python.
 | Rust | **stable** via rustup, target `x86_64-pc-windows-msvc` |
 | C++ toolchain | **Visual Studio 2022 Build Tools** — workload *Desktop development with C++* |
 | WebView2 | Preinstalled on Windows 11 (Edge) |
-| Optional GPU | Cargo feature `directml` / `gpu` (no CUDA toolkit) |
+| Windows release build | `build-windows.ps1` (DirectML with CPU fallback) |
+| Optional GPU | DirectML (no CUDA toolkit; recent GPU drivers) |
 | Dev UI | `http://localhost:18674` |
 | MCP (when app runs) | `http://127.0.0.1:18651/mcp?server_id=<name>` |
 | App data | `%LOCALAPPDATA%\com.mcpquick.mcp-nano\` |
@@ -42,10 +43,9 @@ powershell -ExecutionPolicy Bypass -File documentation\install-mcp-nano-windows.
 3. Run **install** (Administrator if winget/VS fails).
 4. **Open a new PowerShell** after installing Rust / VS / Node so `PATH` updates.
 5. Re-run inspect until checklist is green.
-6. `npm install` from repo root.
-7. Download **ONNX models** + **Qdrant Windows sidecar**.
-8. Dev: `npm run tauri dev` — or release: `npm run tauri build`.
-9. Artifacts under `src-tauri\target\release\bundle\msi\` and `nsis\`.
+6. Run `npm ci` or use `build-windows.ps1`, which runs it automatically.
+7. Run the build wrapper. It downloads **ONNX models** + **Qdrant**, then creates the installers.
+8. Artifacts are under `src-tauri\target\release\bundle\msi\` and `nsis\`.
 
 ---
 
@@ -168,13 +168,22 @@ npm run tauri dev
 ```powershell
 Set-Location C:\src\mcp-nano
 
-# Models MUST already be present (not auto-fetched by tauri build)
-npm run tauri build
-# npm run tauri:build:gpu
+# Recommended: complete adaptive Windows build.
+# Runs npm ci, downloads models and Qdrant, and enables DirectML + CPU fallback.
+.\build-windows.ps1
+
+# If dependencies are already installed:
+.\build-windows.ps1 -SkipInstall
 
 Get-ChildItem src-tauri\target\release\bundle\msi
 Get-ChildItem src-tauri\target\release\bundle\nsis
 ```
+
+Do not use the CPU-only `npm run tauri build` command for the normal Windows
+release. The wrapper builds one DirectML-enabled executable; the Rust runtime
+selects DirectML when it works and falls back to CPU automatically. NASM is
+optional: when it is not on `PATH`, the wrapper enables AWS-LC's prebuilt
+Windows assembler objects.
 
 | Artifact | Path |
 | --- | --- |
@@ -232,11 +241,9 @@ Remove-Item -Recurse -Force "$env:LOCALAPPDATA\com.mcpquick.mcp-nano"
 [ ] documentation\install-mcp-nano-windows.ps1
 [ ] New PowerShell — inspect all [OK]
 [ ] git clone + cd mcp-nano
-[ ] npm install
-[ ] documentation\download-models.ps1
-[ ] documentation\download-qdrant-windows.ps1
+[ ] npm ci (or let build-windows.ps1 run it)
 [ ] npm run tauri dev
-[ ] (later) npm run tauri build → MSI/NSIS
+[ ] .\build-windows.ps1 → MSI/NSIS (DirectML + CPU fallback)
 ```
 
 ```powershell

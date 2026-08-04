@@ -9,19 +9,29 @@ use std::{
     time::Duration,
 };
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 use qdrant_client::qdrant::{
     vectors_config, CreateCollectionBuilder, CreateFieldIndexCollectionBuilder, Distance,
-    FieldType, KeywordIndexParamsBuilder, Modifier, SparseIndexConfig, SparseVectorConfig,
-    SparseVectorParams, VectorParams, VectorParamsMap, VectorsConfig,
+    FieldType, KeywordIndexParamsBuilder, Modifier, PayloadSchemaType, SparseIndexConfig,
+    SparseVectorConfig, SparseVectorParams, VectorParams, VectorParamsMap, VectorsConfig,
 };
 use qdrant_client::Qdrant;
 use tauri::{AppHandle, Emitter, Manager};
 use tracing::{error, info, warn};
 use crate::models::response::ModelStatusResponse;
 
-/// Schema stamp: bump when on-disk Qdrant/SQLite layout is incompatible.
-/// Missing or mismatched stamp triggers a full local data wipe.
-const DATA_SCHEMA_VERSION: &str = "2-idf-hybrid";
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+#[cfg(windows)]
+fn hide_console(command: &mut Command) {
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn hide_console(_command: &mut Command) {}
 
 /// Owns the Qdrant sidecar so it is killed on app exit.
 pub struct QdrantChild(pub Mutex<Option<Child>>);
@@ -144,50 +154,8 @@ pub fn storage_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(storage)
 }
 
-fn schema_stamp_path(app: &AppHandle) -> Result<PathBuf, String> {
-    Ok(data_dir(app)?.join("data_schema_version"))
-}
-
 fn pidfile_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(data_dir(app)?.join("qdrant.pid"))
-}
-
-/// Wipe SQLite + Qdrant storage when schema stamp is missing/outdated.
-pub fn migrate_local_data_if_needed(app: &AppHandle) -> Result<(), String> {
-    let stamp_path = schema_stamp_path(app)?;
-    let current = fs::read_to_string(&stamp_path).unwrap_or_default();
-    let current = current.trim();
-    if current == DATA_SCHEMA_VERSION {
-        return Ok(());
-    }
-
-    warn!(
-        "local data schema '{current}' != '{DATA_SCHEMA_VERSION}'; wiping SQLite + Qdrant storage"
-    );
-    kill_from_pidfile(app);
-
-    let base = data_dir(app)?;
-    let qdrant_dir = base.join("qdrant");
-    if qdrant_dir.exists() {
-        fs::remove_dir_all(&qdrant_dir)
-            .map_err(|e| format!("failed to wipe Qdrant storage: {e}"))?;
-    }
-    for name in ["app.db", "app.db-wal", "app.db-shm"] {
-        let p = base.join(name);
-        if p.exists() {
-            let _ = fs::remove_file(&p);
-        }
-    }
-    // Drop leftover uploads from old jobs.
-    let uploads = base.join("uploads");
-    if uploads.exists() {
-        let _ = fs::remove_dir_all(&uploads);
-    }
-
-    fs::write(&stamp_path, DATA_SCHEMA_VERSION)
-        .map_err(|e| format!("failed to write schema stamp: {e}"))?;
-    info!("local data wiped and schema stamped as {DATA_SCHEMA_VERSION}");
-    Ok(())
 }
 
 fn write_pidfile(app: &AppHandle, pid: u32) -> Result<(), String> {
@@ -228,9 +196,9 @@ fn kill_from_pidfile(app: &AppHandle) {
         }
         #[cfg(windows)]
         {
-            let _ = Command::new("taskkill")
-                .args(["/PID", &pid.to_string(), "/F"])
-                .status();
+            let mut command = Command::new("taskkill");
+            hide_console(&mut command);
+            let _ = command.args(["/PID", &pid.to_string(), "/F"]).status();
         }
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -274,7 +242,6 @@ fn qdrant_binary() -> Result<PathBuf, String> {
 }
 
 pub fn start(app: &AppHandle) -> Result<(u16, u16, Child), String> {
-    migrate_local_data_if_needed(app)?;
     let storage = storage_path(app)?;
     kill_from_pidfile(app);
     kill_orphaned_sidecars();
@@ -306,7 +273,9 @@ pub fn start(app: &AppHandle) -> Result<(u16, u16, Child), String> {
             .try_clone()
             .map_err(|error| format!("failed to clone Qdrant log handle: {error}"))?;
 
-        let mut spawned = Command::new(&bin)
+        let mut qdrant_command = Command::new(&bin);
+        hide_console(&mut qdrant_command);
+        let mut spawned = qdrant_command
             .env("QDRANT__SERVICE__HOST", "127.0.0.1")
             .env("QDRANT__SERVICE__HTTP_PORT", http_port.to_string())
             .env("QDRANT__SERVICE__GRPC_PORT", grpc_port.to_string())
@@ -355,7 +324,9 @@ pub fn start(app: &AppHandle) -> Result<(u16, u16, Child), String> {
                         #[cfg(unix)]
                         let alive = Path::new(&format!("/proc/{watch_pid}")).exists();
                         #[cfg(windows)]
-                        let alive = Command::new("tasklist")
+                        let mut tasklist = Command::new("tasklist");
+                        hide_console(&mut tasklist);
+                        let alive = tasklist
                             .args(["/FI", &format!("PID eq {watch_pid}"), "/NH"])
                             .output()
                             .map(|o| String::from_utf8_lossy(&o.stdout).contains(&watch_pid.to_string()))
@@ -422,6 +393,7 @@ pub fn shutdown(app: &AppHandle) {
     clear_pidfile(app);
 }
 
+#[cfg(unix)]
 fn is_our_qdrant_cmdline(cmd: &str) -> bool {
     cmd.contains("target/debug/qdrant")
         || cmd.contains("target/release/qdrant")
@@ -587,6 +559,25 @@ pub async fn ensure_collections(client: &Qdrant) -> Result<(), String> {
     }
 
     for (collection, field, field_type, is_tenant) in PAYLOAD_INDEXES {
+        let info = client
+            .collection_info(collection)
+            .await
+            .map_err(|error| format!("failed to inspect collection '{collection}': {error}"))?
+            .result
+            .ok_or_else(|| format!("collection '{collection}' returned no metadata"))?;
+
+        if let Some(existing) = info.payload_schema.get(field) {
+            let expected = payload_schema_type(field_type);
+            if existing.data_type != expected as i32 {
+                return Err(format!(
+                    "payload index '{field}' on '{collection}' has type {:?}, expected {:?}",
+                    PayloadSchemaType::try_from(existing.data_type).ok(),
+                    expected
+                ));
+            }
+            continue;
+        }
+
         let mut builder =
             CreateFieldIndexCollectionBuilder::new(collection, field, field_type);
         if is_tenant && field_type == FieldType::Keyword {
@@ -594,11 +585,46 @@ pub async fn ensure_collections(client: &Qdrant) -> Result<(), String> {
                 KeywordIndexParamsBuilder::default().is_tenant(true),
             );
         }
-        match client.create_field_index(builder).await {
-            Ok(_) => info!("Created index '{field}' on '{collection}' (tenant={is_tenant})"),
-            Err(error) => warn!("Index '{field}' on '{collection}' skipped: {error}"),
-        }
+        client
+            .create_field_index(builder)
+            .await
+            .map_err(|error| format!("failed to create index '{field}' on '{collection}': {error}"))?;
+        info!("Created index '{field}' on '{collection}' (tenant={is_tenant})");
     }
 
     Ok(())
+}
+
+fn payload_schema_type(field_type: FieldType) -> PayloadSchemaType {
+    match field_type {
+        FieldType::Keyword => PayloadSchemaType::Keyword,
+        FieldType::Integer => PayloadSchemaType::Integer,
+        FieldType::Float => PayloadSchemaType::Float,
+        FieldType::Geo => PayloadSchemaType::Geo,
+        FieldType::Text => PayloadSchemaType::Text,
+        FieldType::Bool => PayloadSchemaType::Bool,
+        FieldType::Datetime => PayloadSchemaType::Datetime,
+        FieldType::Uuid => PayloadSchemaType::Uuid,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn payload_index_types_match_qdrant_schema_types() {
+        for (field_type, schema_type) in [
+            (FieldType::Keyword, PayloadSchemaType::Keyword),
+            (FieldType::Integer, PayloadSchemaType::Integer),
+            (FieldType::Float, PayloadSchemaType::Float),
+            (FieldType::Geo, PayloadSchemaType::Geo),
+            (FieldType::Text, PayloadSchemaType::Text),
+            (FieldType::Bool, PayloadSchemaType::Bool),
+            (FieldType::Datetime, PayloadSchemaType::Datetime),
+            (FieldType::Uuid, PayloadSchemaType::Uuid),
+        ] {
+            assert_eq!(payload_schema_type(field_type), schema_type);
+        }
+    }
 }

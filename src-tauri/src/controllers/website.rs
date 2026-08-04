@@ -48,6 +48,11 @@ pub async fn embed_website(
     urls: Vec<String>,
     group: Option<String>,
 ) -> Result<EmbedWebsiteResponse, String> {
+    let urls: Vec<String> = urls
+        .iter()
+        .map(|url| ingestion::website::normalize_website_url(url))
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("invalid website URL: {e:#}"))?;
     let group_str = group.unwrap_or_else(|| "default".to_string());
     let pool = match app.try_state::<DbState>() {
         Some(state) => state.pool.clone(),
