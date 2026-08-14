@@ -39,11 +39,11 @@ pub fn log_size_bytes(app: &tauri::AppHandle) -> Option<u64> {
     let entries = std::fs::read_dir(log_directory(app).ok()?).ok()?;
     Some(
         entries
-        .filter_map(Result::ok)
-        .filter_map(|entry| entry.metadata().ok())
-        .filter(|metadata| metadata.is_file())
-        .map(|metadata| metadata.len())
-        .sum(),
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.metadata().ok())
+            .filter(|metadata| metadata.is_file())
+            .map(|metadata| metadata.len())
+            .sum(),
     )
 }
 
@@ -143,7 +143,10 @@ fn install_panic_hook() {
                 .open(dir.join("mcp-nano-debug.log"))
             {
                 use std::io::Write;
-                let _ = writeln!(f, "ERROR panic_hook: {location} | {payload} | crumb={breadcrumb}");
+                let _ = writeln!(
+                    f,
+                    "ERROR panic_hook: {location} | {payload} | crumb={breadcrumb}"
+                );
                 let _ = f.flush();
             }
         }
@@ -169,11 +172,7 @@ fn init_logging(app: &tauri::AppHandle) {
             if std::fs::create_dir_all(&log_dir).is_ok() {
                 let _ = LOG_DIR.set(log_dir.clone());
                 let log_path = log_dir.join("mcp-nano-debug.log");
-                match OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&log_path)
-                {
+                match OpenOptions::new().create(true).append(true).open(&log_path) {
                     Ok(f) => {
                         file_writer = Some(Arc::new(Mutex::new(f)));
                         eprintln!(
@@ -302,7 +301,8 @@ pub fn run() {
         .setup(|app| {
             init_logging(app.handle());
             if let Some(window) = app.get_webview_window("main") {
-                if let Ok(icon) = tauri::image::Image::from_bytes(include_bytes!("../icons/icon.png"))
+                if let Ok(icon) =
+                    tauri::image::Image::from_bytes(include_bytes!("../icons/icon.png"))
                 {
                     let _ = window.set_icon(icon);
                 }
@@ -337,7 +337,10 @@ pub fn run() {
                     Ok(state) => {
                         let device_mode = state.device_mode().to_string();
                         let model_statuses = state.model_statuses();
-                        info!("Embedder models loaded from {} using {device_mode}", dir.display());
+                        info!(
+                            "Embedder models loaded from {} using {device_mode}",
+                            dir.display()
+                        );
                         app.manage(Arc::new(state));
                         qdrant::publish_status(app.handle(), |s| {
                             s.embedders_ready = true;
@@ -415,39 +418,6 @@ pub fn run() {
                 qdrant::publish_status(&app_handle, |s| s.worker_ready = true);
             });
 
-            // Splashscreen: watch for backend readiness (qdrant + db + embedders), then
-            // swap the splashscreen out for the real window. A fallback timeout ensures
-            // the user is never stuck on the splash if something never becomes ready.
-            let app_handle = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                const SPLASH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-                const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(120);
-                let deadline = tokio::time::Instant::now() + SPLASH_TIMEOUT;
-
-                loop {
-                    let ready = app_handle
-                        .try_state::<qdrant::BackendStatusState>()
-                        .and_then(|state| state.0.read().ok().map(|s| s.qdrant_ready && s.db_ready && s.embedders_ready))
-                        .unwrap_or(false);
-
-                    let timed_out = tokio::time::Instant::now() >= deadline;
-                    if ready || timed_out {
-                        if timed_out && !ready {
-                            warn!("Splashscreen timeout reached before backend was ready; showing main window anyway");
-                        }
-                        if let Some(splash) = app_handle.get_webview_window("splashscreen") {
-                            let _ = splash.close();
-                        }
-                        if let Some(main) = app_handle.get_webview_window("main") {
-                            let _ = main.show();
-                            let _ = main.set_focus();
-                        }
-                        break;
-                    }
-                    tokio::time::sleep(POLL_INTERVAL).await;
-                }
-            });
-
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -483,13 +453,60 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| {
-            if let RunEvent::Exit = event {
-                if let Some(cancel) = app.try_state::<CancellationToken>() {
-                    cancel.cancel();
+            match event {
+                // Start the splash timer only after Tauri has created and
+                // displayed the configured windows, not while setup is blocked.
+                RunEvent::Ready => start_splash_watcher(app),
+                RunEvent::Exit => {
+                    if let Some(cancel) = app.try_state::<CancellationToken>() {
+                        cancel.cancel();
+                    }
+                    qdrant::shutdown(app);
                 }
-                qdrant::shutdown(app);
+                _ => {}
             }
         });
+}
+
+fn start_splash_watcher(app: &tauri::AppHandle) {
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        const MIN_SPLASH_DURATION: std::time::Duration = std::time::Duration::from_secs(4);
+        const SPLASH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(120);
+        let started_at = tokio::time::Instant::now();
+        let deadline = started_at + SPLASH_TIMEOUT;
+
+        loop {
+            let ready = app_handle
+                .try_state::<qdrant::BackendStatusState>()
+                .and_then(|state| {
+                    state
+                        .0
+                        .read()
+                        .ok()
+                        .map(|s| s.qdrant_ready && s.db_ready && s.embedders_ready)
+                })
+                .unwrap_or(false);
+
+            let timed_out = tokio::time::Instant::now() >= deadline;
+            let minimum_duration_elapsed = started_at.elapsed() >= MIN_SPLASH_DURATION;
+            if (ready && minimum_duration_elapsed) || timed_out {
+                if timed_out && !ready {
+                    warn!("Splashscreen timeout reached before backend was ready; showing main window anyway");
+                }
+                if let Some(splash) = app_handle.get_webview_window("splashscreen") {
+                    let _ = splash.close();
+                }
+                if let Some(main) = app_handle.get_webview_window("main") {
+                    let _ = main.show();
+                    let _ = main.set_focus();
+                }
+                break;
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    });
 }
 
 /// Poll `app.try_state::<DbState>()` up to 6 seconds, returning the pool
