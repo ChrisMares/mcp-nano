@@ -333,28 +333,42 @@ pub fn run() {
                 }
             });
             match EmbedderState::models_dir(app.handle()) {
-                Ok(dir) => match EmbedderState::load(&dir) {
-                    Ok(state) => {
-                        let device_mode = state.device_mode().to_string();
-                        let model_statuses = state.model_statuses();
-                        info!(
-                            "Embedder models loaded from {} using {device_mode}",
-                            dir.display()
-                        );
-                        app.manage(Arc::new(state));
-                        qdrant::publish_status(app.handle(), |s| {
-                            s.embedders_ready = true;
-                            s.embedding_device = Some(device_mode);
-                            s.model_statuses = model_statuses;
-                        });
-                    }
-                    Err(error) => {
-                        error!(
-                            "Embedder model load failed from {}: {error:#}",
-                            dir.display()
-                        );
-                    }
-                },
+                Ok(dir) => {
+                    let app_handle = app.handle().clone();
+                    tauri::async_runtime::spawn(async move {
+                        let model_dir = dir.clone();
+                        let result = tauri::async_runtime::spawn_blocking(move || {
+                            EmbedderState::load(&model_dir)
+                        })
+                        .await;
+
+                        match result {
+                            Ok(Ok(state)) => {
+                                let device_mode = state.device_mode().to_string();
+                                let model_statuses = state.model_statuses();
+                                info!(
+                                    "Embedder models loaded from {} using {device_mode}",
+                                    dir.display()
+                                );
+                                app_handle.manage(Arc::new(state));
+                                qdrant::publish_status(&app_handle, |s| {
+                                    s.embedders_ready = true;
+                                    s.embedding_device = Some(device_mode);
+                                    s.model_statuses = model_statuses;
+                                });
+                            }
+                            Ok(Err(error)) => {
+                                error!(
+                                    "Embedder model load failed from {}: {error:#}",
+                                    dir.display()
+                                );
+                            }
+                            Err(error) => {
+                                error!("Embedder model loading task failed: {error}");
+                            }
+                        }
+                    });
+                }
                 Err(error) => error!("Embedder models_dir resolution failed: {error}"),
             }
 
@@ -371,8 +385,8 @@ pub fn run() {
                         return;
                     }
                 };
-                let embedders = match app_handle.try_state::<Arc<EmbedderState>>() {
-                    Some(s) => s.inner().clone(),
+                let embedders = match wait_for_embedders(&app_handle).await {
+                    Some(s) => s,
                     None => {
                         error!("Worker/MCP not started: EmbedderState not registered");
                         return;
@@ -471,7 +485,7 @@ pub fn run() {
 fn start_splash_watcher(app: &tauri::AppHandle) {
     let app_handle = app.clone();
     tauri::async_runtime::spawn(async move {
-        const MIN_SPLASH_DURATION: std::time::Duration = std::time::Duration::from_secs(4);
+        const MIN_SPLASH_DURATION: std::time::Duration = std::time::Duration::from_secs(5);
         const SPLASH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
         const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(120);
         let started_at = tokio::time::Instant::now();
@@ -528,6 +542,16 @@ async fn wait_for_qdrant_client(app: &tauri::AppHandle) -> Option<qdrant_client:
     for _ in 0..300 {
         if let Some(state) = app.try_state::<qdrant::QdrantState>() {
             return Some(state.client.clone());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    None
+}
+
+async fn wait_for_embedders(app: &tauri::AppHandle) -> Option<Arc<EmbedderState>> {
+    for _ in 0..600 {
+        if let Some(state) = app.try_state::<Arc<EmbedderState>>() {
+            return Some(state.inner().clone());
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
