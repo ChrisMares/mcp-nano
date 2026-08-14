@@ -40,7 +40,7 @@ const ToolWizard: React.FC<ToolWizardProps> = ({
   toolName,
 }) => {
   const [step, setStep] = useState(1);
-  const { form, toggleRepo, toggleGroup, setRepos, setGroups, toggleWebsite, setWebsites, updateForm } = useToolForm(initialData);
+  const { form, toggleRepo, toggleGroup, setRepos, setGroups, toggleWebsite, setWebsites, updateForm, setMaxChunkLimit } = useToolForm(initialData);
 
   if (editMode) {
     return (
@@ -91,8 +91,10 @@ const ToolWizard: React.FC<ToolWizardProps> = ({
           selectedRepos={form.selectedRepos}
           selectedGroups={form.selectedGroups}
           selectedWebsites={form.selectedWebsites}
+          maxChunkLimit={form.maxChunkLimit}
           onNameChange={(name) => updateForm({ name })}
           onDescriptionChange={(description) => updateForm({ description })}
+          onMaxChunkLimitChange={setMaxChunkLimit}
           onBack={onCancel}
           onSave={() => onSave(form)}
           saving={saving}
@@ -139,8 +141,10 @@ const ToolWizard: React.FC<ToolWizardProps> = ({
           selectedRepos={form.selectedRepos}
           selectedGroups={form.selectedGroups}
           selectedWebsites={form.selectedWebsites}
+          maxChunkLimit={form.maxChunkLimit}
           onNameChange={(name) => updateForm({ name })}
           onDescriptionChange={(description) => updateForm({ description })}
+          onMaxChunkLimitChange={setMaxChunkLimit}
           onBack={() => setStep(1)}
           onSave={() => onSave(form)}
           saving={saving}

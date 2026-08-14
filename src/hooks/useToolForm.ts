@@ -32,9 +32,13 @@ export function useToolForm(initial?: ToolFormData) {
   const setGroups = useCallback((groups: Set<string>) => setItems("selectedGroups", groups), [setItems]);
   const setWebsites = useCallback((websites: Set<string>) => setItems("selectedWebsites", websites), [setItems]);
 
+  const setMaxChunkLimit = useCallback((maxChunkLimit: number) => {
+    setForm((prev) => ({ ...prev, maxChunkLimit }));
+  }, []);
+
   const resetForm = useCallback(() => {
     setForm(emptyToolForm());
   }, []);
 
-  return { form, updateForm, toggleRepo, toggleGroup, setRepos, setGroups, toggleWebsite, setWebsites, resetForm };
+  return { form, updateForm, toggleRepo, toggleGroup, setRepos, setGroups, toggleWebsite, setWebsites, setMaxChunkLimit, resetForm };
 }

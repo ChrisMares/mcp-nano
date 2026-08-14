@@ -1,0 +1,512 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>mcp-nano</title>
+    <style>
+      :root {
+        color-scheme: dark;
+
+        /* Mirrors the React app's `.dark` theme tokens (src/index.css) */
+        --foreground: oklch(0.95 0.02 85);
+        --muted-foreground: oklch(0.72 0.03 80);
+        --brand-gold: oklch(0.78 0.16 75);
+        --brand-gold-bright: oklch(0.9 0.15 85);
+        --brand-cyan: oklch(0.85 0.13 192);
+        --brand-cyan-light: oklch(0.92 0.09 192);
+        --brand-surface: oklch(0.25 0.005 260);
+        --brand-surface-raised: oklch(0.3 0.005 260);
+        --star-dim: oklch(0.55 0.02 260);
+      }
+
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: #000000;
+        font-family: "Courier New", ui-monospace, monospace;
+        user-select: none;
+        -webkit-user-select: none;
+      }
+
+      body {
+        position: relative;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 28px;
+      }
+
+      /* ---------- starfield (scrolls behind the ship) ---------- */
+      .starfield {
+        position: absolute;
+        inset: 0;
+        overflow: hidden;
+        z-index: 0;
+      }
+
+      .stars-layer {
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100vw;
+        height: 200vh;
+        animation: fall-stars linear infinite;
+      }
+
+      .stars-far {
+        width: 1px;
+        height: 1px;
+        background: transparent;
+        box-shadow:
+          32.38vw 15.08vh 0 var(--star-dim),
+          65.09vw 7.24vh 0 var(--brand-cyan-light),
+          53.59vw 36.57vh 0 #ffffff,
+          5.8vw 50.74vh 0 var(--star-dim),
+          3.75vw 43.36vh 0 var(--brand-cyan-light),
+          6.99vw 9.07vh 0 #ffffff,
+          42.45vw 82.69vh 0 var(--star-dim),
+          12.38vw 22.32vh 0 var(--brand-cyan-light),
+          62.74vw 94.77vh 0 #ffffff,
+          57.71vw 39.67vh 0 var(--star-dim),
+          97.63vw 4.66vh 0 var(--brand-cyan-light),
+          85.85vw 28.96vh 0 #ffffff,
+          14.43vw 11.78vh 0 var(--star-dim),
+          30.85vw 81.61vh 0 var(--brand-cyan-light),
+          18.07vw 58.16vh 0 #ffffff,
+          63.89vw 37.24vh 0 var(--star-dim),
+          54.77vw 6.28vh 0 var(--brand-cyan-light),
+          5.96vw 20.6vh 0 #ffffff,
+          68.04vw 42.76vh 0 var(--star-dim),
+          31.41vw 58.56vh 0 var(--brand-cyan-light),
+          45.32vw 29.98vh 0 #ffffff,
+          79.44vw 69.9vh 0 var(--star-dim),
+          24.41vw 57.44vh 0 var(--brand-cyan-light),
+          52.52vw 87.51vh 0 #ffffff,
+          72.94vw 28.79vh 0 var(--star-dim),
+          98.02vw 11.81vh 0 var(--brand-cyan-light),
+          41.81vw 75.71vh 0 #ffffff,
+          15.2vw 48.9vh 0 var(--star-dim),
+          3.92vw 66.82vh 0 var(--brand-cyan-light),
+          76.46vw 57.3vh 0 #ffffff,
+          87.55vw 31.37vh 0 var(--star-dim),
+          69.53vw 59.44vh 0 var(--brand-cyan-light),
+          57.99vw 45.62vh 0 #ffffff,
+          84vw 94.47vh 0 var(--star-dim),
+          47.41vw 66.42vh 0 var(--brand-cyan-light),
+          6.07vw 70.15vh 0 #ffffff,
+          64.71vw 99.31vh 0 var(--star-dim),
+          82.19vw 28.46vh 0 var(--brand-cyan-light),
+          38.58vw 66.87vh 0 #ffffff,
+          2.26vw 46.17vh 0 var(--star-dim),
+          16.8vw 11.71vh 0 var(--brand-cyan-light),
+          5.9vw 76.82vh 0 #ffffff,
+          12.93vw 24.76vh 0 var(--star-dim),
+          39.09vw 87.14vh 0 var(--brand-cyan-light),
+          8.06vw 44.92vh 0 #ffffff,
+          54.94vw 88.34vh 0 var(--star-dim),
+          81.93vw 86.4vh 0 var(--brand-cyan-light),
+          27.84vw 41.53vh 0 #ffffff,
+          35.88vw 88.42vh 0 var(--star-dim),
+          95.77vw 15.09vh 0 var(--brand-cyan-light),
+          17.62vw 23.2vh 0 #ffffff,
+          23.33vw 48.5vh 0 var(--star-dim),
+          58.91vw 26.27vh 0 var(--brand-cyan-light),
+          0.41vw 41.89vh 0 #ffffff,
+          36.93vw 56.63vh 0 var(--star-dim),
+          95.31vw 69.05vh 0 var(--brand-cyan-light),
+          51.55vw 61.76vh 0 #ffffff,
+          67.62vw 5.4vh 0 var(--star-dim),
+          89.95vw 78vh 0 var(--brand-cyan-light),
+          87.45vw 79.79vh 0 #ffffff,
+          32.38vw 115.08vh 0 var(--star-dim),
+          65.09vw 107.24vh 0 var(--brand-cyan-light),
+          53.59vw 136.57vh 0 #ffffff,
+          5.8vw 150.74vh 0 var(--star-dim),
+          3.75vw 143.36vh 0 var(--brand-cyan-light),
+          6.99vw 109.07vh 0 #ffffff,
+          42.45vw 182.69vh 0 var(--star-dim),
+          12.38vw 122.32vh 0 var(--brand-cyan-light),
+          62.74vw 194.77vh 0 #ffffff,
+          57.71vw 139.67vh 0 var(--star-dim),
+          97.63vw 104.66vh 0 var(--brand-cyan-light),
+          85.85vw 128.96vh 0 #ffffff,
+          14.43vw 111.78vh 0 var(--star-dim),
+          30.85vw 181.61vh 0 var(--brand-cyan-light),
+          18.07vw 158.16vh 0 #ffffff,
+          63.89vw 137.24vh 0 var(--star-dim),
+          54.77vw 106.28vh 0 var(--brand-cyan-light),
+          5.96vw 120.6vh 0 #ffffff,
+          68.04vw 142.76vh 0 var(--star-dim),
+          31.41vw 158.56vh 0 var(--brand-cyan-light),
+          45.32vw 129.98vh 0 #ffffff,
+          79.44vw 169.9vh 0 var(--star-dim),
+          24.41vw 157.44vh 0 var(--brand-cyan-light),
+          52.52vw 187.51vh 0 #ffffff,
+          72.94vw 128.79vh 0 var(--star-dim),
+          98.02vw 111.81vh 0 var(--brand-cyan-light),
+          41.81vw 175.71vh 0 #ffffff,
+          15.2vw 148.9vh 0 var(--star-dim),
+          3.92vw 166.82vh 0 var(--brand-cyan-light),
+          76.46vw 157.3vh 0 #ffffff,
+          87.55vw 131.37vh 0 var(--star-dim),
+          69.53vw 159.44vh 0 var(--brand-cyan-light),
+          57.99vw 145.62vh 0 #ffffff,
+          84vw 194.47vh 0 var(--star-dim),
+          47.41vw 166.42vh 0 var(--brand-cyan-light),
+          6.07vw 170.15vh 0 #ffffff,
+          64.71vw 199.31vh 0 var(--star-dim),
+          82.19vw 128.46vh 0 var(--brand-cyan-light),
+          38.58vw 166.87vh 0 #ffffff,
+          2.26vw 146.17vh 0 var(--star-dim),
+          16.8vw 111.71vh 0 var(--brand-cyan-light),
+          5.9vw 176.82vh 0 #ffffff,
+          12.93vw 124.76vh 0 var(--star-dim),
+          39.09vw 187.14vh 0 var(--brand-cyan-light),
+          8.06vw 144.92vh 0 #ffffff,
+          54.94vw 188.34vh 0 var(--star-dim),
+          81.93vw 186.4vh 0 var(--brand-cyan-light),
+          27.84vw 141.53vh 0 #ffffff,
+          35.88vw 188.42vh 0 var(--star-dim),
+          95.77vw 115.09vh 0 var(--brand-cyan-light),
+          17.62vw 123.2vh 0 #ffffff,
+          23.33vw 148.5vh 0 var(--star-dim),
+          58.91vw 126.27vh 0 var(--brand-cyan-light),
+          0.41vw 141.89vh 0 #ffffff,
+          36.93vw 156.63vh 0 var(--star-dim),
+          95.31vw 169.05vh 0 var(--brand-cyan-light),
+          51.55vw 161.76vh 0 #ffffff,
+          67.62vw 105.4vh 0 var(--star-dim),
+          89.95vw 178vh 0 var(--brand-cyan-light),
+          87.45vw 179.79vh 0 #ffffff;
+        animation-duration: 9s;
+        opacity: 0.7;
+      }
+
+      .stars-near {
+        width: 2px;
+        height: 2px;
+        background: transparent;
+        box-shadow:
+          39.24vw 39.9vh 0 #ffffff,
+          10.35vw 63.43vh 0 #ffffff,
+          6.22vw 6.73vh 0 #ffffff,
+          20.88vw 16.23vh 0 #ffffff,
+          34.01vw 5.26vh 0 #ffffff,
+          0.02vw 15.13vh 0 #ffffff,
+          10.15vw 36.36vh 0 #ffffff,
+          2.55vw 87.43vh 0 #ffffff,
+          61.41vw 14.86vh 0 #ffffff,
+          25.23vw 34.74vh 0 #ffffff,
+          36.42vw 12.28vh 0 #ffffff,
+          84.89vw 99.31vh 0 #ffffff,
+          46.6vw 48.38vh 0 #ffffff,
+          8.59vw 10.22vh 0 #ffffff,
+          34.26vw 26.48vh 0 #ffffff,
+          82.89vw 16.14vh 0 #ffffff,
+          2.31vw 95.1vh 0 #ffffff,
+          52.83vw 14.66vh 0 #ffffff,
+          54.32vw 2.7vh 0 #ffffff,
+          52.81vw 97.85vh 0 #ffffff,
+          86.33vw 69.62vh 0 #ffffff,
+          26.11vw 36.67vh 0 #ffffff,
+          16.7vw 77.19vh 0 #ffffff,
+          53.26vw 77.91vh 0 #ffffff,
+          39.24vw 139.9vh 0 #ffffff,
+          10.35vw 163.43vh 0 #ffffff,
+          6.22vw 106.73vh 0 #ffffff,
+          20.88vw 116.23vh 0 #ffffff,
+          34.01vw 105.26vh 0 #ffffff,
+          0.02vw 115.13vh 0 #ffffff,
+          10.15vw 136.36vh 0 #ffffff,
+          2.55vw 187.43vh 0 #ffffff,
+          61.41vw 114.86vh 0 #ffffff,
+          25.23vw 134.74vh 0 #ffffff,
+          36.42vw 112.28vh 0 #ffffff,
+          84.89vw 199.31vh 0 #ffffff,
+          46.6vw 148.38vh 0 #ffffff,
+          8.59vw 110.22vh 0 #ffffff,
+          34.26vw 126.48vh 0 #ffffff,
+          82.89vw 116.14vh 0 #ffffff,
+          2.31vw 195.1vh 0 #ffffff,
+          52.83vw 114.66vh 0 #ffffff,
+          54.32vw 102.7vh 0 #ffffff,
+          52.81vw 197.85vh 0 #ffffff,
+          86.33vw 169.62vh 0 #ffffff,
+          26.11vw 136.67vh 0 #ffffff,
+          16.7vw 177.19vh 0 #ffffff,
+          53.26vw 177.91vh 0 #ffffff;
+        animation-duration: 3.5s;
+        opacity: 0.9;
+      }
+
+      @keyframes fall-stars {
+        0% {
+          transform: translateY(-100vh);
+        }
+        100% {
+          transform: translateY(0);
+        }
+      }
+
+      /* ---------- pixel-art stage ---------- */
+      .stage {
+        position: relative;
+        width: 72px;
+        height: 96px;
+        z-index: 1;
+      }
+
+      .px {
+        image-rendering: pixelated;
+      }
+
+      .rocket {
+        position: absolute;
+        left: 0;
+        width: 8px;
+        height: 8px;
+        background: transparent;
+        box-shadow:
+          32px 0px 0 var(--foreground),
+          24px 8px 0 var(--foreground),
+          32px 8px 0 var(--foreground),
+          40px 8px 0 var(--foreground),
+          24px 16px 0 var(--foreground),
+          32px 16px 0 var(--foreground),
+          40px 16px 0 var(--foreground),
+          16px 24px 0 var(--foreground),
+          24px 24px 0 var(--foreground),
+          32px 24px 0 var(--foreground),
+          40px 24px 0 var(--foreground),
+          48px 24px 0 var(--foreground),
+          16px 32px 0 var(--foreground),
+          24px 32px 0 var(--foreground),
+          32px 32px 0 var(--foreground),
+          40px 32px 0 var(--foreground),
+          48px 32px 0 var(--foreground),
+          16px 40px 0 var(--foreground),
+          24px 40px 0 var(--foreground),
+          40px 40px 0 var(--foreground),
+          48px 40px 0 var(--foreground),
+          16px 48px 0 var(--foreground),
+          24px 48px 0 var(--foreground),
+          40px 48px 0 var(--foreground),
+          48px 48px 0 var(--foreground),
+          16px 56px 0 var(--foreground),
+          24px 56px 0 var(--foreground),
+          32px 56px 0 var(--foreground),
+          40px 56px 0 var(--foreground),
+          48px 56px 0 var(--foreground),
+          32px 40px 0 var(--brand-cyan),
+          32px 48px 0 var(--brand-cyan),
+          8px 64px 0 var(--brand-gold),
+          16px 64px 0 var(--brand-gold),
+          48px 64px 0 var(--brand-gold),
+          56px 64px 0 var(--brand-gold),
+          0px 72px 0 var(--brand-gold),
+          8px 72px 0 var(--brand-gold),
+          56px 72px 0 var(--brand-gold),
+          64px 72px 0 var(--brand-gold),
+          24px 64px 0 var(--muted-foreground),
+          32px 64px 0 var(--muted-foreground),
+          40px 64px 0 var(--muted-foreground),
+          16px 72px 0 var(--muted-foreground),
+          24px 72px 0 var(--muted-foreground),
+          32px 72px 0 var(--muted-foreground),
+          40px 72px 0 var(--muted-foreground),
+          48px 72px 0 var(--muted-foreground),
+          16px 80px 0 var(--muted-foreground),
+          24px 80px 0 var(--muted-foreground),
+          32px 80px 0 var(--muted-foreground),
+          40px 80px 0 var(--muted-foreground),
+          48px 80px 0 var(--muted-foreground);
+        animation: hover 1.6s ease-in-out infinite;
+      }
+
+      .flame {
+        position: absolute;
+        left: 0;
+        top: 88px;
+        width: 8px;
+        height: 8px;
+        background: transparent;
+        animation:
+          hover 1.6s ease-in-out infinite,
+          flicker 0.22s steps(1) infinite;
+      }
+
+      @keyframes hover {
+        0% {
+          transform: translateY(0);
+        }
+        50% {
+          transform: translateY(-3px);
+        }
+        100% {
+          transform: translateY(0);
+        }
+      }
+
+      @keyframes flicker {
+        0% {
+          box-shadow:
+            24px 0px 0 var(--brand-gold-bright),
+            32px 0px 0 var(--brand-gold),
+            24px 8px 0 var(--brand-gold),
+            32px 8px 0 var(--brand-gold);
+        }
+        50% {
+          box-shadow:
+            16px 0px 0 var(--brand-gold-bright),
+            24px 0px 0 var(--brand-gold-bright),
+            32px 0px 0 var(--brand-gold-bright),
+            40px 0px 0 var(--brand-gold-bright),
+            24px 8px 0 var(--brand-gold-bright),
+            32px 8px 0 var(--brand-gold-bright),
+            16px 8px 0 var(--brand-gold),
+            40px 8px 0 var(--brand-gold),
+            24px 16px 0 var(--brand-gold),
+            32px 16px 0 var(--brand-gold);
+        }
+        100% {
+          box-shadow:
+            24px 0px 0 var(--brand-gold-bright),
+            32px 0px 0 var(--brand-gold),
+            24px 8px 0 var(--brand-gold),
+            32px 8px 0 var(--brand-gold);
+        }
+      }
+
+      /* exhaust trail pixels drifting down + fading */
+      .exhaust {
+        position: absolute;
+        left: 30px;
+        top: 96px;
+        width: 6px;
+        height: 6px;
+        background: var(--brand-gold);
+        image-rendering: pixelated;
+        animation: puff 1.1s linear infinite;
+        opacity: 0;
+        z-index: 1;
+      }
+      .exhaust:nth-child(3) {
+        left: 22px;
+        animation-delay: 0.28s;
+      }
+      .exhaust:nth-child(4) {
+        left: 40px;
+        animation-delay: 0.55s;
+      }
+      .exhaust:nth-child(5) {
+        left: 30px;
+        animation-delay: 0.82s;
+      }
+
+      @keyframes puff {
+        0% {
+          opacity: 0.9;
+          transform: translateY(0) scale(1);
+        }
+        100% {
+          opacity: 0;
+          transform: translateY(22px) scale(0.4);
+        }
+      }
+
+      /* ---------- terminal loading text ---------- */
+      .loading {
+        position: relative;
+        z-index: 1;
+        font-size: 15px;
+        letter-spacing: 3px;
+        color: var(--brand-cyan);
+        text-transform: uppercase;
+        text-shadow: 1px 1px 0 rgba(0, 0, 0, 0.6);
+        display: flex;
+        align-items: baseline;
+      }
+
+      .dots {
+        display: inline-block;
+        width: 9ch;
+        text-align: left;
+      }
+
+      .dots::after {
+        content: ".";
+        animation: dots-cycle 3.5s steps(1) infinite;
+      }
+
+      @keyframes dots-cycle {
+        0% {
+          content: ".";
+        }
+        7.14% {
+          content: "..";
+        }
+        14.29% {
+          content: "...";
+        }
+        21.43% {
+          content: "....";
+        }
+        28.57% {
+          content: ".....";
+        }
+        35.71% {
+          content: "......";
+        }
+        42.86% {
+          content: ".......";
+        }
+        50% {
+          content: "........";
+        }
+        57.14% {
+          content: ".......";
+        }
+        64.29% {
+          content: "......";
+        }
+        71.43% {
+          content: ".....";
+        }
+        78.57% {
+          content: "....";
+        }
+        85.71% {
+          content: "...";
+        }
+        92.86% {
+          content: "..";
+        }
+        100% {
+          content: ".";
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="starfield">
+      <div class="stars-layer stars-far"></div>
+      <div class="stars-layer stars-near"></div>
+    </div>
+    <div class="stage px">
+      <div class="rocket"></div>
+      <div class="flame"></div>
+      <div class="exhaust"></div>
+      <div class="exhaust"></div>
+      <div class="exhaust"></div>
+      <div class="exhaust"></div>
+    </div>
+    <div class="loading">
+      <span>LOADING</span><span class="dots"></span>
+    </div>
+  </body>
+</html>

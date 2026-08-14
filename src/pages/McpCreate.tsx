@@ -27,7 +27,7 @@ const validateServerName = (name: string, existingNames: string[] = []): string 
 const McpCreate: React.FC = () => {
   const navigate = useNavigate();
   const { repoOptions, groupOptions, websiteOptions } = useScopeOptions();
-  const { form, toggleRepo, toggleGroup, setRepos, setGroups, toggleWebsite, setWebsites, updateForm } = useToolForm();
+  const { form, toggleRepo, toggleGroup, setRepos, setGroups, toggleWebsite, setWebsites, updateForm, setMaxChunkLimit } = useToolForm();
   const [step, setStep] = useState(1);
 
   // Step 1 state
@@ -155,8 +155,10 @@ const McpCreate: React.FC = () => {
             selectedRepos={form.selectedRepos}
             selectedGroups={form.selectedGroups}
             selectedWebsites={form.selectedWebsites}
+            maxChunkLimit={form.maxChunkLimit}
             onNameChange={(name) => updateForm({ name })}
             onDescriptionChange={(description) => updateForm({ description })}
+            onMaxChunkLimitChange={setMaxChunkLimit}
             onBack={() => setStep(2)}
             onSave={handleSave}
             saving={saving}

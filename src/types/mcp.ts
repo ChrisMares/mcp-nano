@@ -16,6 +16,7 @@ export interface ToolDefinition {
   active: boolean;
   created_at: string;
   updated_at: string;
+  max_chunk_limit: number | null;
   code_search_scopes: ToolCodeSearchScope[];
   document_search_scopes: ToolDocumentSearchScope[];
 }
@@ -39,6 +40,7 @@ export interface ToolPayload {
   description: string;
   code_search_scopes: { collection: string; repo_names: string[] }[];
   document_search_scopes: { collection: string; group_ids: string[] }[];
+  max_chunk_limit: number;
 }
 
 export interface ToolFormData {
@@ -47,7 +49,10 @@ export interface ToolFormData {
   selectedRepos: Set<string>;
   selectedGroups: Set<string>;
   selectedWebsites: Set<string>;
+  maxChunkLimit: number;
 }
+
+export const DEFAULT_MAX_CHUNK_LIMIT = 5;
 
 export const emptyToolForm = (): ToolFormData => ({
   name: "",
@@ -55,6 +60,7 @@ export const emptyToolForm = (): ToolFormData => ({
   selectedRepos: new Set(),
   selectedGroups: new Set(),
   selectedWebsites: new Set(),
+  maxChunkLimit: DEFAULT_MAX_CHUNK_LIMIT,
 });
 
 export const toolFormToPayload = (form: ToolFormData): ToolPayload => {
@@ -71,6 +77,7 @@ export const toolFormToPayload = (form: ToolFormData): ToolPayload => {
       groupIds.size > 0
         ? [{ collection: "general", group_ids: Array.from(groupIds) }]
         : [],
+    max_chunk_limit: form.maxChunkLimit,
   };
 };
 
@@ -87,7 +94,14 @@ export const toolToFormData = (tool: ToolDefinition, knownWebsiteGroups: string[
       groups.add(g);
     }
   }));
-  return { name: tool.name, description: tool.description || "", selectedRepos: repos, selectedGroups: groups, selectedWebsites: websites };
+  return {
+    name: tool.name,
+    description: tool.description || "",
+    selectedRepos: repos,
+    selectedGroups: groups,
+    selectedWebsites: websites,
+    maxChunkLimit: tool.max_chunk_limit ?? DEFAULT_MAX_CHUNK_LIMIT,
+  };
 };
 
 export interface ConnectionInfo {

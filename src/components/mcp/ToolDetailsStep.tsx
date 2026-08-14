@@ -1,6 +1,7 @@
 import React, { useState } from "react";
 import { Loader2 } from "lucide-react";
 import { wizardNav, btnPrimary, btnSecondary, fieldLabel, textInput, textArea, alertValidation } from "@/styles/classes";
+import NumberStepper from "@/components/ui/NumberStepper";
 
 const TOOL_NAME_RE = /^[A-Za-z0-9_]+$/;
 
@@ -16,8 +17,10 @@ interface ToolDetailsStepProps {
   selectedRepos: Set<string>;
   selectedGroups: Set<string>;
   selectedWebsites: Set<string>;
+  maxChunkLimit: number;
   onNameChange: (name: string) => void;
   onDescriptionChange: (desc: string) => void;
+  onMaxChunkLimitChange: (limit: number) => void;
   onBack: () => void;
   onSave: () => void;
   saving: boolean;
@@ -32,8 +35,10 @@ const ToolDetailsStep: React.FC<ToolDetailsStepProps> = ({
   selectedRepos,
   selectedGroups,
   selectedWebsites,
+  maxChunkLimit,
   onNameChange,
   onDescriptionChange,
+  onMaxChunkLimitChange,
   onBack,
   onSave,
   saving,
@@ -105,6 +110,17 @@ const ToolDetailsStep: React.FC<ToolDetailsStepProps> = ({
             placeholder="What this tool searches for..."
             rows={3}
             className={textArea}
+          />
+        </div>
+
+        <div>
+          <NumberStepper
+            label="Max Chunk Limit"
+            hint="Maximum number of result chunks this tool can return per search."
+            value={maxChunkLimit}
+            onChange={onMaxChunkLimitChange}
+            min={1}
+            max={50}
           />
         </div>
       </div>

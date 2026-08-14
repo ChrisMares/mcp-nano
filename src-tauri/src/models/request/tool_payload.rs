@@ -7,7 +7,7 @@ pub struct ScopePayload {
     pub group_ids: Option<Vec<String>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct ToolPayload {
     pub name: String,
     pub description: Option<String>,
@@ -15,4 +15,6 @@ pub struct ToolPayload {
     pub code_search_scopes: Vec<ScopePayload>,
     #[serde(default)]
     pub document_search_scopes: Vec<ScopePayload>,
+    #[serde(default)]
+    pub max_chunk_limit: Option<i32>,
 }

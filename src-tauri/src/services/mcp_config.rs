@@ -17,6 +17,16 @@ fn now_iso() -> String {
     Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
 }
 
+const DEFAULT_MAX_CHUNK_LIMIT: i32 = 5;
+const MIN_MAX_CHUNK_LIMIT: i32 = 1;
+const MAX_MAX_CHUNK_LIMIT: i32 = 50;
+
+fn normalize_max_chunk_limit(value: Option<i32>) -> i32 {
+    value
+        .unwrap_or(DEFAULT_MAX_CHUNK_LIMIT)
+        .clamp(MIN_MAX_CHUNK_LIMIT, MAX_MAX_CHUNK_LIMIT)
+}
+
 fn validate_server_name(name: &str) -> Result<String, String> {
     let name = name.trim().to_string();
     if name.is_empty() {
@@ -102,7 +112,7 @@ pub async fn get_server(pool: &SqlitePool, server_id: &str) -> Result<ServerResp
 pub async fn delete_server(pool: &SqlitePool, server_id: &str) -> Result<MessageResponse, String> {
     let _ = get_server_row(pool, server_id).await?;
     let tools = sqlx::query_as::<_, ToolDefinition>(
-        "SELECT id, mcp_server_id, name, description, active, created_at, updated_at \
+        "SELECT id, mcp_server_id, name, description, active, created_at, updated_at, max_chunk_limit \
          FROM tool_definitions WHERE mcp_server_id = ?",
     )
     .bind(server_id)
@@ -142,9 +152,10 @@ pub async fn create_tool(
     }
     let id = Uuid::new_v4().to_string();
     let now = now_iso();
+    let max_chunk_limit = normalize_max_chunk_limit(tool_data.max_chunk_limit);
     sqlx::query(
-        "INSERT INTO tool_definitions (id, name, description, active, mcp_server_id, created_at, updated_at) \
-         VALUES (?, ?, ?, 1, ?, ?, ?)",
+        "INSERT INTO tool_definitions (id, name, description, active, mcp_server_id, created_at, updated_at, max_chunk_limit) \
+         VALUES (?, ?, ?, 1, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&name)
@@ -152,6 +163,7 @@ pub async fn create_tool(
     .bind(server_id)
     .bind(&now)
     .bind(&now)
+    .bind(max_chunk_limit)
     .execute(pool)
     .await
     .map_err(|e| format!("creating tool: {e}"))?;
@@ -166,6 +178,7 @@ pub async fn create_tool(
             active: true,
             created_at: Some(now.clone()),
             updated_at: Some(now),
+            max_chunk_limit: Some(max_chunk_limit),
             code_search_scopes: code_scopes,
             document_search_scopes: doc_scopes,
         },
@@ -184,12 +197,14 @@ pub async fn update_tool(
         return Err("Tool name is required".into());
     }
     let now = now_iso();
+    let max_chunk_limit = normalize_max_chunk_limit(tool_data.max_chunk_limit);
     sqlx::query(
-        "UPDATE tool_definitions SET name = ?, description = ?, updated_at = ? WHERE id = ?",
+        "UPDATE tool_definitions SET name = ?, description = ?, updated_at = ?, max_chunk_limit = ? WHERE id = ?",
     )
     .bind(&name)
     .bind(&tool_data.description)
     .bind(&now)
+    .bind(max_chunk_limit)
     .bind(tool_id)
     .execute(pool)
     .await
@@ -199,6 +214,7 @@ pub async fn update_tool(
     tool.name = name;
     tool.description = tool_data.description;
     tool.updated_at = Some(now);
+    tool.max_chunk_limit = Some(max_chunk_limit);
     tool.code_search_scopes = code_scopes;
     tool.document_search_scopes = doc_scopes;
     Ok(ToolResponse { tool })
@@ -273,7 +289,7 @@ pub async fn list_active_tools(
 ) -> Result<Vec<ToolDefinition>, String> {
     let tools = if let Some(name) = server_name {
         sqlx::query_as::<_, ToolDefinition>(
-            "SELECT t.id, t.mcp_server_id, t.name, t.description, t.active, t.created_at, t.updated_at \
+            "SELECT t.id, t.mcp_server_id, t.name, t.description, t.active, t.created_at, t.updated_at, t.max_chunk_limit \
              FROM tool_definitions t \
              JOIN mcp_servers s ON s.id = t.mcp_server_id \
              WHERE t.active = 1 AND s.active = 1 AND s.name = ? \
@@ -284,7 +300,7 @@ pub async fn list_active_tools(
         .await
     } else {
         sqlx::query_as::<_, ToolDefinition>(
-            "SELECT t.id, t.mcp_server_id, t.name, t.description, t.active, t.created_at, t.updated_at \
+            "SELECT t.id, t.mcp_server_id, t.name, t.description, t.active, t.created_at, t.updated_at, t.max_chunk_limit \
              FROM tool_definitions t \
              JOIN mcp_servers s ON s.id = t.mcp_server_id \
              WHERE t.active = 1 AND s.active = 1 \
@@ -375,7 +391,7 @@ async fn get_tool_row(
     tool_id: &str,
 ) -> Result<ToolDefinition, String> {
     sqlx::query_as::<_, ToolDefinition>(
-        "SELECT id, mcp_server_id, name, description, active, created_at, updated_at \
+        "SELECT id, mcp_server_id, name, description, active, created_at, updated_at, max_chunk_limit \
          FROM tool_definitions WHERE id = ? AND mcp_server_id = ?",
     )
     .bind(tool_id)
@@ -391,7 +407,7 @@ async fn load_tools_for_server(
     server_id: &str,
 ) -> Result<Vec<ToolDefinition>, String> {
     let tools = sqlx::query_as::<_, ToolDefinition>(
-        "SELECT id, mcp_server_id, name, description, active, created_at, updated_at \
+        "SELECT id, mcp_server_id, name, description, active, created_at, updated_at, max_chunk_limit \
          FROM tool_definitions WHERE mcp_server_id = ? ORDER BY created_at ASC",
     )
     .bind(server_id)

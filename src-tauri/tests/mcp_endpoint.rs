@@ -64,6 +64,7 @@ async fn list_tools_filtered_by_server_id() {
                 group_ids: None,
             }],
             document_search_scopes: vec![],
+            max_chunk_limit: None,
         },
     )
     .await
@@ -80,6 +81,7 @@ async fn list_tools_filtered_by_server_id() {
             description: Some("other".into()),
             code_search_scopes: vec![],
             document_search_scopes: vec![],
+            max_chunk_limit: None,
         },
     )
     .await
@@ -116,6 +118,7 @@ async fn mcp_http_list_tools_via_streamable_http() {
             description: Some("HTTP exposed tool".into()),
             code_search_scopes: vec![],
             document_search_scopes: vec![],
+            max_chunk_limit: None,
         },
     )
     .await

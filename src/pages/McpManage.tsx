@@ -14,8 +14,9 @@ import { Loader2, Trash2, Plus, Cable, ArrowRight } from "lucide-react";
 import PageHead from "@/components/shared/PageHead";
 import ExpandableCard from "@/components/mcp/ExpandableCard";
 import ToolWizard from "@/components/mcp/ToolWizard";
+import NumberStepper from "@/components/ui/NumberStepper";
 import type { McpServer, ToolDefinition, ToolFormData } from "@/types/mcp";
-import { toolFormToPayload, toolToFormData } from "@/types/mcp";
+import { toolFormToPayload, toolToFormData, DEFAULT_MAX_CHUNK_LIMIT } from "@/types/mcp";
 import { card, badge, btnDanger, btnPrimary, btnSecondary, btnDeleteSmall, alertSuccess, alertError, loader, modalOverlay, modalPanel, confirmInput, btnCancel, btnConfirm } from "@/styles/classes";
 
 type ManageMode = "list" | "add" | "edit";
@@ -34,6 +35,7 @@ const McpManage: React.FC = () => {
   const [deleteConfirmServerId, setDeleteConfirmServerId] = useState<string | null>(null);
   const [deleteConfirmText, setDeleteConfirmText] = useState("");
   const [deleteToolPending, setDeleteToolPending] = useState<ToolDefinition | null>(null);
+  const [savingMaxChunkToolId, setSavingMaxChunkToolId] = useState<string | null>(null);
 
   const fetchServers = useCallback(async () => {
     try {
@@ -163,6 +165,32 @@ const McpManage: React.FC = () => {
     }
   }, [expandedServerId, fetchServerDetail]);
 
+  const handleUpdateMaxChunkLimit = useCallback(async (tool: ToolDefinition, maxChunkLimit: number) => {
+    if (!expandedServerId || maxChunkLimit === (tool.max_chunk_limit ?? DEFAULT_MAX_CHUNK_LIMIT)) return;
+    setError(null);
+    setSavingMaxChunkToolId(tool.id);
+    try {
+      await updateMcpTool(expandedServerId, tool.id, {
+        name: tool.name,
+        description: tool.description ?? "",
+        code_search_scopes: tool.code_search_scopes.map((s) => ({
+          collection: s.collection,
+          repo_names: s.repo_names,
+        })),
+        document_search_scopes: tool.document_search_scopes.map((s) => ({
+          collection: s.collection,
+          group_ids: s.group_ids,
+        })),
+        max_chunk_limit: maxChunkLimit,
+      });
+      await fetchServerDetail(expandedServerId);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Failed to update max chunk limit");
+    } finally {
+      setSavingMaxChunkToolId(null);
+    }
+  }, [expandedServerId, fetchServerDetail]);
+
   const handleDeleteServer = useCallback((serverId: string) => {
     setDeleteConfirmServerId(serverId);
     setDeleteConfirmText("");
@@ -277,6 +305,17 @@ const McpManage: React.FC = () => {
                               </div>
                             </div>
                             <div className="flex items-center gap-1.5 shrink-0">
+                              <div className="flex items-center gap-1">
+                                <span className="text-xs text-muted-foreground">Max Chunks</span>
+                                <NumberStepper
+                                  size="sm"
+                                  value={tool.max_chunk_limit ?? DEFAULT_MAX_CHUNK_LIMIT}
+                                  onChange={(value) => handleUpdateMaxChunkLimit(tool, value)}
+                                  min={1}
+                                  max={50}
+                                  disabled={savingMaxChunkToolId === tool.id}
+                                />
+                              </div>
                               <button
                                 onClick={() => handleToggleToolActive(tool)}
                                 className={`${btnSecondary} px-3 py-1.5 text-xs`}

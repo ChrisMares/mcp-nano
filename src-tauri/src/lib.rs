@@ -11,7 +11,7 @@ use std::sync::Arc;
 use services::{EmbedderState, IngestionService, QdrantService, RagService};
 use tauri::{Manager, RunEvent};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use controllers::{data, jobs, mcpconfig, rag, website};
 use mcp::{McpAppState, McpState};
@@ -414,6 +414,40 @@ pub fn run() {
                 let _join = worker::start(pool, registry, cancel, Some(app_handle.clone()));
                 qdrant::publish_status(&app_handle, |s| s.worker_ready = true);
             });
+
+            // Splashscreen: watch for backend readiness (qdrant + db + embedders), then
+            // swap the splashscreen out for the real window. A fallback timeout ensures
+            // the user is never stuck on the splash if something never becomes ready.
+            let app_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                const SPLASH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+                const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(120);
+                let deadline = tokio::time::Instant::now() + SPLASH_TIMEOUT;
+
+                loop {
+                    let ready = app_handle
+                        .try_state::<qdrant::BackendStatusState>()
+                        .and_then(|state| state.0.read().ok().map(|s| s.qdrant_ready && s.db_ready && s.embedders_ready))
+                        .unwrap_or(false);
+
+                    let timed_out = tokio::time::Instant::now() >= deadline;
+                    if ready || timed_out {
+                        if timed_out && !ready {
+                            warn!("Splashscreen timeout reached before backend was ready; showing main window anyway");
+                        }
+                        if let Some(splash) = app_handle.get_webview_window("splashscreen") {
+                            let _ = splash.close();
+                        }
+                        if let Some(main) = app_handle.get_webview_window("main") {
+                            let _ = main.show();
+                            let _ = main.set_focus();
+                        }
+                        break;
+                    }
+                    tokio::time::sleep(POLL_INTERVAL).await;
+                }
+            });
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

@@ -12,6 +12,7 @@ pub struct ToolDefinition {
     pub active: bool,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
+    pub max_chunk_limit: Option<i32>,
     #[sqlx(skip)]
     pub code_search_scopes: Vec<ToolCodeSearchScope>,
     #[sqlx(skip)]

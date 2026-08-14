@@ -50,6 +50,7 @@ async fn server_and_tool_crud() {
                 group_ids: None,
             }],
             document_search_scopes: vec![],
+            max_chunk_limit: None,
         },
     )
     .await
@@ -109,6 +110,7 @@ async fn find_tool_by_name_respects_server_id() {
             description: Some("a".into()),
             code_search_scopes: vec![],
             document_search_scopes: vec![],
+            max_chunk_limit: None,
         },
     )
     .await
@@ -121,6 +123,7 @@ async fn find_tool_by_name_respects_server_id() {
             description: Some("b".into()),
             code_search_scopes: vec![],
             document_search_scopes: vec![],
+            max_chunk_limit: None,
         },
     )
     .await
