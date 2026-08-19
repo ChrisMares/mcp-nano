@@ -18,6 +18,14 @@ fn doc(file: &str) -> PathBuf {
     doc_dir().join(file)
 }
 
+fn code_sample_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/test_data/code_samples")
+}
+
+fn code_sample(file: &str) -> PathBuf {
+    code_sample_dir().join(file)
+}
+
 #[test]
 fn loads_markdown_as_text() {
     let chunks = document_loaders::load_document(&doc("sample.md")).unwrap();
@@ -25,6 +33,42 @@ fn loads_markdown_as_text() {
     assert_eq!(chunks[0].doc_type, "md");
     assert!(chunks[0].content.contains("Markdown Sample"));
     assert!(chunks[0].content.contains("Bullet one"));
+}
+
+#[test]
+fn loads_mdx_as_text() {
+    let chunks = document_loaders::load_document(&code_sample("index.mdx")).unwrap();
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].doc_type, "mdx");
+    // Content is preserved verbatim: frontmatter, directive containers,
+    // JSX blocks, and section headings.
+    let content = &chunks[0].content;
+    assert!(content.contains("title: \"Text splitter integrations\""));
+    assert!(content.contains(":::python"));
+    assert!(content.contains("<CodeGroup>"));
+    assert!(content.contains("## Text structure-based"));
+    assert!(content.contains("## Length-based"));
+    assert!(content.contains("## Document structure-based"));
+    assert!(content.contains("pip install -U langchain-text-splitters"));
+    assert_eq!(
+        chunks[0].metadata.get("source").and_then(|v| v.as_str()),
+        Some("index.mdx")
+    );
+}
+
+#[test]
+fn loads_split_by_token_mdx_as_text() {
+    let chunks = document_loaders::load_document(&code_sample("split_by_token.mdx")).unwrap();
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].doc_type, "mdx");
+    let content = &chunks[0].content;
+    assert!(content.contains("## tiktoken"));
+    assert!(content.contains("## js-tiktoken"));
+    assert!(content.contains("## spaCy"));
+    assert!(content.contains("## KoNLPY"));
+    assert!(content.contains("## Hugging Face tokenizer"));
+    assert!(content.contains("@[CharacterTextSplitter]"));
+    assert!(content.contains("춘향전"));
 }
 
 #[test]

@@ -6,7 +6,7 @@ use anyhow::{anyhow, Context, Result};
 use futures_util::FutureExt;
 use qdrant_client::qdrant::{Condition, Filter};
 use serde::Deserialize;
-use text_splitter::{ChunkConfig, TextSplitter};
+use text_splitter::{ChunkConfig, MarkdownSplitter, TextSplitter};
 use tokenizers::Tokenizer;
 use uuid::Uuid;
 
@@ -119,6 +119,10 @@ pub struct IngestionService {
     /// Second splitter used by `split_oversized_code_chunks`; mirrors the
     /// Python `CODE_CHUNK_SIZE=768, chunk_overlap=64` config.
     code_splitter: Arc<TextSplitter<Tokenizer>>,
+    /// Markdown-aware splitter used for `md`/`mdx` documents (CommonMark
+    /// structure: headings, paragraphs, code blocks). Same size/overlap
+    /// config as the plain text splitter.
+    markdown_splitter: Arc<MarkdownSplitter<Tokenizer>>,
 }
 
 impl IngestionService {
@@ -146,11 +150,22 @@ impl IngestionService {
             .context("building code chunk config")?;
         let code_splitter = TextSplitter::new(code_config);
 
+        // Markdown splitter: separate `Tokenizer` instance; same size and
+        // overlap as the doc splitter so chunk budgets stay consistent.
+        let md_tokenizer = Tokenizer::from_file(models_dir.join("arctic-embed-xs/tokenizer.json"))
+            .map_err(|e| anyhow!("loading markdown tokenizer: {e}"))?;
+        let md_config = ChunkConfig::new(DEFAULT_CHUNK_SIZE)
+            .with_sizer(md_tokenizer)
+            .with_overlap(DEFAULT_CHUNK_OVERLAP)
+            .context("building markdown chunk config")?;
+        let markdown_splitter = MarkdownSplitter::new(md_config);
+
         Ok(Self {
             embedders,
             qdrant,
             splitter: Arc::new(splitter),
             code_splitter: Arc::new(code_splitter),
+            markdown_splitter: Arc::new(markdown_splitter),
         })
     }
 
@@ -752,14 +767,20 @@ impl IngestionService {
                 path_display, source_pages, source_chars
             );
             let splitter = self.splitter.clone();
+            let markdown_splitter = self.markdown_splitter.clone();
             let split_path_display = path_display.clone();
             let (split_progress_tx, mut split_progress_rx) =
                 tokio::sync::mpsc::channel::<ChunkingProgress>(8);
             let split_task = tokio::task::spawn_blocking(move || {
                 catch_sync_panic(&format!("text splitter {split_path_display}"), || {
-                    split_document_chunks_with_progress(loaded, &splitter, |snapshot| {
-                        let _ = split_progress_tx.blocking_send(snapshot);
-                    })
+                    split_document_chunks_with_progress(
+                        loaded,
+                        &splitter,
+                        &markdown_splitter,
+                        |snapshot| {
+                            let _ = split_progress_tx.blocking_send(snapshot);
+                        },
+                    )
                 })
             });
             while let Some(snapshot) = split_progress_rx.recv().await {
@@ -965,10 +986,12 @@ impl IngestionService {
     }
 }
 
-/// Re-tokenize a list of `DocumentChunk`s using the doc text-splitter. Each
-/// input chunk whose `content` exceeds the splitter's chunk size becomes a
-/// sequence of smaller chunks inheriting the same metadata. Used by
-/// `IngestionService::ingest_text_file` for non-code uploads.
+/// Re-tokenize a list of `DocumentChunk`s. Each input chunk whose `content`
+/// exceeds the splitter's chunk size becomes a sequence of smaller chunks
+/// inheriting the same metadata. Used by
+/// `IngestionService::ingest_text_file` for non-code uploads. `md`/`mdx`
+/// chunks are split by the markdown-aware splitter (structure-aligned);
+/// everything else uses the plain text splitter.
 ///
 /// After the token splitter, any remaining piece larger than
 /// [`MAX_CHUNK_CHARS`] is hard-split by character count (minified one-liners
@@ -976,8 +999,9 @@ impl IngestionService {
 pub fn split_document_chunks(
     chunks: Vec<ingestion::DocumentChunk>,
     splitter: &TextSplitter<Tokenizer>,
+    markdown_splitter: &MarkdownSplitter<Tokenizer>,
 ) -> Vec<ingestion::DocumentChunk> {
-    split_document_chunks_with_progress(chunks, splitter, |_| {})
+    split_document_chunks_with_progress(chunks, splitter, markdown_splitter, |_| {})
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -996,6 +1020,7 @@ fn chunking_progress_percent(start: i32, end: i32, completed: usize, total: usiz
 fn split_document_chunks_with_progress(
     chunks: Vec<ingestion::DocumentChunk>,
     splitter: &TextSplitter<Tokenizer>,
+    markdown_splitter: &MarkdownSplitter<Tokenizer>,
     mut report: impl FnMut(ChunkingProgress),
 ) -> Vec<ingestion::DocumentChunk> {
     if chunks.is_empty() {
@@ -1004,7 +1029,14 @@ fn split_document_chunks_with_progress(
     let total = chunks.len();
     let mut out: Vec<ingestion::DocumentChunk> = Vec::new();
     for (source_index, chunk) in chunks.into_iter().enumerate() {
-        let parts: Vec<String> = splitter.chunks(&chunk.content).map(String::from).collect();
+        let parts: Vec<String> = if matches!(chunk.doc_type.as_str(), "md" | "mdx") {
+            markdown_splitter
+                .chunks(&chunk.content)
+                .map(String::from)
+                .collect()
+        } else {
+            splitter.chunks(&chunk.content).map(String::from).collect()
+        };
         let parts = if parts.is_empty() {
             vec![chunk.content.clone()]
         } else {
@@ -1447,19 +1479,67 @@ mod tests {
         Some(TextSplitter::new(config))
     }
 
+    fn test_markdown_splitter() -> Option<MarkdownSplitter<Tokenizer>> {
+        let tok_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("resources/models/arctic-embed-xs/tokenizer.json");
+        if !tok_path.exists() {
+            return None;
+        }
+        let tokenizer = Tokenizer::from_file(&tok_path).ok()?;
+        let config = ChunkConfig::new(DEFAULT_CHUNK_SIZE)
+            .with_sizer(tokenizer)
+            .with_overlap(DEFAULT_CHUNK_OVERLAP)
+            .ok()?;
+        Some(MarkdownSplitter::new(config))
+    }
+
+    fn test_splitters() -> Option<(TextSplitter<Tokenizer>, MarkdownSplitter<Tokenizer>)> {
+        Some((test_doc_splitter()?, test_markdown_splitter()?))
+    }
+
+    fn assert_valid_split(split: &[ingestion::DocumentChunk]) {
+        assert!(!split.is_empty(), "expected at least one chunk after split");
+        assert!(
+            split
+                .iter()
+                .map(|c| c.content.chars().count())
+                .max()
+                .unwrap_or(0)
+                <= MAX_CHUNK_CHARS,
+            "chunk exceeds hard char cap {MAX_CHUNK_CHARS}"
+        );
+        assert!(
+            split
+                .iter()
+                .enumerate()
+                .all(|(index, chunk)| chunk.chunk_index == index as i64),
+            "split chunks must have globally sequential indexes"
+        );
+        assert!(
+            split.iter().all(|c| !c.id.is_empty()),
+            "split chunks must have fresh ids"
+        );
+    }
+
+    fn code_sample(file: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/test_data/code_samples")
+            .join(file)
+    }
+
     /// Reproduces the OptionsPricing zip issue: source maps / minified assets
     /// were stored as ~1MB `document` payloads. After the fix, every chunk
     /// must stay under the hard char cap.
     #[test]
     fn split_document_chunks_caps_huge_minified_blob() {
-        let Some(splitter) = test_doc_splitter() else {
+        let Some((splitter, markdown_splitter)) = test_splitters() else {
             eprintln!("skipping: arctic tokenizer not present");
             return;
         };
         // Single-line ~900KB blob (like a .js.map) — no natural newlines.
         let huge = "a".repeat(900_000);
         let chunk = ingestion::DocumentChunk::new("id1", "chart.umd.min.js.map", huge, "map", 0);
-        let split = split_document_chunks(vec![chunk], &splitter);
+        let split = split_document_chunks(vec![chunk], &splitter, &markdown_splitter);
         assert!(!split.is_empty(), "expected at least one chunk after split");
         let max_chars = split
             .iter()
@@ -1484,7 +1564,7 @@ mod tests {
 
     #[test]
     fn split_document_chunks_keeps_page_metadata() {
-        let Some(splitter) = test_doc_splitter() else {
+        let Some((splitter, markdown_splitter)) = test_splitters() else {
             eprintln!("skipping: arctic tokenizer not present");
             return;
         };
@@ -1493,12 +1573,162 @@ mod tests {
         let mut second = ingestion::DocumentChunk::new("id2", "guide.pdf", "second page", "pdf", 1);
         second.page = Some(1);
 
-        let split = split_document_chunks(vec![first, second], &splitter);
+        let split = split_document_chunks(vec![first, second], &splitter, &markdown_splitter);
         assert_eq!(split.len(), 2);
         assert_eq!(split[0].page, Some(0));
         assert_eq!(split[1].page, Some(1));
         assert_eq!(split[0].chunk_index, 0);
         assert_eq!(split[1].chunk_index, 1);
+    }
+
+    /// Oversized synthetic markdown: headings must survive the split intact
+    /// (never cut mid-line) and both `#` sections end up represented.
+    #[test]
+    fn split_markdown_chunks_align_to_headings() {
+        let Some((splitter, markdown_splitter)) = test_splitters() else {
+            eprintln!("skipping: arctic tokenizer not present");
+            return;
+        };
+        let filler = |word: &str, count: usize| {
+            std::iter::repeat_n(
+                format!("The {word} section discusses semantic chunking boundaries in detail. "),
+                count,
+            )
+            .collect::<Vec<_>>()
+            .join("\n\n")
+        };
+        let content = format!(
+            "# Alpha Overview\n\n{}\n\n# Beta Reference\n\n{}",
+            filler("alpha", 60),
+            filler("beta", 60)
+        );
+        let chunk = ingestion::DocumentChunk::new("id1", "guide.md", content.clone(), "md", 0);
+
+        let split = split_document_chunks(vec![chunk], &splitter, &markdown_splitter);
+        assert!(
+            split.len() >= 2,
+            "expected multiple chunks, got {}",
+            split.len()
+        );
+        assert_valid_split(&split);
+        assert!(split.iter().all(|c| c.doc_type == "md"));
+        assert!(split.iter().all(|c| c.file_name == "guide.md"));
+        for heading in ["# Alpha Overview", "# Beta Reference"] {
+            assert!(
+                split.iter().any(|c| c.content.contains(heading)),
+                "heading {heading:?} missing from all chunks"
+            );
+        }
+        // Headings must never be split mid-line: any chunk mentioning the
+        // section name carries the full heading line.
+        for c in &split {
+            if c.content.contains("Overview") {
+                assert!(c.content.contains("# Alpha Overview"));
+            }
+            if c.content.contains("Reference") {
+                assert!(c.content.contains("# Beta Reference"));
+            }
+        }
+        let combined: String = split.iter().map(|c| c.content.as_str()).collect();
+        assert!(combined.contains("semantic chunking boundaries"));
+    }
+
+    /// Real-world MDX fixture (LangChain docs index): frontmatter, directive
+    /// containers (`:::python`), JSX blocks (`<CodeGroup>`, `<Tip>`), fenced
+    /// code, and `##` sections must all survive chunking.
+    #[test]
+    fn split_mdx_index_fixture() {
+        let Some((splitter, markdown_splitter)) = test_splitters() else {
+            eprintln!("skipping: arctic tokenizer not present");
+            return;
+        };
+        let loaded = ingestion::document_loaders::load_document(&code_sample("index.mdx"))
+            .expect("loading index.mdx fixture");
+        assert_eq!(loaded.len(), 1);
+
+        let split = split_document_chunks(loaded, &splitter, &markdown_splitter);
+        assert_valid_split(&split);
+        assert!(split.iter().all(|c| c.doc_type == "mdx"));
+        assert!(split.iter().all(|c| c.file_name == "index.mdx"));
+        let combined: String = split.iter().map(|c| c.content.as_str()).collect();
+        for heading in [
+            "## Text structure-based",
+            "## Length-based",
+            "## Document structure-based",
+        ] {
+            assert!(
+                combined.contains(heading),
+                "heading {heading:?} lost during mdx split"
+            );
+        }
+        assert!(combined.contains("title: \"Text splitter integrations\""));
+        assert!(combined.contains("pip install -U langchain-text-splitters"));
+        assert!(combined.contains("RecursiveCharacterTextSplitter"));
+        assert!(combined.contains("<CodeGroup>"));
+    }
+
+    /// Real-world MDX fixture (LangChain split-by-token guide): guaranteed
+    /// multi-chunk at this size; section headings, JSX, `@[Component]` refs
+    /// and UTF-8 Korean text must survive.
+    #[test]
+    fn split_mdx_split_by_token_fixture() {
+        let Some((splitter, markdown_splitter)) = test_splitters() else {
+            eprintln!("skipping: arctic tokenizer not present");
+            return;
+        };
+        let loaded = ingestion::document_loaders::load_document(&code_sample("split_by_token.mdx"))
+            .expect("loading split_by_token.mdx fixture");
+        assert_eq!(loaded.len(), 1);
+
+        let split = split_document_chunks(loaded, &splitter, &markdown_splitter);
+        assert!(
+            split.len() >= 2,
+            "expected multiple chunks, got {}",
+            split.len()
+        );
+        assert_valid_split(&split);
+        assert!(split.iter().all(|c| c.doc_type == "mdx"));
+        let combined: String = split.iter().map(|c| c.content.as_str()).collect();
+        for heading in [
+            "## tiktoken",
+            "## js-tiktoken",
+            "## spaCy",
+            "## SentenceTransformers",
+            "## NLTK",
+            "## KoNLPY",
+            "## Hugging Face tokenizer",
+        ] {
+            assert!(
+                combined.contains(heading),
+                "heading {heading:?} lost during mdx split"
+            );
+        }
+        assert!(combined.contains("@[CharacterTextSplitter]"));
+        assert!(combined.contains("춘향전"));
+        assert!(combined.contains("<Note>"));
+    }
+
+    /// Plain `.md` regression: the committed sample flows through the
+    /// markdown-aware splitter without losing content.
+    #[test]
+    fn split_markdown_sample_md() {
+        let Some((splitter, markdown_splitter)) = test_splitters() else {
+            eprintln!("skipping: arctic tokenizer not present");
+            return;
+        };
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/test_data/documents/sample.md");
+        let loaded =
+            ingestion::document_loaders::load_document(&path).expect("loading sample.md fixture");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].doc_type, "md");
+
+        let split = split_document_chunks(loaded, &splitter, &markdown_splitter);
+        assert_valid_split(&split);
+        assert!(split.iter().all(|c| c.doc_type == "md"));
+        let combined: String = split.iter().map(|c| c.content.as_str()).collect();
+        assert!(combined.contains("Markdown Sample"));
+        assert!(combined.contains("Bullet one"));
     }
 
     #[test]

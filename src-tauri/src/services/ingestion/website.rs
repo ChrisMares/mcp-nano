@@ -187,31 +187,73 @@ fn browser_path() -> Option<PathBuf> {
             return Some(path);
         }
     }
-    [
+    let names = [
         "chromium",
         "chromium-browser",
         "google-chrome",
         "google-chrome-stable",
-        "msedge",
         "chrome",
-    ]
-    .iter()
-    .map(PathBuf::from)
-    .find(|path| path.to_string_lossy().contains('/') || which_on_path(path))
+        "msedge",
+    ];
+    std::env::var_os("PATH")
+        .and_then(|path| names.iter().find_map(|name| find_on_path(&path, name)))
+        .or_else(|| {
+            windows_browser_candidates(
+                std::env::var_os("ProgramFiles"),
+                std::env::var_os("ProgramFiles(x86)"),
+                std::env::var_os("LOCALAPPDATA"),
+            )
+            .into_iter()
+            .find(|path| path.is_file())
+        })
 }
 
-fn which_on_path(command: &PathBuf) -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|directory| {
-        let candidate = directory.join(command);
-        candidate.is_file()
-            || (cfg!(windows)
-                && directory
-                    .join(format!("{}.exe", command.display()))
-                    .is_file())
+/// Resolve `name` against each directory of `path_value` (a `PATH` string).
+/// Windows also tries the `.exe` suffix.
+fn find_on_path(path_value: &std::ffi::OsStr, name: &str) -> Option<PathBuf> {
+    std::env::split_paths(path_value).find_map(|directory| {
+        let candidate = directory.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        if cfg!(windows) {
+            let exe = directory.join(format!("{name}.exe"));
+            if exe.is_file() {
+                return Some(exe);
+            }
+        }
+        None
     })
+}
+
+/// Chromium-family browsers in their default Windows install locations,
+/// most preferred first. Pure function over the roots so it is testable
+/// without Windows.
+fn windows_browser_candidates(
+    program_files: Option<std::ffi::OsString>,
+    program_files_x86: Option<std::ffi::OsString>,
+    local_appdata: Option<std::ffi::OsString>,
+) -> Vec<PathBuf> {
+    let chrome_tail = PathBuf::from("Google").join("Chrome").join("chrome.exe");
+    let edge_tail = PathBuf::from("Microsoft").join("Edge").join("msedge.exe");
+    let chromium_tail = PathBuf::from("Chromium").join("chrome.exe");
+    [
+        program_files
+            .clone()
+            .map(|root| PathBuf::from(root).join(&chrome_tail)),
+        program_files_x86
+            .clone()
+            .map(|root| PathBuf::from(root).join(&chrome_tail)),
+        local_appdata
+            .clone()
+            .map(|root| PathBuf::from(root).join(&chrome_tail)),
+        program_files.map(|root| PathBuf::from(root).join(&edge_tail)),
+        program_files_x86.map(|root| PathBuf::from(root).join(&edge_tail)),
+        local_appdata.map(|root| PathBuf::from(root).join(&chromium_tail)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 async fn render_page(url: &str, browser: &PathBuf) -> anyhow::Result<String> {
@@ -616,8 +658,11 @@ fn gunzip(body: Vec<u8>) -> Option<Vec<u8>> {
         return Some(body);
     }
     let mut decoded = Vec::new();
-    std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(body.as_slice()), &mut decoded)
-        .ok()?;
+    std::io::Read::read_to_end(
+        &mut flate2::read::GzDecoder::new(body.as_slice()),
+        &mut decoded,
+    )
+    .ok()?;
     Some(decoded)
 }
 
@@ -781,7 +826,10 @@ pub async fn crawl_website_with_options_and_cancellation(
         visited: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
         seen: Arc::new(tokio::sync::Mutex::new(HashSet::from([start_key.clone()]))),
         results: Arc::new(tokio::sync::Mutex::new(vec![start_key])),
-        queue: Arc::new(tokio::sync::Mutex::new(VecDeque::from([(start.to_string(), 0)]))),
+        queue: Arc::new(tokio::sync::Mutex::new(VecDeque::from([(
+            start.to_string(),
+            0,
+        )]))),
         sitemap_queue: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
     });
     enqueue_sitemap_urls(&run, sitemap_urls).await;
@@ -790,7 +838,8 @@ pub async fn crawl_website_with_options_and_cancellation(
     let mut handles = Vec::new();
 
     loop {
-        if run.cancellation
+        if run
+            .cancellation
             .as_ref()
             .is_some_and(CancellationToken::is_cancelled)
         {
@@ -850,7 +899,8 @@ pub async fn crawl_website_with_options_and_cancellation(
     for handle in handles {
         let _ = handle.await;
     }
-    if run.cancellation
+    if run
+        .cancellation
         .as_ref()
         .is_some_and(CancellationToken::is_cancelled)
     {
@@ -900,7 +950,8 @@ async fn enqueue_sitemap_urls(run: &CrawlRun, sitemap_urls: Vec<String>) {
 
 /// Fetch one page, record it in the results, and enqueue newly found links.
 async fn crawl_page(run: Arc<CrawlRun>, url_str: String, cur_depth: usize) {
-    if run.cancellation
+    if run
+        .cancellation
         .as_ref()
         .is_some_and(CancellationToken::is_cancelled)
     {
@@ -1371,24 +1422,23 @@ pub async fn process_website_with_splitter(
     // Scrape pages concurrently: a JavaScript render takes seconds per page,
     // so a sequential loop dominates the total embed time on large sites.
     // `buffered` keeps the chunk output in input order.
-    let pages: Vec<Option<ScrapedPage>> =
-        futures_util::stream::iter(urls.iter().cloned())
-            .map(|url| {
-                let client = client.clone();
-                let browser = browser.clone();
-                async move {
-                    match scrape_page(&client, browser.as_ref(), &url).await {
-                        Ok(page) => Some(page),
-                        Err(e) => {
-                            tracing::warn!("failed to scrape {url}: {e:#}");
-                            None
-                        }
+    let pages: Vec<Option<ScrapedPage>> = futures_util::stream::iter(urls.iter().cloned())
+        .map(|url| {
+            let client = client.clone();
+            let browser = browser.clone();
+            async move {
+                match scrape_page(&client, browser.as_ref(), &url).await {
+                    Ok(page) => Some(page),
+                    Err(e) => {
+                        tracing::warn!("failed to scrape {url}: {e:#}");
+                        None
                     }
                 }
-            })
-            .buffered(scrape_concurrency(render_javascript))
-            .collect()
-            .await;
+            }
+        })
+        .buffered(scrape_concurrency(render_javascript))
+        .collect()
+        .await;
 
     for (url, page) in urls.iter().zip(pages) {
         let Some((page_title, sections, navigation_links)) = page else {
@@ -1808,5 +1858,61 @@ mod tests {
     fn simple_chunk_short_text_passthrough() {
         assert_eq!(simple_chunk("hello world", 768, 50), vec!["hello world"]);
         assert_eq!(simple_chunk("anything", 0, 0), vec!["anything"]);
+    }
+
+    #[test]
+    fn windows_browser_candidates_prefer_chrome_then_edge() {
+        let program_files = PathBuf::from("/fake/Program Files");
+        let program_files_x86 = PathBuf::from("/fake/Program Files (x86)");
+        let local_appdata = PathBuf::from("/fake/LocalAppData");
+        let candidates = windows_browser_candidates(
+            Some(program_files.clone().into_os_string()),
+            Some(program_files_x86.clone().into_os_string()),
+            Some(local_appdata.clone().into_os_string()),
+        );
+        assert_eq!(
+            candidates,
+            vec![
+                program_files.join("Google/Chrome/chrome.exe"),
+                program_files_x86.join("Google/Chrome/chrome.exe"),
+                local_appdata.join("Google/Chrome/chrome.exe"),
+                program_files.join("Microsoft/Edge/msedge.exe"),
+                program_files_x86.join("Microsoft/Edge/msedge.exe"),
+                local_appdata.join("Chromium/chrome.exe"),
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_browser_candidates_skip_missing_roots() {
+        let candidates = windows_browser_candidates(
+            Some(PathBuf::from("/fake/Program Files").into_os_string()),
+            None,
+            None,
+        );
+        assert_eq!(
+            candidates,
+            vec![
+                PathBuf::from("/fake/Program Files/Google/Chrome/chrome.exe"),
+                PathBuf::from("/fake/Program Files/Microsoft/Edge/msedge.exe"),
+            ]
+        );
+    }
+
+    #[test]
+    fn find_on_path_resolves_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("google-chrome"), b"#!/bin/sh\n").unwrap();
+        let path_value = format!("{}:{}", bin.display(), dir.path().join("missing").display());
+        assert_eq!(
+            find_on_path(std::ffi::OsStr::new(&path_value), "google-chrome"),
+            Some(bin.join("google-chrome"))
+        );
+        assert_eq!(
+            find_on_path(std::ffi::OsStr::new(&path_value), "chromium"),
+            None
+        );
     }
 }

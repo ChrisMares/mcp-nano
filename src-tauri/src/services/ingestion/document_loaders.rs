@@ -4,6 +4,9 @@
 //! Supported formats:
 //! - `.txt` / unknown — read as UTF-8 text.
 //! - `.md` — read raw (text-splitter handles it).
+//! - `.mdx` — read raw like `.md`; the ingestion service routes both to the
+//!   markdown-aware splitter. JSX/ESM constructs are left in place (CommonMark
+//!   parses them as HTML blocks / paragraphs).
 //! - `.csv` — one chunk per row pair (mirrors langchain `CSVLoader`'s
 //!   "row_num: <text>" output).
 //! - `.json` — pretty-printed as a single chunk.
@@ -47,6 +50,7 @@ pub fn load_document(path: &Path) -> anyhow::Result<Vec<DocumentChunk>> {
     match ext.as_str() {
         "txt" | "" => load_text(path, &file_name, &doc_type),
         "md" => load_text(path, &file_name, "md"),
+        "mdx" => load_text(path, &file_name, "mdx"),
         "csv" => load_csv(path, &file_name),
         "json" => load_json(path, &file_name),
         "xml" => load_xml(path, &file_name),
