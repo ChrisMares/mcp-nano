@@ -15,6 +15,8 @@ use axum::Router;
 use mcp_nano_lib::services::ingestion::website;
 use serde_json::Map;
 use tokio::sync::oneshot;
+use tokio::time::{sleep, Duration};
+use tokio_util::sync::CancellationToken;
 
 mod common;
 
@@ -167,7 +169,11 @@ async fn spawn_sitemap_site() -> (String, oneshot::Sender<()>) {
     let guide = Html("<html><body><h1>Guide</h1><p>Sitemap-only guide.</p></body></html>");
     let reference =
         Html("<html><body><h1>Reference</h1><p>Sitemap-only reference.</p></body></html>");
-    let installation = Html("<html><body><h1>Installation</h1><p>Extensionless sitemap page.</p></body></html>");
+    let installation =
+        Html("<html><body><h1>Installation</h1><p>Extensionless sitemap page.</p></body></html>");
+    let blog = Html("<html><body><h1>Blog</h1><p>Blog content.</p></body></html>");
+    let docs_guide =
+        Html("<html><body><h1>Docs Guide</h1><p>Documentation content.</p></body></html>");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();
     let origin = format!("http://{addr}");
@@ -176,6 +182,9 @@ async fn spawn_sitemap_site() -> (String, oneshot::Sender<()>) {
     );
     let pages_sitemap = format!(
         r#"<?xml version="1.0"?><urlset><url><loc>{origin}/guide.html</loc></url><url><loc>{origin}/reference.html</loc></url><url><loc>{origin}/get-started-installation</loc></url></urlset>"#
+    );
+    let secondary_sitemap = format!(
+        r#"<?xml version="1.0"?><urlset><url><loc>{origin}/blog.html</loc></url><url><loc>{origin}/docs/guide.html</loc></url></urlset>"#
     );
     let app = Router::new()
         .route("/", get(move || async move { index }))
@@ -198,7 +207,20 @@ async fn spawn_sitemap_site() -> (String, oneshot::Sender<()>) {
                 let pages_sitemap = pages_sitemap.clone();
                 async move { pages_sitemap }
             }),
-        );
+        )
+        .route(
+            "/secondary.xml",
+            get(move || {
+                let secondary_sitemap = secondary_sitemap.clone();
+                async move { secondary_sitemap }
+            }),
+        )
+        .route(
+            "/robots.txt",
+            get(|| async { "Sitemap: /sitemap.xml\nSitemap: /secondary.xml\n" }),
+        )
+        .route("/blog.html", get(move || async move { blog }))
+        .route("/docs/guide.html", get(move || async move { docs_guide }));
     let (tx, rx) = oneshot::channel::<()>();
     tokio::spawn(async move {
         axum::serve(listener, app)
@@ -215,7 +237,9 @@ async fn spawn_sitemap_site() -> (String, oneshot::Sender<()>) {
 async fn crawl_website_resolves_relative_links_from_directory_index() {
     let (origin, shutdown) = spawn_dir_site().await;
     let start = format!("{origin}/latest/api/");
-    let urls = website::crawl_website(&start, 1, true, None)
+    // same_domain_only=false: the `../learn/` link intentionally leaves the
+    // /latest/api/ path scope, which the scope filter would drop.
+    let urls = website::crawl_website(&start, 1, false, None)
         .await
         .expect("crawl");
     let _ = shutdown.send(());
@@ -256,6 +280,117 @@ async fn crawl_website_discovers_urls_from_nested_sitemap() {
         let expected = format!("{origin}/{path}");
         assert!(set.contains(&expected), "missing {expected} in {urls:?}");
     }
+    assert!(set.contains(&format!("{origin}/blog.html")));
+}
+
+#[tokio::test]
+async fn crawl_website_current_site_section_excludes_sibling_paths() {
+    let (origin, shutdown) = spawn_sitemap_site().await;
+    let start = format!("{origin}/docs/");
+    let urls = website::crawl_website(&start, 0, true, None)
+        .await
+        .expect("crawl");
+    let _ = shutdown.send(());
+
+    assert!(urls.iter().any(|url| url.ends_with("/docs/guide.html")));
+    assert!(!urls.iter().any(|url| url.ends_with("/blog.html")));
+}
+
+#[tokio::test]
+async fn crawl_website_stops_when_cancelled() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = Router::new().route(
+        "/",
+        get(|| async {
+            sleep(Duration::from_secs(5)).await;
+            Html("<html><body><h1>Slow page</h1></body></html>")
+        }),
+    );
+    let (shutdown, shutdown_rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .ok();
+    });
+
+    let cancellation = CancellationToken::new();
+    let start = format!("http://{addr}/");
+    let task_cancellation = cancellation.clone();
+    let task = tokio::spawn(async move {
+        website::crawl_website_with_options_and_cancellation(
+            &start,
+            1,
+            true,
+            false,
+            Some(task_cancellation),
+            None,
+        )
+        .await
+    });
+    sleep(Duration::from_millis(100)).await;
+    cancellation.cancel();
+
+    let result = task.await.unwrap();
+    let _ = shutdown.send(());
+    assert!(result.unwrap_err().to_string().contains("cancelled"));
+}
+
+/// `process_website` scrapes pages concurrently: 5 pages that each take 400ms
+/// must finish well under the 2s a sequential loop would need, and chunks
+/// must stay in input order.
+#[tokio::test]
+async fn process_website_scrapes_pages_concurrently() {
+    async fn slow_page() -> Html<&'static str> {
+        sleep(Duration::from_millis(400)).await;
+        Html(
+            "<html><head><title>Slow page</title></head>\
+             <body><h1>Slow page</h1><p>Concurrent content.</p></body></html>",
+        )
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr: SocketAddr = listener.local_addr().unwrap();
+    let app = Router::new()
+        .route("/p0", get(slow_page))
+        .route("/p1", get(slow_page))
+        .route("/p2", get(slow_page))
+        .route("/p3", get(slow_page))
+        .route("/p4", get(slow_page));
+    let (shutdown, shutdown_rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .ok();
+    });
+
+    let urls: Vec<String> = (0..5).map(|n| format!("http://{addr}/p{n}")).collect();
+    let started = std::time::Instant::now();
+    let chunks = website::process_website(&urls, &Map::new())
+        .await
+        .expect("process website");
+    let elapsed = started.elapsed();
+    let _ = shutdown.send(());
+
+    assert_eq!(chunks.len(), urls.len(), "expected one chunk per page");
+    assert!(
+        chunks
+            .iter()
+            .all(|c| c.content.contains("Concurrent content")),
+        "unexpected chunk content"
+    );
+    for (chunk, url) in chunks.iter().zip(&urls) {
+        assert_eq!(chunk.file_name, *url, "chunks must stay in input order");
+    }
+    assert!(
+        elapsed < Duration::from_millis(1500),
+        "scraping 5 x 400ms pages took {elapsed:?}; expected concurrent execution"
+    );
 }
 
 #[tokio::test]

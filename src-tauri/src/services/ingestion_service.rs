@@ -219,22 +219,33 @@ impl IngestionService {
             }
         }
         if collection == "codebase" {
-            if let Some(repo_name) = embedding_options.repo_name.as_deref().filter(|name| !name.is_empty()) {
+            if let Some(repo_name) = embedding_options
+                .repo_name
+                .as_deref()
+                .filter(|name| !name.is_empty())
+            {
                 self.qdrant
                     .delete_items(
                         &collection,
                         None,
-                        Some(Filter::must([Condition::matches("repo_name", repo_name.to_string())])),
+                        Some(Filter::must([Condition::matches(
+                            "repo_name",
+                            repo_name.to_string(),
+                        )])),
                     )
                     .await
                     .context("deleting prior codebase vectors for zip")?;
             }
-        } else if let Some(zip_filename) = p.zip_filename.as_deref().filter(|name| !name.is_empty()) {
+        } else if let Some(zip_filename) = p.zip_filename.as_deref().filter(|name| !name.is_empty())
+        {
             self.qdrant
                 .delete_items(
                     &collection,
                     None,
-                    Some(Filter::must([Condition::matches("zip_filename", zip_filename.to_string())])),
+                    Some(Filter::must([Condition::matches(
+                        "zip_filename",
+                        zip_filename.to_string(),
+                    )])),
                 )
                 .await
                 .context("deleting prior document vectors for zip")?;
@@ -552,9 +563,10 @@ impl IngestionService {
                     std::slice::from_ref(url),
                     &base_metadata,
                     Some(&self.splitter),
+                    p.render_javascript.unwrap_or(false),
                 )
-                    .await
-                    .context("scraping + chunking website pages")
+                .await
+                .context("scraping + chunking website pages")
             })
             .await?;
             chunks.extend(page_chunks);
@@ -751,7 +763,12 @@ impl IngestionService {
                 })
             });
             while let Some(snapshot) = split_progress_rx.recv().await {
-                let pct = chunking_progress_percent(chunk_pct, range_start, snapshot.completed, snapshot.total);
+                let pct = chunking_progress_percent(
+                    chunk_pct,
+                    range_start,
+                    snapshot.completed,
+                    snapshot.total,
+                );
                 progress(
                     pct,
                     Some(format!(
@@ -1258,6 +1275,7 @@ struct ProcessWebsiteParams {
     urls: Vec<String>,
     group: String,
     metadata: Option<serde_json::Value>,
+    render_javascript: Option<bool>,
 }
 
 #[cfg(test)]

@@ -12,17 +12,22 @@
 //! - `REQUEST_TIMEOUT = 3s`
 //! - `CRAWL_DELAY = 100ms`
 //! - `MERGE_MIN_TOKENS = 512`
-//! - `MAX_PAGES = 200` (env-configurable via `WEBSITE_CRAWL_MAX_PAGES`)
+//! - `MAX_PAGES = 1000` (env-configurable via `WEBSITE_CRAWL_MAX_PAGES`)
 
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::future::Future;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context;
+use futures_util::stream::StreamExt;
 use serde::Serialize;
 use serde_json::{Map, Value};
 use text_splitter::TextSplitter;
 use tokenizers::Tokenizer;
+use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use super::types::DocumentChunk;
@@ -43,11 +48,13 @@ pub type CrawlProgressCallback = Arc<dyn Fn(CrawlProgressEvent) + Send + Sync>;
 
 const REQUEST_TIMEOUT_SECS: u64 = 3;
 const CRAWL_DELAY_MS: u64 = 100;
+/// Concurrent page fetches during a crawl.
+const CRAWL_CONCURRENCY: usize = 10;
 const MERGE_MIN_TOKENS: usize = 512;
 const MIN_ANCHOR_LEN: usize = 4;
 
 /// Domains that social sharing / analytics / app-store pages live on which
-/// we refuse to crawl. Direct port of `IGNORED_DOMAINS`.
+/// the crawler intentionally skips.
 const IGNORED_DOMAINS: &[&str] = &[
     "facebook.com",
     "fb.com",
@@ -103,7 +110,6 @@ const IGNORED_DOMAINS: &[&str] = &[
     "sharethis.com",
     "disqus.com",
 ];
-
 /// Tag names that emit a leaf text section.
 const LEAF_TEXT_TAGS: &[&str] = &[
     "p",
@@ -122,13 +128,39 @@ const LEAF_TEXT_TAGS: &[&str] = &[
     "summary",
 ];
 
-/// Maximum pages crawled in a single `crawl_website` call. Mirrors Python
-/// `WEBSITE_CRAWL_MAX_PAGES` (default 200).
+/// Maximum pages fetched in a single crawl. Sitemap discovery is not limited
+/// by this value, so a large sitemap remains fully selectable in the UI.
 fn max_pages() -> usize {
     std::env::var("WEBSITE_CRAWL_MAX_PAGES")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(200)
+        .map(|value| if value == 0 { usize::MAX } else { value })
+        .unwrap_or(1000)
+}
+
+fn max_sitemaps() -> usize {
+    std::env::var("WEBSITE_CRAWL_MAX_SITEMAPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(512)
+}
+
+fn max_sitemap_urls() -> usize {
+    std::env::var("WEBSITE_CRAWL_MAX_SITEMAP_URLS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(250_000)
+}
+
+/// Concurrent page scrapes during embedding. Browser renders dominate
+/// CPU/memory, so they default lower than plain HTTP fetches.
+/// `WEBSITE_SCRAPE_CONCURRENCY` overrides.
+fn scrape_concurrency(render_javascript: bool) -> usize {
+    std::env::var("WEBSITE_SCRAPE_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(if render_javascript { 4 } else { 8 })
 }
 
 /// Default headers applied to every outbound request.
@@ -141,22 +173,94 @@ fn headers() -> reqwest::header::HeaderMap {
     map
 }
 
-fn is_ignored_domain(host: &str) -> bool {
-    let host = host.to_lowercase();
-    for d in IGNORED_DOMAINS {
-        if host == *d || host.ends_with(&format!(".{d}")) {
-            return true;
-        }
-    }
-    false
+fn http_client() -> anyhow::Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+        .default_headers(headers())
+        .build()?)
 }
 
-fn same_domain(url: &Url, base: &str) -> bool {
-    if let Some(host) = url.host_str() {
-        let h = host.to_lowercase();
-        return h == base || h.ends_with(&format!(".{base}"));
+fn browser_path() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("WEBSITE_BROWSER_PATH") {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Some(path);
+        }
     }
-    false
+    [
+        "chromium",
+        "chromium-browser",
+        "google-chrome",
+        "google-chrome-stable",
+        "msedge",
+        "chrome",
+    ]
+    .iter()
+    .map(PathBuf::from)
+    .find(|path| path.to_string_lossy().contains('/') || which_on_path(path))
+}
+
+fn which_on_path(command: &PathBuf) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|directory| {
+        let candidate = directory.join(command);
+        candidate.is_file()
+            || (cfg!(windows)
+                && directory
+                    .join(format!("{}.exe", command.display()))
+                    .is_file())
+    })
+}
+
+async fn render_page(url: &str, browser: &PathBuf) -> anyhow::Result<String> {
+    let profile = tempfile::tempdir().context("creating browser profile")?;
+    let output = tokio::time::timeout(
+        Duration::from_secs(30),
+        tokio::process::Command::new(browser)
+            .args([
+                "--headless=new",
+                "--disable-gpu",
+                "--disable-dev-shm-usage",
+                "--no-sandbox",
+                "--no-first-run",
+                "--dump-dom",
+                "--virtual-time-budget=10000",
+            ])
+            .arg(format!("--user-data-dir={}", profile.path().display()))
+            .arg(url)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("browser timed out after 30 seconds"))??;
+    if !output.status.success() {
+        anyhow::bail!("browser exited with status {}", output.status);
+    }
+    String::from_utf8(output.stdout).context("browser returned non-UTF-8 HTML")
+}
+
+fn same_scope(url: &Url, start: &Url) -> bool {
+    if url.host_str().map(str::to_ascii_lowercase) != start.host_str().map(str::to_ascii_lowercase)
+        || url.port_or_known_default() != start.port_or_known_default()
+    {
+        return false;
+    }
+
+    let start_path = start.path().trim_end_matches('/');
+    if start_path.is_empty() {
+        return true;
+    }
+    let url_path = url.path().trim_end_matches('/');
+    url_path == start_path || url_path.starts_with(&format!("{start_path}/"))
+}
+
+fn is_ignored_domain(host: &str) -> bool {
+    let host = host.to_lowercase();
+    IGNORED_DOMAINS
+        .iter()
+        .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")))
 }
 
 /// Canonical form used for visited/seen/results identity.
@@ -171,24 +275,72 @@ fn canonical_url(url: &Url) -> String {
     s
 }
 
-/// URL string used for the actual HTTP GET.
-///
-/// Preserve the discovered path exactly. Adding a slash to every path that
-/// does not look like a file turns extensionless pages such as
-/// `/get-started-installation` into a different URL, which some static sites
-/// return as 404. `response.url()` remains the authoritative base for joins.
-fn fetch_url_string(url: &Url) -> String {
-    url.to_string()
+fn origin_url(start: &Url) -> Url {
+    let mut origin = start.clone();
+    origin.set_path("/");
+    origin.set_query(None);
+    origin.set_fragment(None);
+    origin
 }
 
-/// Return the conventional sitemap location for a site. Sitemap discovery is
-/// deliberately independent from robots.txt so crawls do not need to fetch it.
-fn sitemap_url(start: &Url) -> Url {
-    let mut sitemap = start.clone();
-    sitemap.set_path("/sitemap.xml");
-    sitemap.set_query(None);
-    sitemap.set_fragment(None);
-    sitemap
+fn sitemap_seed_urls(start: &Url) -> Vec<Url> {
+    let origin = origin_url(start);
+    let mut seeds = vec![
+        origin
+            .join("sitemap.xml")
+            .unwrap_or_else(|_| origin.clone()),
+        origin
+            .join("sitemap_index.xml")
+            .unwrap_or_else(|_| origin.clone()),
+    ];
+
+    for name in ["sitemap.xml", "sitemap_index.xml"] {
+        if let Ok(url) = start.join(name) {
+            if !seeds
+                .iter()
+                .any(|candidate| canonical_url(candidate) == canonical_url(&url))
+            {
+                seeds.push(url);
+            }
+        }
+    }
+    seeds
+}
+
+fn sitemap_urls_from_robots(body: &[u8], base: &Url) -> Vec<Url> {
+    let text = String::from_utf8_lossy(body);
+    text.lines()
+        .filter_map(|line| {
+            let line = line.split('#').next()?.trim();
+            let (key, value) = line.split_once(':')?;
+            if !key.trim().eq_ignore_ascii_case("sitemap") {
+                return None;
+            }
+            let value = value.trim();
+            if value.is_empty() {
+                return None;
+            }
+            base.join(value).ok()
+        })
+        .collect()
+}
+
+fn sitemap_urls_from_html(html: &str, base: &Url) -> Vec<Url> {
+    let document = scraper::Html::parse_document(html);
+    let selector = scraper::Selector::parse("link[href]").unwrap();
+    document
+        .select(&selector)
+        .filter_map(|element| {
+            let rel = element.value().attr("rel").unwrap_or_default();
+            if !rel
+                .split_ascii_whitespace()
+                .any(|value| value.eq_ignore_ascii_case("sitemap"))
+            {
+                return None;
+            }
+            normalize_url(element.value().attr("href")?, base).and_then(|url| Url::parse(&url).ok())
+        })
+        .collect()
 }
 
 /// Parse a sitemap URL set or sitemap index, returning whether its locations
@@ -201,25 +353,55 @@ fn parse_sitemap(xml: &[u8]) -> Option<(bool, Vec<String>)> {
     reader.config_mut().trim_text(true);
     let mut buf = Vec::new();
     let mut is_index = false;
+    let mut root = None;
+    let mut stack: Vec<Vec<u8>> = Vec::new();
     let mut in_loc = false;
     let mut locations = Vec::new();
 
     loop {
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(event)) => match event.local_name().as_ref() {
-                b"sitemapindex" => is_index = true,
-                b"loc" => in_loc = true,
-                _ => {}
-            },
+            Ok(Event::Start(event)) => {
+                let name = event.local_name();
+                if root.is_none() {
+                    root = Some(name.as_ref().to_vec());
+                    is_index = name.as_ref() == b"sitemapindex";
+                }
+                match name.as_ref() {
+                    b"loc"
+                        if matches!(stack.last().map(Vec::as_slice), Some(b"sitemap" | b"url")) =>
+                    {
+                        in_loc = true
+                    }
+                    b"link" if matches!(root.as_deref(), Some(b"rss") | Some(b"feed")) => {
+                        in_loc = true
+                    }
+                    _ => {}
+                }
+                stack.push(name.as_ref().to_vec());
+            }
             Ok(Event::Text(event)) if in_loc => {
-                if let Ok(location) = event.decode() {
+                let location =
+                    event
+                        .decode()
+                        .map_err(|error| error.to_string())
+                        .and_then(|value| {
+                            quick_xml::escape::unescape(value.as_ref())
+                                .map_err(|error| error.to_string())
+                                .map(|value| value.into_owned())
+                        });
+                if let Ok(location) = location {
                     let location = location.trim();
                     if !location.is_empty() {
                         locations.push(location.to_string());
                     }
                 }
             }
-            Ok(Event::End(event)) if event.local_name().as_ref() == b"loc" => in_loc = false,
+            Ok(Event::End(event)) => {
+                if matches!(event.local_name().as_ref(), b"loc" | b"link") {
+                    in_loc = false;
+                }
+                let _ = stack.pop();
+            }
             Ok(Event::Eof) => break,
             Err(_) => return None,
             _ => {}
@@ -230,45 +412,227 @@ fn parse_sitemap(xml: &[u8]) -> Option<(bool, Vec<String>)> {
     (!locations.is_empty()).then_some((is_index, locations))
 }
 
-async fn discover_sitemap_urls(client: &reqwest::Client, start: &Url) -> Vec<String> {
-    const MAX_SITEMAPS: usize = 20;
+/// Await `future` unless `cancellation` fires first.
+async fn cancel_aware<F: Future>(
+    future: F,
+    cancellation: Option<&CancellationToken>,
+) -> Option<F::Output> {
+    match cancellation {
+        Some(token) => tokio::select! {
+            output = future => Some(output),
+            _ = token.cancelled() => None,
+        },
+        None => Some(future.await),
+    }
+}
 
-    let base_domain = start.host_str().unwrap_or_default().to_lowercase();
-    let mut pending = VecDeque::from([sitemap_url(start)]);
+async fn request_response(
+    client: &reqwest::Client,
+    url: Url,
+    cancellation: Option<&CancellationToken>,
+) -> Option<reqwest::Response> {
+    cancel_aware(client.get(url).send(), cancellation)
+        .await
+        .and_then(|response| response.ok())
+}
+
+async fn response_bytes(
+    response: reqwest::Response,
+    cancellation: Option<&CancellationToken>,
+) -> Option<Vec<u8>> {
+    cancel_aware(response.bytes(), cancellation)
+        .await
+        .and_then(|bytes| bytes.ok())
+        .map(|bytes| bytes.to_vec())
+}
+
+async fn response_text(
+    response: reqwest::Response,
+    cancellation: Option<&CancellationToken>,
+) -> Option<String> {
+    cancel_aware(response.text(), cancellation)
+        .await
+        .and_then(|body| body.ok())
+}
+
+/// Fetch `url`, returning the body and the final (post-redirect) URL when
+/// the response succeeds.
+async fn fetch_body(
+    client: &reqwest::Client,
+    url: Url,
+    cancellation: Option<&CancellationToken>,
+) -> Option<(Vec<u8>, Url)> {
+    let response = request_response(client, url, cancellation).await?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let response_url = response.url().clone();
+    let body = response_bytes(response, cancellation).await?;
+    Some((body, response_url))
+}
+
+/// Fetch a page over HTTP, optionally rendering it with a headless browser.
+///
+/// With `browser` set, the rendered DOM replaces the HTTP body (keeping the
+/// HTTP body when rendering fails), and an unsuccessful HTTP fetch falls
+/// back to rendering alone.
+async fn fetch_page(
+    client: &reqwest::Client,
+    url_str: &str,
+    browser: Option<&PathBuf>,
+    cancellation: Option<&CancellationToken>,
+) -> Option<(String, Url, String)> {
+    let response = cancel_aware(client.get(url_str).send(), cancellation).await;
+    let (content_type, response_url, body) = match response {
+        Some(Ok(resp)) if resp.status().is_success() => {
+            let content_type = resp
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            let response_url = resp.url().clone();
+            let body = response_text(resp, cancellation).await?;
+            (content_type, response_url, body)
+        }
+        _ if browser.is_some() => (
+            "text/html".to_string(),
+            Url::parse(url_str).ok()?,
+            String::new(),
+        ),
+        _ => return None,
+    };
+    let body = match browser {
+        Some(browser) => match cancel_aware(render_page(url_str, browser), cancellation).await {
+            Some(Ok(rendered)) => rendered,
+            Some(Err(error)) => {
+                tracing::debug!("JavaScript render failed for {url_str}: {error:#}");
+                body
+            }
+            None => return None,
+        },
+        None => body,
+    };
+    Some((content_type, response_url, body))
+}
+
+async fn discover_sitemap_urls(
+    client: &reqwest::Client,
+    start: &Url,
+    cancellation: Option<CancellationToken>,
+) -> Vec<String> {
+    let origin = origin_url(start);
+    let mut pending: VecDeque<Url> = sitemap_seed_urls(start).into();
+
+    if let Some((body, _)) = fetch_body(
+        client,
+        origin.join("robots.txt").unwrap_or_else(|_| origin.clone()),
+        cancellation.as_ref(),
+    )
+    .await
+    {
+        for sitemap in sitemap_urls_from_robots(&body, &origin) {
+            pending.push_back(sitemap);
+        }
+    }
+
+    // Some sites advertise a sitemap only through the HTML head. This is a
+    // discovery hint, not a replacement for robots.txt or conventional paths.
+    if let Some((body, base)) = fetch_body(client, start.clone(), cancellation.as_ref()).await {
+        if let Ok(html) = String::from_utf8(body) {
+            for sitemap in sitemap_urls_from_html(&html, &base) {
+                pending.push_back(sitemap);
+            }
+        }
+    }
+
     let mut seen_sitemaps = HashSet::new();
     let mut urls = Vec::new();
 
     while let Some(sitemap) = pending.pop_front() {
+        if cancellation
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            break;
+        }
         let sitemap_key = canonical_url(&sitemap);
-        if !seen_sitemaps.insert(sitemap_key) || seen_sitemaps.len() > MAX_SITEMAPS {
+        if !seen_sitemaps.insert(sitemap_key) || seen_sitemaps.len() > max_sitemaps() {
             continue;
         }
-        let Ok(response) = client.get(sitemap).send().await else {
+        let Some((body, response_url)) =
+            fetch_sitemap_body(client, sitemap, cancellation.as_ref()).await
+        else {
             continue;
         };
-        if !response.status().is_success() {
-            continue;
-        }
-        let Ok(body) = response.bytes().await else {
-            continue;
-        };
-        let Some((is_index, locations)) = parse_sitemap(&body) else {
-            continue;
-        };
-        if is_index {
-            for location in locations {
-                if let Ok(sitemap) = Url::parse(&location) {
-                    if same_domain(&sitemap, &base_domain) {
-                        pending.push_back(sitemap);
+        match parse_sitemap(&body) {
+            Some((is_index, locations)) => {
+                for location in locations {
+                    let Some(url) = normalize_url(&location, &response_url)
+                        .and_then(|value| Url::parse(&value).ok())
+                    else {
+                        continue;
+                    };
+                    if is_index {
+                        pending.push_back(url);
+                    } else if urls.len() < max_sitemap_urls() {
+                        urls.push(canonical_url(&url));
                     }
                 }
             }
-        } else {
-            urls.extend(locations);
+            None => {
+                for url in plain_text_sitemap_urls(&body, &response_url) {
+                    if urls.len() >= max_sitemap_urls() {
+                        break;
+                    }
+                    urls.push(url);
+                }
+            }
         }
     }
 
+    urls.sort();
+    urls.dedup();
     urls
+}
+
+/// Fetch + decode a single sitemap, enforcing the size cap and transparent
+/// gzip decompression (`.xml.gz` files are served without Content-Encoding).
+async fn fetch_sitemap_body(
+    client: &reqwest::Client,
+    url: Url,
+    cancellation: Option<&CancellationToken>,
+) -> Option<(Vec<u8>, Url)> {
+    const MAX_SITEMAP_BYTES: usize = 52_428_800;
+    let (body, response_url) = fetch_body(client, url, cancellation).await?;
+    if body.len() > MAX_SITEMAP_BYTES {
+        return None;
+    }
+    Some((gunzip(body)?, response_url))
+}
+
+fn gunzip(body: Vec<u8>) -> Option<Vec<u8>> {
+    if !body.starts_with(&[0x1f, 0x8b]) {
+        return Some(body);
+    }
+    let mut decoded = Vec::new();
+    std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(body.as_slice()), &mut decoded)
+        .ok()?;
+    Some(decoded)
+}
+
+/// Parse a plain-text sitemap: one URL per line, resolved against the
+/// sitemap's own URL.
+fn plain_text_sitemap_urls(body: &[u8], response_url: &Url) -> Vec<String> {
+    String::from_utf8_lossy(body)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| {
+            let url = normalize_url(line, response_url)?;
+            Some(canonical_url(&Url::parse(&url).ok()?))
+        })
+        .collect()
 }
 
 /// Turn a user-entered website address into an absolute HTTP URL.
@@ -291,7 +655,10 @@ pub fn normalize_website_url(raw: &str) -> anyhow::Result<String> {
     };
     let parsed = Url::parse(&candidate).map_err(|e| anyhow::anyhow!("invalid URL {raw:?}: {e}"))?;
     if !matches!(parsed.scheme(), "http" | "https") {
-        anyhow::bail!("unsupported URL scheme {:?}; use http or https", parsed.scheme());
+        anyhow::bail!(
+            "unsupported URL scheme {:?}; use http or https",
+            parsed.scheme()
+        );
     }
     if parsed.host_str().is_none() {
         anyhow::bail!("website URL has no domain: {raw:?}");
@@ -315,12 +682,27 @@ pub fn normalize_url(href: &str, base: &Url) -> Option<String> {
     Some(joined.to_string())
 }
 
+fn is_html_response(content_type: &str, body: &str) -> bool {
+    let content_type = content_type.to_ascii_lowercase();
+    content_type.contains("text/html")
+        || content_type.contains("application/xhtml+xml")
+        || (content_type.is_empty()
+            && body
+                .trim_start()
+                .get(..64)
+                .map(|prefix| {
+                    let prefix = prefix.to_ascii_lowercase();
+                    prefix.contains("<html") || prefix.contains("<!doctype html")
+                })
+                .unwrap_or(false))
+}
+
 /// BFS-crawl a website starting from `start_url`, returning the list of
-/// discovered HTML URLs. Direct port of `crawl_website`.
+/// discovered page URLs.
 ///
-/// Uses a tokio task set capped at 10 concurrent fetches, with a 100ms
-/// inter-fetch delay. Skips non-HTML responses, ignored domains, and (when
-/// `same_domain_only`) off-domain pages.
+/// Uses a tokio task set capped at `CRAWL_CONCURRENCY` concurrent fetches,
+/// with a 100ms inter-fetch delay. Sitemap URLs are returned as soon as they
+/// are discovered; `WEBSITE_CRAWL_MAX_PAGES` limits validation fetches only.
 ///
 /// When `on_progress` is set, emits `fetching` / `found` / `done` events so
 /// the UI can show the live URL list (same idea as zip file embedding status).
@@ -330,201 +712,152 @@ pub async fn crawl_website(
     same_domain_only: bool,
     on_progress: Option<CrawlProgressCallback>,
 ) -> anyhow::Result<Vec<String>> {
+    crawl_website_with_options_and_cancellation(
+        start_url,
+        depth,
+        same_domain_only,
+        false,
+        None,
+        on_progress,
+    )
+    .await
+}
+
+/// Shared state for one crawl run: options plus the synchronized queues and
+/// sets the worker tasks mutate.
+struct CrawlRun {
+    client: reqwest::Client,
+    start: Url,
+    browser: Option<PathBuf>,
+    cancellation: Option<CancellationToken>,
+    on_progress: Option<CrawlProgressCallback>,
+    depth: usize,
+    same_domain_only: bool,
+    max_pages: usize,
+    visited: Arc<tokio::sync::Mutex<HashSet<String>>>,
+    seen: Arc<tokio::sync::Mutex<HashSet<String>>>,
+    results: Arc<tokio::sync::Mutex<Vec<String>>>,
+    queue: Arc<tokio::sync::Mutex<VecDeque<(String, usize)>>>,
+    sitemap_queue: Arc<tokio::sync::Mutex<VecDeque<(String, usize)>>>,
+}
+
+pub async fn crawl_website_with_options_and_cancellation(
+    start_url: &str,
+    depth: usize,
+    same_domain_only: bool,
+    render_javascript: bool,
+    cancellation: Option<CancellationToken>,
+    on_progress: Option<CrawlProgressCallback>,
+) -> anyhow::Result<Vec<String>> {
     let normalized_start = normalize_website_url(start_url)?;
     let start = Url::parse(&normalized_start)?;
-    let base_domain = start
-        .host_str()
-        .ok_or_else(|| anyhow::anyhow!("no domain in {start_url}"))?
-        .to_lowercase();
     let start_key = canonical_url(&start);
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
-        .default_headers(headers())
-        .build()?;
-    let max_pages = max_pages();
-
-    let sitemap_urls = discover_sitemap_urls(&client, &start).await;
-
-    let visited: std::sync::Arc<tokio::sync::Mutex<HashSet<String>>> =
-        std::sync::Arc::new(tokio::sync::Mutex::new(HashSet::new()));
-    let seen: std::sync::Arc<tokio::sync::Mutex<HashSet<String>>> =
-        std::sync::Arc::new(tokio::sync::Mutex::new(HashSet::from([start_key.clone()])));
-    let results: std::sync::Arc<tokio::sync::Mutex<Vec<String>>> =
-        std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
-
-    // Queue stores the fetch URL string (directory paths keep trailing slash) + depth.
-    let mut initial_queue = VecDeque::from([(fetch_url_string(&start), 0)]);
-    {
-        let mut s = seen.lock().await;
-        for sitemap_url in sitemap_urls {
-            let Some(url) = normalize_url(&sitemap_url, &start) else {
-                continue;
-            };
-            let Ok(parsed) = Url::parse(&url) else {
-                continue;
-            };
-            let host = parsed.host_str().unwrap_or("").to_lowercase();
-            if is_ignored_domain(&host) || (same_domain_only && !same_domain(&parsed, &base_domain))
-            {
-                continue;
-            }
-            if s.insert(url.clone()) {
-                initial_queue.push_back((fetch_url_string(&parsed), 0));
-            }
-        }
+    let browser = if render_javascript {
+        browser_path()
+    } else {
+        None
+    };
+    if render_javascript && browser.is_none() {
+        tracing::warn!(
+            "JavaScript rendering requested but no Chromium-family browser was found; using HTTP HTML"
+        );
     }
-    let queue: std::sync::Arc<tokio::sync::Mutex<VecDeque<(String, usize)>>> =
-        std::sync::Arc::new(tokio::sync::Mutex::new(initial_queue));
 
-    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(10));
+    let client = http_client()?;
+    let sitemap_urls = discover_sitemap_urls(&client, &start, cancellation.clone()).await;
+
+    // The queue stores the fetch URL (directory paths keep their trailing
+    // slash, which affects relative link resolution) + depth.
+    let run = Arc::new(CrawlRun {
+        client,
+        start: start.clone(),
+        browser,
+        cancellation,
+        on_progress,
+        depth,
+        same_domain_only,
+        max_pages: max_pages(),
+        visited: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+        seen: Arc::new(tokio::sync::Mutex::new(HashSet::from([start_key.clone()]))),
+        results: Arc::new(tokio::sync::Mutex::new(vec![start_key])),
+        queue: Arc::new(tokio::sync::Mutex::new(VecDeque::from([(start.to_string(), 0)]))),
+        sitemap_queue: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
+    });
+    enqueue_sitemap_urls(&run, sitemap_urls).await;
+
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(CRAWL_CONCURRENCY));
     let mut handles = Vec::new();
 
     loop {
-        let item = {
-            let mut q = queue.lock().await;
-            q.pop_front()
+        if run.cancellation
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            break;
+        }
+        let item = run.queue.lock().await.pop_front();
+        let item = if item.is_some() {
+            item
+        } else if semaphore.available_permits() == CRAWL_CONCURRENCY {
+            run.sitemap_queue.lock().await.pop_front()
+        } else {
+            None
         };
         let Some((url_str, cur_depth)) = item else {
-            // No items in queue; check if any tasks still running, otherwise
-            // we're done.
-            let active = semaphore.available_permits();
-            if active == 10 {
+            // Nothing queued; done when no fetch is in flight either.
+            if semaphore.available_permits() == CRAWL_CONCURRENCY
+                && run.sitemap_queue.lock().await.is_empty()
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
             continue;
         };
 
-        let visit_key = {
-            if let Ok(u) = Url::parse(&url_str) {
-                canonical_url(&u)
-            } else {
-                url_str.trim_end_matches('/').to_string()
-            }
-        };
+        let visit_key = Url::parse(&url_str)
+            .map(|u| canonical_url(&u))
+            .unwrap_or_else(|_| url_str.trim_end_matches('/').to_string());
         {
-            let mut v = visited.lock().await;
-            if v.contains(&visit_key) {
+            let mut visited = run.visited.lock().await;
+            if visited.contains(&visit_key) {
                 continue;
             }
-            if v.len() >= max_pages {
+            if visited.len() >= run.max_pages {
                 break;
             }
-            v.insert(visit_key.clone());
+            visited.insert(visit_key);
         }
 
         tokio::time::sleep(Duration::from_millis(CRAWL_DELAY_MS)).await;
 
         let permit = semaphore.clone().acquire_owned().await?;
-        let client = client.clone();
-        let queue = queue.clone();
-        let seen = seen.clone();
-        let results = results.clone();
-        let base_domain_clone = base_domain.clone();
-        let on_progress = on_progress.clone();
-
-        if let Some(cb) = on_progress.as_ref() {
-            let found_count = results.lock().await.len();
+        if let Some(cb) = run.on_progress.as_ref() {
             cb(CrawlProgressEvent {
                 url: url_str.clone(),
                 phase: "fetching".into(),
-                found_count,
+                found_count: run.results.lock().await.len(),
             });
         }
 
+        let task_run = run.clone();
         handles.push(tokio::spawn(async move {
             let _permit = permit;
-            let resp = client.get(&url_str).send().await;
-            let resp = match resp {
-                Ok(r) => r,
-                Err(_) => return,
-            };
-            if !resp.status().is_success() {
-                return;
-            }
-            let content_type = resp
-                .headers()
-                .get(reqwest::header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or_default()
-                .to_string();
-            if !content_type.contains("text/html") {
-                return;
-            }
-            // Use the final URL after redirects, unless the HTTP client has
-            // removed a slash from the directory URL we requested. That slash
-            // changes how relative links such as `../learn/` are resolved.
-            let response_url = resp.url().clone();
-            let document_base = if url_str.ends_with('/') && !response_url.path().ends_with('/') {
-                Url::parse(&url_str).unwrap_or(response_url)
-            } else {
-                response_url
-            };
-            let result_key = canonical_url(&document_base);
-            let body = match resp.text().await {
-                Ok(t) => t,
-                Err(_) => return,
-            };
-
-            let found_count = {
-                let mut r = results.lock().await;
-                if !r.iter().any(|u| u == &result_key) {
-                    r.push(result_key.clone());
-                }
-                r.len()
-            };
-            if let Some(cb) = on_progress.as_ref() {
-                cb(CrawlProgressEvent {
-                    url: result_key,
-                    phase: "found".into(),
-                    found_count,
-                });
-            }
-
-            if cur_depth < depth {
-                let found: Vec<String> = {
-                    let doc = scraper::Html::parse_document(&body);
-                    let mut out: Vec<String> = Vec::new();
-                    let sel = scraper::Selector::parse("a[href]").unwrap();
-                    for el in doc.select(&sel) {
-                        if let Some(href) = el.value().attr("href") {
-                            if let Some(nu) = normalize_url(href, &document_base) {
-                                if let Ok(parsed) = Url::parse(&nu) {
-                                    let nu_host = parsed.host_str().unwrap_or("").to_lowercase();
-                                    if is_ignored_domain(&nu_host) {
-                                        continue;
-                                    }
-                                    if same_domain_only && !same_domain(&parsed, &base_domain_clone)
-                                    {
-                                        continue;
-                                    }
-                                }
-                                out.push(nu);
-                            }
-                        }
-                    }
-                    out
-                };
-                let mut s = seen.lock().await;
-                let mut q = queue.lock().await;
-                for nu in found {
-                    if !s.contains(&nu) {
-                        s.insert(nu.clone());
-                        let fetch = Url::parse(&nu).map(|u| fetch_url_string(&u)).unwrap_or(nu);
-                        q.push_back((fetch, cur_depth + 1));
-                    }
-                }
-            }
+            crawl_page(task_run, url_str, cur_depth).await;
         }));
     }
 
-    for h in handles {
-        let _ = h.await;
+    for handle in handles {
+        let _ = handle.await;
     }
-    let r = results.lock().await;
-    let urls = r.clone();
-    if let Some(cb) = on_progress.as_ref() {
+    if run.cancellation
+        .as_ref()
+        .is_some_and(CancellationToken::is_cancelled)
+    {
+        anyhow::bail!("website crawl cancelled");
+    }
+    let urls = run.results.lock().await.clone();
+    if let Some(cb) = run.on_progress.as_ref() {
         cb(CrawlProgressEvent {
             url: String::new(),
             phase: "done".into(),
@@ -532,6 +865,148 @@ pub async fn crawl_website(
         });
     }
     Ok(urls)
+}
+
+/// Queue sitemap-discovered URLs for later validation: they are only fetched
+/// once the link-based crawl drains, so sitemap breadth never crowds out the
+/// pages actually linked from the site.
+async fn enqueue_sitemap_urls(run: &CrawlRun, sitemap_urls: Vec<String>) {
+    let mut queue = VecDeque::new();
+    let mut results = Vec::new();
+    let mut seen = run.seen.lock().await;
+    for sitemap_url in sitemap_urls {
+        let Some(url) = normalize_url(&sitemap_url, &run.start) else {
+            continue;
+        };
+        let Ok(parsed) = Url::parse(&url) else {
+            continue;
+        };
+        if is_ignored_domain(parsed.host_str().unwrap_or_default()) {
+            continue;
+        }
+        if run.same_domain_only && !same_scope(&parsed, &run.start) {
+            continue;
+        }
+        let key = canonical_url(&parsed);
+        if seen.insert(key.clone()) {
+            queue.push_back((parsed.to_string(), 0));
+            results.push(key);
+        }
+    }
+    drop(seen);
+    *run.sitemap_queue.lock().await = queue;
+    run.results.lock().await.extend(results);
+}
+
+/// Fetch one page, record it in the results, and enqueue newly found links.
+async fn crawl_page(run: Arc<CrawlRun>, url_str: String, cur_depth: usize) {
+    if run.cancellation
+        .as_ref()
+        .is_some_and(CancellationToken::is_cancelled)
+    {
+        return;
+    }
+    let Some((content_type, response_url, body)) = fetch_page(
+        &run.client,
+        &url_str,
+        run.browser.as_ref(),
+        run.cancellation.as_ref(),
+    )
+    .await
+    else {
+        return;
+    };
+    // Use the final URL after redirects, unless the HTTP client has removed
+    // a slash from the directory URL we requested. That slash changes how
+    // relative links such as `../learn/` are resolved.
+    let document_base = if url_str.ends_with('/') && !response_url.path().ends_with('/') {
+        Url::parse(&url_str).unwrap_or(response_url)
+    } else {
+        response_url
+    };
+    let result_key = canonical_url(&document_base);
+    if !is_html_response(&content_type, &body) {
+        return;
+    }
+
+    let found_count = {
+        let mut results = run.results.lock().await;
+        if !results.iter().any(|u| u == &result_key) {
+            results.push(result_key.clone());
+        }
+        results.len()
+    };
+    if let Some(cb) = run.on_progress.as_ref() {
+        cb(CrawlProgressEvent {
+            url: result_key,
+            phase: "found".into(),
+            found_count,
+        });
+    }
+
+    if cur_depth >= run.depth {
+        return;
+    }
+    let found = extract_page_links(&body, &document_base, run.same_domain_only, &run.start);
+    let mut seen = run.seen.lock().await;
+    let mut queue = run.queue.lock().await;
+    for url in found {
+        let Ok(parsed) = Url::parse(&url) else {
+            continue;
+        };
+        let key = canonical_url(&parsed);
+        if seen.insert(key.clone()) {
+            queue.push_back((url, cur_depth + 1));
+            run.results.lock().await.push(key);
+        }
+    }
+}
+
+/// Resolve a document's effective base URL (`<base href>` overrides the
+/// response URL).
+fn base_href(document: &scraper::Html, document_base: &Url) -> Url {
+    scraper::Selector::parse("base[href]")
+        .ok()
+        .and_then(|selector| document.select(&selector).next())
+        .and_then(|element| element.value().attr("href"))
+        .and_then(|href| normalize_url(href, document_base))
+        .and_then(|url| Url::parse(&url).ok())
+        .unwrap_or_else(|| document_base.clone())
+}
+
+/// Collect outgoing page links from an HTML body, honoring scope and
+/// ignored-domain rules.
+fn extract_page_links(
+    body: &str,
+    document_base: &Url,
+    same_domain_only: bool,
+    scope_start: &Url,
+) -> Vec<String> {
+    let document = scraper::Html::parse_document(body);
+    let link_base = base_href(&document, document_base);
+    let selector = scraper::Selector::parse(
+        "a[href], area[href], [data-href], [data-url], link[rel~='next'][href]",
+    )
+    .unwrap();
+    document
+        .select(&selector)
+        .filter_map(|element| {
+            let href = element
+                .value()
+                .attr("href")
+                .or_else(|| element.value().attr("data-href"))
+                .or_else(|| element.value().attr("data-url"))?;
+            let url = normalize_url(href, &link_base)?;
+            let parsed = Url::parse(&url).ok()?;
+            if same_domain_only && !same_scope(&parsed, scope_start) {
+                return None;
+            }
+            if is_ignored_domain(parsed.host_str().unwrap_or_default()) {
+                return None;
+            }
+            Some(url)
+        })
+        .collect()
 }
 
 /// One scraped section of an HTML page. Sections are keyed by the heading
@@ -557,36 +1032,53 @@ pub struct Link {
     pub anchor_text: String,
 }
 
+/// One scraped page: title, sections, and navigation links.
+type ScrapedPage = (String, Vec<WebSection>, Vec<Link>);
+
 /// Fetch + sectionize a single page. Direct port of `scrape_website`.
 pub async fn scrape_website(url: &str) -> anyhow::Result<(String, Vec<WebSection>)> {
+    let (title, sections, _) = scrape_page(&http_client()?, None, url).await?;
+    Ok((title, sections))
+}
+
+/// Fetch one page and return `(title, sections, navigation links)`. With
+/// `browser` set the page is rendered with it first; render errors propagate
+/// (the crawl path uses [`fetch_page`] to fall back to the HTTP body).
+async fn scrape_page(
+    client: &reqwest::Client,
+    browser: Option<&PathBuf>,
+    url: &str,
+) -> anyhow::Result<ScrapedPage> {
     let url = normalize_website_url(url)?;
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
-        .default_headers(headers())
-        .build()?;
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("fetching {url}: {e}"))?;
-    let status = resp.status();
-    let content_type = resp
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default()
-        .to_string();
-    if !status.is_success() {
-        anyhow::bail!("failed to load page: HTTP {status}");
+    let response = client.get(&url).send().await;
+    let (content_type, response_url, mut body) = match response {
+        Ok(resp) if resp.status().is_success() => {
+            let content_type = resp
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            let response_url = resp.url().clone();
+            let body = resp
+                .text()
+                .await
+                .map_err(|e| anyhow::anyhow!("reading body: {e}"))?;
+            (content_type, response_url, body)
+        }
+        _ if browser.is_some() => ("text/html".to_string(), Url::parse(&url)?, String::new()),
+        Ok(resp) => anyhow::bail!("failed to load page: HTTP {}", resp.status()),
+        Err(error) => return Err(anyhow::anyhow!("fetching {url}: {error}")),
+    };
+    if let Some(browser) = browser {
+        body = render_page(&url, browser).await?;
     }
-    if !content_type.contains("text/html") {
+    if !is_html_response(&content_type, &body) {
         anyhow::bail!("page is not HTML (Content-Type: {content_type})");
     }
-    let body = resp
-        .text()
-        .await
-        .map_err(|e| anyhow::anyhow!("reading body: {e}"))?;
-    Ok(scrape_html(&body))
+    let (title, sections) = scrape_html_with_base(&body, Some(&response_url));
+    let navigation = extract_navigation_links(&body, &response_url);
+    Ok((title, sections, navigation))
 }
 
 /// Sectionize an HTML body without fetching it. Direct port of `_walk_dom`.
@@ -595,6 +1087,10 @@ pub async fn scrape_website(url: &str) -> anyhow::Result<(String, Vec<WebSection
 /// figcaption, dd, dt, caption, summary` elements in document order,
 /// maintaining a small walker state keyed on the most recent h1/h2.
 pub fn scrape_html(html: &str) -> (String, Vec<WebSection>) {
+    scrape_html_with_base(html, None)
+}
+
+fn scrape_html_with_base(html: &str, base: Option<&Url>) -> (String, Vec<WebSection>) {
     let document = scraper::Html::parse_document(html);
     let title_selector = scraper::Selector::parse("title").unwrap();
     let title = document
@@ -666,7 +1162,10 @@ pub fn scrape_html(html: &str) -> (String, Vec<WebSection>) {
             if let Some(href) = a.value().attr("href") {
                 let href = href.trim();
                 if !href.is_empty() && href != "#" {
-                    last.links.push((href.to_string(), anchor_text));
+                    let href = base
+                        .and_then(|base| normalize_url(href, base))
+                        .unwrap_or_else(|| href.to_string());
+                    last.links.push((href, anchor_text));
                 }
             }
         }
@@ -711,6 +1210,32 @@ pub fn scrape_html(html: &str) -> (String, Vec<WebSection>) {
     }
 
     (title, sections)
+}
+
+fn extract_navigation_links(html: &str, base: &Url) -> Vec<Link> {
+    let document = scraper::Html::parse_document(html);
+    let selector = scraper::Selector::parse(
+        "nav a[href], aside a[href], [role='navigation'] a[href], [data-nav] a[href]",
+    )
+    .unwrap();
+    let mut links = Vec::new();
+    let mut seen = HashSet::new();
+    for element in document.select(&selector) {
+        let anchor_text = element.text().collect::<String>().trim().to_string();
+        let Some(href) = element.value().attr("href") else {
+            continue;
+        };
+        if anchor_text.len() < MIN_ANCHOR_LEN {
+            continue;
+        }
+        let Some(href) = normalize_url(href.trim(), base) else {
+            continue;
+        };
+        if seen.insert((href.clone(), anchor_text.clone())) {
+            links.push(Link { href, anchor_text });
+        }
+    }
+    links
 }
 
 #[derive(Default)]
@@ -808,7 +1333,7 @@ pub async fn process_website(
     urls: &[String],
     metadata: &Map<String, Value>,
 ) -> anyhow::Result<Vec<DocumentChunk>> {
-    process_website_with_splitter(urls, metadata, None).await
+    process_website_with_splitter(urls, metadata, None, false).await
 }
 
 /// Production website path. Uses the same tokenizer-backed splitter as local
@@ -817,6 +1342,7 @@ pub async fn process_website_with_splitter(
     urls: &[String],
     metadata: &Map<String, Value>,
     splitter: Option<&TextSplitter<Tokenizer>>,
+    render_javascript: bool,
 ) -> anyhow::Result<Vec<DocumentChunk>> {
     let chunk_size: usize = std::env::var("DOC_CHUNK_SIZE")
         .ok()
@@ -830,13 +1356,43 @@ pub async fn process_website_with_splitter(
     let embedded_at = super::types::now_iso();
     let mut all_chunks: Vec<DocumentChunk> = Vec::new();
 
-    for url in urls {
-        let (page_title, sections) = match scrape_website(url).await {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!("failed to scrape {url}: {e:#}");
-                continue;
-            }
+    let client = http_client()?;
+    let browser = if render_javascript {
+        browser_path()
+    } else {
+        None
+    };
+    if render_javascript && browser.is_none() {
+        tracing::warn!(
+            "JavaScript rendering requested but no Chromium-family browser was found; using HTTP HTML"
+        );
+    }
+
+    // Scrape pages concurrently: a JavaScript render takes seconds per page,
+    // so a sequential loop dominates the total embed time on large sites.
+    // `buffered` keeps the chunk output in input order.
+    let pages: Vec<Option<ScrapedPage>> =
+        futures_util::stream::iter(urls.iter().cloned())
+            .map(|url| {
+                let client = client.clone();
+                let browser = browser.clone();
+                async move {
+                    match scrape_page(&client, browser.as_ref(), &url).await {
+                        Ok(page) => Some(page),
+                        Err(e) => {
+                            tracing::warn!("failed to scrape {url}: {e:#}");
+                            None
+                        }
+                    }
+                }
+            })
+            .buffered(scrape_concurrency(render_javascript))
+            .collect()
+            .await;
+
+    for (url, page) in urls.iter().zip(pages) {
+        let Some((page_title, sections, navigation_links)) = page else {
+            continue;
         };
         if sections.is_empty() {
             continue;
@@ -853,6 +1409,11 @@ pub async fn process_website_with_splitter(
                     .or_insert_with(|| link.href.clone());
             }
         }
+        for link in &navigation_links {
+            link_map
+                .entry(link.anchor_text.clone())
+                .or_insert_with(|| link.href.clone());
+        }
 
         let mut base_md: Map<String, Value> = metadata.clone();
         base_md.insert("url".into(), Value::String(url.clone()));
@@ -860,6 +1421,20 @@ pub async fn process_website_with_splitter(
         base_md.insert("embedded_at".into(), Value::String(embedded_at.clone()));
         base_md.insert("page_id".into(), Value::String(page_id.clone()));
         base_md.insert("page_title".into(), Value::String(page_title.clone()));
+        base_md.insert(
+            "navigation_links".into(),
+            Value::Array(
+                navigation_links
+                    .iter()
+                    .map(|link| {
+                        serde_json::json!({
+                            "href": link.href,
+                            "anchor_text": link.anchor_text,
+                        })
+                    })
+                    .collect(),
+            ),
+        );
         base_md.insert(
             "website_key".into(),
             Value::String(make_website_key(
@@ -1137,6 +1712,65 @@ mod tests {
             index,
             Some((true, vec!["https://example.com/pages.xml".to_string()]))
         );
+    }
+
+    #[test]
+    fn parse_sitemap_ignores_nested_image_locations() {
+        let urls = parse_sitemap(
+            br#"<urlset><url><loc>https://example.com/page</loc><image:image><image:loc>https://example.com/image.png</image:loc></image:image></url></urlset>"#,
+        );
+        assert_eq!(
+            urls,
+            Some((false, vec!["https://example.com/page".to_string()]))
+        );
+    }
+
+    #[test]
+    fn robots_discovers_multiple_relative_and_absolute_sitemaps() {
+        let base = Url::parse("https://example.com/docs/").unwrap();
+        let urls = sitemap_urls_from_robots(
+            b"Sitemap: /sitemap.xml\n sitemap: https://cdn.example.com/docs.xml\n",
+            &base,
+        );
+        assert_eq!(
+            urls.iter().map(Url::as_str).collect::<Vec<_>>(),
+            vec![
+                "https://example.com/sitemap.xml",
+                "https://cdn.example.com/docs.xml"
+            ]
+        );
+    }
+
+    #[test]
+    fn navigation_links_are_absolute_and_deduplicated() {
+        let base = Url::parse("https://example.com/docs/page/").unwrap();
+        let links = extract_navigation_links(
+            r#"<nav><a href="../guide/">Guide</a><a href="../guide/">Guide</a></nav><main><p>Body</p></main>"#,
+            &base,
+        );
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].href, "https://example.com/docs/guide/");
+    }
+
+    #[test]
+    fn same_scope_stays_under_starting_path() {
+        let start = Url::parse("https://neo4j.com/docs/").unwrap();
+        assert!(same_scope(
+            &Url::parse("https://neo4j.com/docs/getting-started/").unwrap(),
+            &start
+        ));
+        assert!(same_scope(
+            &Url::parse("https://neo4j.com/docs").unwrap(),
+            &start
+        ));
+        assert!(!same_scope(
+            &Url::parse("https://neo4j.com/blog/").unwrap(),
+            &start
+        ));
+        assert!(!same_scope(
+            &Url::parse("https://docs.neo4j.com/docs/").unwrap(),
+            &start
+        ));
     }
 
     #[test]

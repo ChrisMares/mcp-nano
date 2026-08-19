@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use serde_json::json;
 use tauri::{AppHandle, Emitter, Manager};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::db::DbState;
@@ -22,24 +23,54 @@ use crate::services::ingestion;
 use crate::services::ingestion::website::CrawlProgressEvent;
 use crate::worker::progress::{emit_job_event, now_iso, JobProgressEvent};
 
+#[derive(Clone, Default)]
+pub struct WebsiteCrawlState(pub Arc<tokio::sync::Mutex<Option<CancellationToken>>>);
+
+pub async fn cancel_active_crawl(state: &WebsiteCrawlState) {
+    if let Some(token) = state.0.lock().await.as_ref() {
+        token.cancel();
+    }
+}
+
 #[tauri::command]
 pub async fn crawl_website(
     app: AppHandle,
+    crawl_state: tauri::State<'_, WebsiteCrawlState>,
     url: String,
     depth: Option<i64>,
     same_domain_only: Option<bool>,
+    render_javascript: Option<bool>,
 ) -> Result<CrawlResponse, String> {
     let depth = depth.unwrap_or(1).max(0) as usize;
     let same_domain = same_domain_only.unwrap_or(true);
+    let cancellation = CancellationToken::new();
+    *crawl_state.0.lock().await = Some(cancellation.clone());
     let app_for_progress = app.clone();
-    let on_progress: ingestion::website::CrawlProgressCallback = Arc::new(move |ev: CrawlProgressEvent| {
-        let _ = app_for_progress.emit("crawl_progress", &ev);
-    });
-    let urls = ingestion::website::crawl_website(&url, depth, same_domain, Some(on_progress))
-        .await
-        .map_err(|e| format!("crawling {url}: {e:#}"))?;
+    let on_progress: ingestion::website::CrawlProgressCallback =
+        Arc::new(move |ev: CrawlProgressEvent| {
+            let _ = app_for_progress.emit("crawl_progress", &ev);
+        });
+    let result = ingestion::website::crawl_website_with_options_and_cancellation(
+        &url,
+        depth,
+        same_domain,
+        render_javascript.unwrap_or(false),
+        Some(cancellation.clone()),
+        Some(on_progress),
+    )
+    .await;
+    crawl_state.0.lock().await.take();
+    let urls = result.map_err(|e| format!("crawling {url}: {e:#}"))?;
     let count = urls.len() as i64;
     Ok(CrawlResponse { urls, count })
+}
+
+#[tauri::command]
+pub async fn cancel_website_crawl(
+    crawl_state: tauri::State<'_, WebsiteCrawlState>,
+) -> Result<(), String> {
+    cancel_active_crawl(&crawl_state).await;
+    Ok(())
 }
 
 #[tauri::command]
@@ -47,6 +78,7 @@ pub async fn embed_website(
     app: AppHandle,
     urls: Vec<String>,
     group: Option<String>,
+    render_javascript: Option<bool>,
 ) -> Result<EmbedWebsiteResponse, String> {
     let urls: Vec<String> = urls
         .iter()
@@ -67,6 +99,7 @@ pub async fn embed_website(
     let task_params = json!({
         "urls": urls,
         "group": group_str,
+        "render_javascript": render_javascript.unwrap_or(false),
     });
     let params_str = serde_json::to_string(&task_params).unwrap_or_else(|_| "{}".to_string());
     sqlx::query(

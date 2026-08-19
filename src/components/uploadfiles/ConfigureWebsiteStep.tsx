@@ -1,35 +1,66 @@
 import React from "react";
-import { ArrowLeft, ArrowRight, Loader2 } from "lucide-react";
-import { wizardNav, btnPrimary, btnSecondary, fieldLabel, textInput, sliderBounds } from "@/styles/classes";
+import { ArrowLeft, ArrowRight, Loader2, X } from "lucide-react";
+import {
+  wizardNav,
+  btnPrimary,
+  btnSecondary,
+  fieldLabel,
+  textInput,
+  sliderBounds,
+} from "@/styles/classes";
 
 interface Props {
   websiteUrl: string;
   depth: number;
   sameDomainOnly: boolean;
+  renderJavascript: boolean;
   isCrawling: boolean;
   crawlCurrentUrl?: string | null;
   crawlFoundCount?: number;
   onUrlChange: (url: string) => void;
   onDepthChange: (depth: number) => void;
   onSameDomainChange: (val: boolean) => void;
+  onRenderJavascriptChange: (val: boolean) => void;
+  onCancelCrawl: () => void;
   onBack: () => void;
   onNext: () => void;
 }
 
-const DEPTH_LABELS = ["This page only", "1 level deep", "2 levels deep", "3 levels deep", "4 levels deep", "5 levels deep"];
+const DEPTH_LABELS = [
+  "This page only",
+  "1 level deep",
+  "2 levels deep",
+  "3 levels deep",
+  "4 levels deep",
+  "5 levels deep",
+];
 
 const ConfigureWebsiteStep: React.FC<Props> = ({
-  websiteUrl, depth, sameDomainOnly, isCrawling,
-  crawlCurrentUrl = null, crawlFoundCount = 0,
-  onUrlChange, onDepthChange, onSameDomainChange, onBack, onNext,
+  websiteUrl,
+  depth,
+  sameDomainOnly,
+  renderJavascript,
+  isCrawling,
+  crawlCurrentUrl = null,
+  crawlFoundCount = 0,
+  onUrlChange,
+  onDepthChange,
+  onSameDomainChange,
+  onRenderJavascriptChange,
+  onCancelCrawl,
+  onBack,
+  onNext,
 }) => {
   const canProceed = !!websiteUrl.trim() && !isCrawling;
 
   return (
     <div>
-      <h2 className="text-lg font-semibold text-foreground mb-1">Configure Website Crawl</h2>
+      <h2 className="text-lg font-semibold text-foreground mb-1">
+        Configure Website Crawl
+      </h2>
       <p className="text-sm text-muted-foreground mb-5">
-        Provide the URL to crawl and choose how deep to follow links. Content is grouped by the full URL path (hostname + path).
+        Provide the URL to crawl. Sitemap URLs are included alongside links
+        discovered from each page.
       </p>
 
       <div className="mb-5">
@@ -44,13 +75,36 @@ const ConfigureWebsiteStep: React.FC<Props> = ({
           onChange={(e) => onUrlChange(e.target.value)}
           disabled={isCrawling}
         />
-        <p className="text-xs text-muted-foreground mt-1">The starting URL — the crawler begins here.</p>
+        <p className="text-xs text-muted-foreground mt-1">
+          The starting URL for sitemap and page-link discovery.
+        </p>
       </div>
 
       <div className="mb-5">
         <label
           className={`${fieldLabel} flex items-center gap-2 cursor-pointer`}
-          title="When checked, the crawler only follows links that point to the same domain as the starting URL. Uncheck to allow crawling external domains linked from the site."
+          title="Use an installed Chromium-family browser to execute JavaScript before extracting links.
+          Use this for websites that are SPA's and do not have server-rendered HTML. This is slower, but more thorough."
+        >
+          <input
+            type="checkbox"
+            checked={renderJavascript}
+            onChange={(e) => onRenderJavascriptChange(e.target.checked)}
+            className="w-4 h-4 rounded border-border text-primary focus:ring-brand-cyan"
+            disabled={isCrawling}
+          />
+          Render JavaScript
+        </label>
+        <p className="text-xs text-muted-foreground mt-1 ml-6">
+          Client-rendered navigation if any Chromium browser is installed.
+          Slower crawl, but more thorough.
+        </p>
+      </div>
+
+      <div className="mb-5">
+        <label
+          className={`${fieldLabel} flex items-center gap-2 cursor-pointer`}
+          title="When checked, the crawler stays on the starting host and path subtree. Uncheck to allow crawling outside that scope."
         >
           <input
             type="checkbox"
@@ -59,16 +113,23 @@ const ConfigureWebsiteStep: React.FC<Props> = ({
             className="w-4 h-4 rounded border-border text-primary focus:ring-brand-cyan"
             disabled={isCrawling}
           />
-          Only crawl current domain
+          Only crawl current site section
         </label>
         <p className="text-xs text-muted-foreground mt-1 ml-6">
-          When checked, external links (links pointing to other domains) are skipped.
+          When checked, only URLs under the starting host and path are crawled.
+          For example, /docs/ excludes /blog/.
         </p>
       </div>
 
       <div className="mb-6">
-        <label className={fieldLabel} title="The number of link levels to follow from the starting URL. Higher depth means the crawler explores more pages, but takes longer.">
-          Crawl Depth — <span className="text-foreground font-semibold">{DEPTH_LABELS[depth]}</span>
+        <label
+          className={fieldLabel}
+          title="The number of link levels to follow from the starting URL. Higher depth means the crawler explores more pages, but takes longer."
+        >
+          Crawl Depth —{" "}
+          <span className="text-foreground font-semibold">
+            {DEPTH_LABELS[depth]}
+          </span>
         </label>
         <input
           type="range"
@@ -85,12 +146,22 @@ const ConfigureWebsiteStep: React.FC<Props> = ({
           <span>5 — deep crawl</span>
         </div>
         <p className="text-xs text-muted-foreground mt-1">
-          How many link levels to follow from the starting URL. Higher depth = more pages scraped.
+          Sitemap URLs are not limited by this depth. Higher depth adds more
+          page-link discovery.
         </p>
       </div>
 
       {isCrawling && (
         <div className="flex items-center gap-2 mb-4 text-sm text-muted-foreground min-w-0">
+          <button
+            type="button"
+            onClick={onCancelCrawl}
+            title="cancel"
+            aria-label="cancel crawl"
+            className="shrink-0 flex items-center justify-center w-6 h-6 rounded-md border border-border text-foreground font-bold hover:bg-muted hover:border-foreground"
+          >
+            <X size={16} strokeWidth={3} />
+          </button>
           <Loader2 size={16} className="animate-spin text-primary shrink-0" />
           <span className="truncate" title={crawlCurrentUrl ?? undefined}>
             {crawlCurrentUrl
@@ -102,18 +173,18 @@ const ConfigureWebsiteStep: React.FC<Props> = ({
       )}
 
       <div className={wizardNav}>
-        <button onClick={onBack} className={btnSecondary} disabled={isCrawling}>
+        <button onClick={onBack} className={btnSecondary}>
           <ArrowLeft size={16} /> Back
         </button>
-        <button
-          disabled={!canProceed}
-          onClick={onNext}
-          className={btnPrimary}
-        >
+        <button disabled={!canProceed} onClick={onNext} className={btnPrimary}>
           {isCrawling ? (
-            <><Loader2 size={16} className="animate-spin" /> Crawling...</>
+            <>
+              <Loader2 size={16} className="animate-spin" /> Crawling...
+            </>
           ) : (
-            <>Start Crawl <ArrowRight size={16} /></>
+            <>
+              Start Crawl <ArrowRight size={16} />
+            </>
           )}
         </button>
       </div>

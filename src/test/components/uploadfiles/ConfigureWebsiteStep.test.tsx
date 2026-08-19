@@ -10,6 +10,8 @@ const defaults = {
   onUrlChange: vi.fn(),
   onDepthChange: vi.fn(),
   onSameDomainChange: vi.fn(),
+  onRenderJavascriptChange: vi.fn(),
+  onCancelCrawl: vi.fn(),
   onBack: vi.fn(),
   onNext: vi.fn(),
 }
@@ -19,34 +21,34 @@ describe('ConfigureWebsiteStep', () => {
     render(<ConfigureWebsiteStep {...defaults} />)
     expect(screen.getByPlaceholderText('https://docs.example.com')).toBeInTheDocument()
     expect(screen.getByText(/Crawl Depth/)).toBeInTheDocument()
-    expect(screen.getByLabelText('Only crawl current domain')).toBeInTheDocument()
+    expect(screen.getByLabelText('Only crawl current site section')).toBeInTheDocument()
   })
 
   it('checkbox is checked by default', () => {
     render(<ConfigureWebsiteStep {...defaults} />)
-    const checkbox = screen.getByLabelText('Only crawl current domain')
+    const checkbox = screen.getByLabelText('Only crawl current site section')
     expect(checkbox).toBeChecked()
   })
 
   it('checkbox shows unchecked when sameDomainOnly is false', () => {
     render(<ConfigureWebsiteStep {...defaults} sameDomainOnly={false} />)
-    const checkbox = screen.getByLabelText('Only crawl current domain')
+    const checkbox = screen.getByLabelText('Only crawl current site section')
     expect(checkbox).not.toBeChecked()
   })
 
   it('calls onSameDomainChange when checkbox toggled', () => {
     const onSameDomainChange = vi.fn()
     render(<ConfigureWebsiteStep {...defaults} onSameDomainChange={onSameDomainChange} />)
-    const checkbox = screen.getByLabelText('Only crawl current domain')
+    const checkbox = screen.getByLabelText('Only crawl current site section')
     fireEvent.click(checkbox)
     expect(onSameDomainChange).toHaveBeenCalledWith(false)
   })
 
   it('checkbox has a title tooltip', () => {
     render(<ConfigureWebsiteStep {...defaults} />)
-    const checkbox = screen.getByLabelText('Only crawl current domain')
+    const checkbox = screen.getByLabelText('Only crawl current site section')
     expect(checkbox.closest('label')).toHaveAttribute('title')
-    expect(checkbox.closest('label')!.getAttribute('title')).toContain('same domain')
+    expect(checkbox.closest('label')!.getAttribute('title')).toContain('starting host and path')
   })
 
   it('depth label has a title tooltip', () => {
@@ -59,7 +61,28 @@ describe('ConfigureWebsiteStep', () => {
   it('disables inputs when isCrawling', () => {
     render(<ConfigureWebsiteStep {...defaults} isCrawling={true} />)
     expect(screen.getByPlaceholderText('https://docs.example.com')).toBeDisabled()
-    expect(screen.getByLabelText('Only crawl current domain')).toBeDisabled()
+    expect(screen.getByLabelText('Only crawl current site section')).toBeDisabled()
+  })
+
+  it('shows cancel button while crawling and calls onCancelCrawl on click', () => {
+    const onCancelCrawl = vi.fn()
+    render(
+      <ConfigureWebsiteStep
+        {...defaults}
+        websiteUrl="https://gojs.net/latest/api/"
+        isCrawling={true}
+        onCancelCrawl={onCancelCrawl}
+      />
+    )
+    const cancelButton = screen.getByTitle('cancel')
+    expect(cancelButton).toBeInTheDocument()
+    fireEvent.click(cancelButton)
+    expect(onCancelCrawl).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not show cancel button when not crawling', () => {
+    render(<ConfigureWebsiteStep {...defaults} websiteUrl="https://example.com" />)
+    expect(screen.queryByTitle('cancel')).not.toBeInTheDocument()
   })
 
   it('shows current crawl URL on one line while crawling', () => {

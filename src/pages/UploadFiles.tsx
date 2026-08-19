@@ -1,8 +1,8 @@
-import React, { useState, useMemo, useCallback, useEffect } from "react";
+import React, { useState, useMemo, useCallback, useEffect, useRef } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useLocalUpload } from "@/hooks/use-local-upload";
 import { useJobTracking } from "@/hooks/use-job-tracking";
-import { crawlWebsite, embedWebsite, getMetadataValues } from "@/utils/apicalls";
+import { cancelWebsiteCrawl, crawlWebsite, embedWebsite, getMetadataValues } from "@/utils/apicalls";
 import PageHead from "@/components/shared/PageHead";
 import StepIndicator from "@/components/shared/StepIndicator";
 
@@ -53,6 +53,7 @@ const UploadFiles: React.FC = () => {
   const [websiteUrl, setWebsiteUrl] = useState<string>("");
   const [websiteDepth, setWebsiteDepth] = useState<number>(1);
   const [websiteSameDomainOnly, setWebsiteSameDomainOnly] = useState<boolean>(true);
+  const [websiteRenderJavascript, setWebsiteRenderJavascript] = useState<boolean>(false);
   const [websiteUrls, setWebsiteUrls] = useState<string[]>([]);
   const [websiteCrawlError, setWebsiteCrawlError] = useState<boolean>(false);
   const [websiteCrawling, setWebsiteCrawling] = useState<boolean>(false);
@@ -61,6 +62,7 @@ const UploadFiles: React.FC = () => {
   const [websiteEmbedJobId, setWebsiteEmbedJobId] = useState<string | null>(null);
   const [mixWarning, setMixWarning] = useState("");
   const [lastSubmittedCount, setLastSubmittedCount] = useState(0);
+  const crawlSessionRef = useRef(0);
   const { activeJobs, completedJobs, trackUploadedJobs, trackQueuedJob } = useJobTracking();
 
   useEffect(() => {
@@ -97,20 +99,47 @@ const UploadFiles: React.FC = () => {
     setCrawlCurrentUrl(null);
     setCrawlFoundCount(0);
     setWebsiteCrawling(true);
+    const session = ++crawlSessionRef.current;
     try {
-      const res = await crawlWebsite(websiteUrl, websiteDepth, websiteSameDomainOnly);
-      setWebsiteUrls(res.urls ?? []);
-      setStep(3);
-    } catch {
-      setWebsiteCrawlError(true);
+      const res = await crawlWebsite(
+        websiteUrl,
+        websiteDepth,
+        websiteSameDomainOnly,
+        websiteRenderJavascript,
+      );
+      if (crawlSessionRef.current === session) {
+        setWebsiteUrls(res.urls ?? []);
+        setStep((s) => (s === 2 ? 3 : s));
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (crawlSessionRef.current === session && !message.includes("cancelled")) {
+        setWebsiteCrawlError(true);
+      }
     } finally {
-      setWebsiteCrawling(false);
+      if (crawlSessionRef.current === session) setWebsiteCrawling(false);
     }
-  }, [websiteUrl, websiteDepth, websiteSameDomainOnly]);
+  }, [websiteUrl, websiteDepth, websiteSameDomainOnly, websiteRenderJavascript]);
+
+  const handleCancelCrawl = useCallback(() => {
+    void cancelWebsiteCrawl();
+  }, []);
+
+  const handleWebsiteBack = useCallback(() => {
+    setStep(1);
+  }, []);
+
+  const handleStepClick = useCallback((nextStep: number) => {
+    setStep(nextStep);
+  }, []);
 
   const handleWebsiteEmbed = useCallback(async (urls: string[]) => {
     try {
-      const res = await embedWebsite(urls, urlToGroupName(websiteUrl));
+      const res = await embedWebsite(
+        urls,
+        urlToGroupName(websiteUrl),
+        websiteRenderJavascript,
+      );
       const jobId = res.job_id;
       setWebsiteEmbedJobId(jobId);
       trackQueuedJob({
@@ -123,7 +152,7 @@ const UploadFiles: React.FC = () => {
     } catch (err) {
       console.error("Failed to start website embedding:", err);
     }
-  }, [websiteUrl, trackQueuedJob]);
+  }, [websiteUrl, websiteRenderJavascript, trackQueuedJob]);
 
   // Fetch repo names when codebase is selected
   useEffect(() => {
@@ -180,6 +209,7 @@ const UploadFiles: React.FC = () => {
   }, [collection, codeUploadMode, repoName]);
 
   const resetWebsiteState = () => {
+    crawlSessionRef.current += 1;
     setWebsiteUrl("");
     setWebsiteDepth(1);
     setWebsiteSameDomainOnly(true);
@@ -224,7 +254,7 @@ const UploadFiles: React.FC = () => {
         Use the steps below to select data type, configure scope, and upload files.
       </p>
 
-      <StepIndicator current={step} total={3} labels={stepLabels} onStepClick={(s) => setStep(s)} />
+      <StepIndicator current={step} total={3} labels={stepLabels} onStepClick={handleStepClick} />
 
       <div className="max-w-3xl mx-auto">
         {step === 1 && (
@@ -261,13 +291,16 @@ const UploadFiles: React.FC = () => {
             websiteUrl={websiteUrl}
             depth={websiteDepth}
             sameDomainOnly={websiteSameDomainOnly}
+            renderJavascript={websiteRenderJavascript}
             isCrawling={websiteCrawling}
             crawlCurrentUrl={crawlCurrentUrl}
             crawlFoundCount={crawlFoundCount}
             onUrlChange={setWebsiteUrl}
             onDepthChange={setWebsiteDepth}
             onSameDomainChange={setWebsiteSameDomainOnly}
-            onBack={() => setStep(1)}
+            onRenderJavascriptChange={setWebsiteRenderJavascript}
+            onCancelCrawl={handleCancelCrawl}
+            onBack={handleWebsiteBack}
             onNext={handleWebsiteSubmit}
           />
         )}

@@ -234,14 +234,20 @@ export async function getMcpConnectionInfo(
 export async function crawlWebsite(
   url: string,
   depth: number,
-  sameDomainOnly: boolean
+  sameDomainOnly: boolean,
+  renderJavascript = false,
 ): Promise<CrawlResponse> {
-  return invoke("crawl_website", { url, depth, sameDomainOnly });
+  return invoke("crawl_website", { url, depth, sameDomainOnly, renderJavascript });
+}
+
+export async function cancelWebsiteCrawl(): Promise<void> {
+  return invoke("cancel_website_crawl");
 }
 
 export async function embedWebsite(
   urls: string[],
-  group: string
+  group: string,
+  renderJavascript = false,
 ): Promise<EmbedWebsiteResponse> {
-  return invoke("embed_website", { urls, group });
+  return invoke("embed_website", { urls, group, renderJavascript });
 }

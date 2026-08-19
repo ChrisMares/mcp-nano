@@ -227,9 +227,9 @@ const WebsiteProcessingStep: React.FC<Props> = ({
         {crawledUrls.length > 0 && (
           <>
             <p className="text-sm text-muted-foreground mb-4">
-              Found <span className="font-semibold text-foreground">{crawledUrls.length}</span> pages from{" "}
+              Found <span className="font-semibold text-foreground">{crawledUrls.length}</span> URLs from{" "}
               <span className="font-medium text-foreground break-all">{websiteUrl}</span>.
-              Deselect pages you don't want embedded.
+              Deselect URLs you don't want embedded.
             </p>
 
             <div className="rounded-lg border border-border bg-muted/30 p-4 mb-4">
