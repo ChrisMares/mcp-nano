@@ -4,6 +4,7 @@ import { getFiles, getMcpServers, getMcpServer, getWebsites } from "@/utils/apic
 import { Database, Search, Plug, Code2, FileText, Server, Wrench, Loader2, ArrowRight } from "lucide-react";
 import PageHead from "@/components/shared/PageHead";
 import { card, cardInner, btnPrimary } from "@/styles/classes";
+import { useBackendStatus } from "@/hooks/use-backend-status";
 import type { DashboardStats } from "@/types/dashboard";
 import { emptyDashboardStats } from "@/types/dashboard";
 
@@ -53,8 +54,16 @@ const statCards = [
 const Dashboard: React.FC = () => {
   const [stats, setStats] = useState<DashboardStats>(emptyDashboardStats);
   const [loading, setLoading] = useState(true);
+  const backendStatus = useBackendStatus();
+  const backendReady = !!backendStatus?.qdrant_ready && !!backendStatus?.db_ready;
+  const backendFailed = !!backendStatus?.qdrant_error;
 
   useEffect(() => {
+    if (!backendReady && !backendFailed) return;
+
+    let cancelled = false;
+    setLoading(true);
+
     Promise.all([
       getFiles().catch(() => ({ repos: [], documents: [] })),
       getMcpServers().catch(() => ({ servers: [] })),
@@ -70,14 +79,22 @@ const Dashboard: React.FC = () => {
       }, 0);
       const websiteCount = websitesRes.websites?.length ?? 0;
 
-      setStats({
-        repos: filesRes.repos?.length ?? 0,
-        documents: (filesRes.documents?.length ?? 0) + websiteCount,
-        servers: servers.length,
-        tools: toolCount,
-      });
-    }).finally(() => setLoading(false));
-  }, []);
+      if (!cancelled) {
+        setStats({
+          repos: filesRes.repos?.length ?? 0,
+          documents: (filesRes.documents?.length ?? 0) + websiteCount,
+          servers: servers.length,
+          tools: toolCount,
+        });
+      }
+    }).finally(() => {
+      if (!cancelled) setLoading(false);
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [backendReady, backendFailed]);
 
   const hasData = stats.repos + stats.documents > 0;
   const disabledHint = "Embed your data first -- there's nothing to search or serve yet.";
