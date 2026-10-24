@@ -15,7 +15,7 @@
         "label": "main",
         "title": "mcp-nano",
         "width": 1120,
-        "height": 820,
+        "height": 920,
         "visible": false
       },
       {
@@ -45,12 +45,6 @@
       "resources/models/arctic-embed-xs/*": "models/arctic-embed-xs/",
       "resources/models/minilm-l6-v2/*": "models/minilm-l6-v2/"
     },
-    "icon": [
-      "icons/32x32.png",
-      "icons/128x128.png",
-      "icons/128x128@2x.png",
-      "icons/icon.icns",
-      "icons/icon.ico"
-    ]
+    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico"]
   }
 }

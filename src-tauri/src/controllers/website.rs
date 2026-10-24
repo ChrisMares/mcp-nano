@@ -30,6 +30,7 @@ pub async fn cancel_active_crawl(state: &WebsiteCrawlState) {
     if let Some(token) = state.0.lock().await.as_ref() {
         token.cancel();
     }
+    ingestion::website::clear_html_cache();
 }
 
 #[tauri::command]
@@ -43,11 +44,22 @@ pub async fn crawl_website(
 ) -> Result<CrawlResponse, String> {
     let depth = depth.unwrap_or(1).max(0) as usize;
     let same_domain = same_domain_only.unwrap_or(true);
+    ingestion::website::clear_html_cache();
     let cancellation = CancellationToken::new();
     *crawl_state.0.lock().await = Some(cancellation.clone());
     let app_for_progress = app.clone();
+    let started_at = std::time::Instant::now();
+    let last_emit_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let on_progress: ingestion::website::CrawlProgressCallback =
         Arc::new(move |ev: CrawlProgressEvent| {
+            if ev.phase != "done" {
+                let elapsed_ms = (started_at.elapsed().as_millis() as u64).max(1);
+                let prev = last_emit_ms.load(std::sync::atomic::Ordering::Relaxed);
+                if prev != 0 && elapsed_ms.saturating_sub(prev) < 35 {
+                    return;
+                }
+                last_emit_ms.store(elapsed_ms, std::sync::atomic::Ordering::Relaxed);
+            }
             let _ = app_for_progress.emit("crawl_progress", &ev);
         });
     let result = ingestion::website::crawl_website_with_options_and_cancellation(
@@ -60,7 +72,10 @@ pub async fn crawl_website(
     )
     .await;
     crawl_state.0.lock().await.take();
-    let urls = result.map_err(|e| format!("crawling {url}: {e:#}"))?;
+    let urls = result.map_err(|e| {
+        ingestion::website::clear_html_cache();
+        format!("crawling {url}: {e:#}")
+    })?;
     let count = urls.len() as i64;
     Ok(CrawlResponse { urls, count })
 }
@@ -70,6 +85,12 @@ pub async fn cancel_website_crawl(
     crawl_state: tauri::State<'_, WebsiteCrawlState>,
 ) -> Result<(), String> {
     cancel_active_crawl(&crawl_state).await;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn clear_website_cache() -> Result<(), String> {
+    ingestion::website::clear_html_cache();
     Ok(())
 }
 

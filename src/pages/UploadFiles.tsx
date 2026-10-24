@@ -2,7 +2,7 @@ import React, { useState, useMemo, useCallback, useEffect, useRef } from "react"
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useLocalUpload } from "@/hooks/use-local-upload";
 import { useJobTracking } from "@/hooks/use-job-tracking";
-import { cancelWebsiteCrawl, crawlWebsite, embedWebsite, getMetadataValues } from "@/utils/apicalls";
+import { cancelWebsiteCrawl, clearWebsiteCache, crawlWebsite, embedWebsite, getMetadataValues } from "@/utils/apicalls";
 import PageHead from "@/components/shared/PageHead";
 import StepIndicator from "@/components/shared/StepIndicator";
 
@@ -47,6 +47,8 @@ const UploadFiles: React.FC = () => {
   const [groupMode, setGroupMode] = useState<"existing" | "new">("existing");
   const [groupOptions, setGroupOptions] = useState<string[]>([]);
   const [codeUploadMode, setCodeUploadMode] = useState<"zip" | "individual" | "">("");
+  const [filterTestFiles, setFilterTestFiles] = useState<boolean>(true);
+  const [codeFilesOnly, setCodeFilesOnly] = useState<boolean>(true);
   const [repoName, setRepoName] = useState<string>("");
   const [repoMode, setRepoMode] = useState<"existing" | "new">("existing");
   const [repoOptions, setRepoOptions] = useState<string[]>([]);
@@ -63,7 +65,17 @@ const UploadFiles: React.FC = () => {
   const [mixWarning, setMixWarning] = useState("");
   const [lastSubmittedCount, setLastSubmittedCount] = useState(0);
   const crawlSessionRef = useRef(0);
+  const websiteEmbedJobIdRef = useRef<string | null>(null);
+  websiteEmbedJobIdRef.current = websiteEmbedJobId;
   const { activeJobs, completedJobs, trackUploadedJobs, trackQueuedJob } = useJobTracking();
+
+  useEffect(() => {
+    return () => {
+      if (!websiteEmbedJobIdRef.current) {
+        void clearWebsiteCache();
+      }
+    };
+  }, []);
 
   useEffect(() => {
     let unlisten: UnlistenFn | undefined;
@@ -96,7 +108,7 @@ const UploadFiles: React.FC = () => {
     setWebsiteCrawlError(false);
     setWebsiteUrls([]);
     setWebsiteEmbedJobId(null);
-    setCrawlCurrentUrl(null);
+    setCrawlCurrentUrl(websiteUrl.trim() || null);
     setCrawlFoundCount(0);
     setWebsiteCrawling(true);
     const session = ++crawlSessionRef.current;
@@ -126,10 +138,14 @@ const UploadFiles: React.FC = () => {
   }, []);
 
   const handleWebsiteBack = useCallback(() => {
+    void clearWebsiteCache();
     setStep(1);
   }, []);
 
   const handleStepClick = useCallback((nextStep: number) => {
+    if (nextStep < 3 && !websiteEmbedJobIdRef.current) {
+      void clearWebsiteCache();
+    }
     setStep(nextStep);
   }, []);
 
@@ -180,6 +196,8 @@ const UploadFiles: React.FC = () => {
     codeUploadMode,
     repoName,
     groupName,
+    filterTestFiles,
+    codeFilesOnly,
     maxFiles: 10,
     maxFileSize: Number.POSITIVE_INFINITY,
     onSuccess: handleUploadSuccess,
@@ -210,6 +228,9 @@ const UploadFiles: React.FC = () => {
 
   const resetWebsiteState = () => {
     crawlSessionRef.current += 1;
+    if (!websiteEmbedJobIdRef.current) {
+      void clearWebsiteCache();
+    }
     setWebsiteUrl("");
     setWebsiteDepth(1);
     setWebsiteSameDomainOnly(true);
@@ -224,6 +245,8 @@ const UploadFiles: React.FC = () => {
   const handleCollectionSelect = (val: "codebase" | "general" | "website") => {
     setCollection(val);
     setCodeUploadMode("");
+    setFilterTestFiles(true);
+    setCodeFilesOnly(true);
     if (val !== "codebase") { setRepoName(""); setRepoMode("existing"); }
     if (val !== "general" && val !== "website") { setGroupName(""); setGroupMode("existing"); }
     if (val !== "website") resetWebsiteState();
@@ -235,6 +258,8 @@ const UploadFiles: React.FC = () => {
     setGroupName("");
     setGroupMode("existing");
     setCodeUploadMode("");
+    setFilterTestFiles(true);
+    setCodeFilesOnly(true);
     setRepoName("");
     setRepoMode("existing");
     resetWebsiteState();
@@ -311,6 +336,10 @@ const UploadFiles: React.FC = () => {
             codeUploadMode={codeUploadMode}
             repoName={repoName}
             groupName={groupName}
+            filterTestFiles={filterTestFiles}
+            onFilterTestFilesChange={setFilterTestFiles}
+            codeFilesOnly={codeFilesOnly}
+            onCodeFilesOnlyChange={setCodeFilesOnly}
             uploadProps={uploadProps}
             disableUpload={disableUpload}
             disableReason={disableReason}

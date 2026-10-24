@@ -108,7 +108,7 @@ const Dashboard: React.FC = () => {
 
       {/* Welcome header */}
       <div className={card}>
-        <h1 className="text-2xl font-bold text-foreground mb-1">Welcome to NASA MCP</h1>
+        <h1 className="text-2xl font-bold text-foreground mb-1">Welcome to MCP Nano</h1>
       </div>
 
       {/* Getting started steps */}

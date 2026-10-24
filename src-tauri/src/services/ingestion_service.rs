@@ -1,13 +1,16 @@
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
-use futures_util::FutureExt;
+use futures_util::{stream, FutureExt, StreamExt};
+use rayon::prelude::*;
 use qdrant_client::qdrant::{Condition, Filter};
 use serde::Deserialize;
 use text_splitter::{ChunkConfig, MarkdownSplitter, TextSplitter};
 use tokenizers::Tokenizer;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use tracing::{debug, error, info};
@@ -15,9 +18,10 @@ use tracing::{debug, error, info};
 use crate::models::request::EmbeddingOptions;
 use crate::services::embedder_state::EmbedderState;
 use crate::services::embedders::EncodeDocuments;
+use crate::services::file_filters::{self, IngestFilter};
 use crate::services::ingestion;
 use crate::services::qdrant_service::QdrantService;
-use crate::worker::TaskRegistry;
+use crate::worker::{JobCancelled, TaskRegistry};
 
 /// Default chunk size in tokens (matches the Python `DOC_CHUNK_SIZE = 768`).
 const DEFAULT_CHUNK_SIZE: usize = 768;
@@ -33,6 +37,10 @@ const MAX_CHUNK_CHARS: usize = 6_000;
 const UPSERT_BATCH_SIZE: usize = 250;
 /// Batch size for dense embedding forward passes.
 const EMBED_BATCH_SIZE: usize = 16;
+/// How many zip files to ingest concurrently. Chunking (tree-sitter/text) and
+/// sparse/dense encoding are the bulk of the work; overlapping a handful of
+/// files keeps cores busy without oversubscribing the shared embedder sessions.
+const ZIP_FILE_CONCURRENCY: usize = 4;
 
 use crate::panic_payload_to_string;
 
@@ -82,6 +90,15 @@ where
             record_caught_panic(label, &msg);
             Err(anyhow!("{label} panicked: {msg}"))
         }
+    }
+}
+
+/// Bail out of a task as soon as its job is cancelled.
+fn ensure_not_cancelled(cancel: &CancellationToken) -> Result<()> {
+    if cancel.is_cancelled() {
+        Err(anyhow::Error::new(JobCancelled))
+    } else {
+        Ok(())
     }
 }
 
@@ -175,6 +192,7 @@ impl IngestionService {
         &self,
         params: serde_json::Value,
         progress: crate::worker::ProgressCallback,
+        cancel: CancellationToken,
     ) -> Result<String> {
         let p: ProcessZipParams = serde_json::from_value(params)
             .map_err(|e| {
@@ -187,10 +205,13 @@ impl IngestionService {
             p.zip_path, p.embedding_options.collection
         );
         progress(5, Some("Starting zip extraction".to_string())).await;
+        ensure_not_cancelled(&cancel)?;
 
         let extract_dir = PathBuf::from(format!("{}_extracted", strip_zip_ext(&p.zip_path)));
-        unzip_to(&p.zip_path, &extract_dir).with_context(|| format!("unzipping {}", p.zip_path))?;
+        tokio::task::block_in_place(|| unzip_to(&p.zip_path, &extract_dir))
+            .with_context(|| format!("unzipping {}", p.zip_path))?;
         info!("extracted zip to {}", extract_dir.display());
+        ensure_not_cancelled(&cancel)?;
         progress(20, Some("Zip extraction complete".to_string())).await;
 
         let collection = p
@@ -271,12 +292,16 @@ impl IngestionService {
             None
         };
 
+        let filter = IngestFilter::new(
+            embedding_options.code_files_only.unwrap_or(true),
+            embedding_options.filter_test_files.unwrap_or(true),
+        );
         let mut file_paths: Vec<PathBuf> = walkdir::WalkDir::new(&extract_dir)
             .into_iter()
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().is_file())
             .map(|e| e.into_path())
-            .filter(|p| !should_skip_ingest_path(p))
+            .filter(|p| filter.allows(p, p.strip_prefix(&extract_dir).unwrap_or(p)))
             .collect();
         file_paths.sort();
 
@@ -294,101 +319,149 @@ impl IngestionService {
                 extract_dir.display()
             ),
         );
-        let mut processed = 0usize;
-        let mut errors: Vec<String> = Vec::new();
-        for (idx, path) in file_paths.iter().enumerate() {
-            let file_name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("unknown")
-                .to_string();
-            let rel = path
-                .strip_prefix(&extract_dir)
-                .unwrap_or(path.as_path())
-                .display()
-                .to_string();
-            let (file_start, file_end) = zip_file_progress_bounds(idx, total_files);
-            info!(
-                "process_zip_upload: file {}/{} pct={}-{} path={}",
-                idx + 1,
-                total_files,
-                file_start,
-                file_end,
-                rel
-            );
-            crate::write_ingest_breadcrumb(
-                "zip_file_start",
-                &format!(
-                    "{}/{} pct={} path={}",
-                    idx + 1,
-                    total_files,
-                    file_start,
-                    rel
-                ),
-            );
-            progress(
-                file_start,
-                Some(format!(
-                    "Processing {} ({}/{})",
-                    file_name,
-                    idx + 1,
-                    total_files
-                )),
-            )
-            .await;
 
-            let file_t0 = std::time::Instant::now();
-            // One bad file must not abort the whole zip job.
-            let result = catch_async_panic(
-                &format!("ingest {rel}"),
-                self.ingest_text_file_with_range(
-                    path,
-                    &collection,
-                    repo_name_for_dispatch,
-                    &embedding_options,
-                    &progress,
-                    file_start,
-                    file_end,
-                ),
-            )
-            .await;
-            let file_ms = file_t0.elapsed().as_millis();
-            match result {
-                Ok(n) => {
-                    processed += n;
-                    if file_ms >= 2_000 {
-                        info!(
-                            "process_zip_upload: slow file={rel} chunks={n} elapsed_ms={file_ms}"
-                        );
+        // Files are independent, so ingest several concurrently; concurrency
+        // overlaps file I/O, chunking (tree-sitter / text splitting) and
+        // encoding across files. Shared counters are atomic so progress stays
+        // correct even though files finish out of order.
+        let concurrency = ZIP_FILE_CONCURRENCY.min(total_files);
+        let processed = AtomicUsize::new(0);
+        let errors: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        // Per-file progress bands overlap when files run concurrently. Clamp
+        // the percentage to a monotonic high-water mark so the bar never moves
+        // backwards, but still forward every update so the current stage
+        // message is always shown.
+        let max_pct = AtomicI32::new(19);
+        let file_progress: crate::worker::ProgressCallback = {
+            let outer = progress.clone();
+            Arc::new(move |pct, msg| -> crate::worker::progress::ProgressFuture {
+                let high = max_pct.fetch_max(pct, Ordering::SeqCst);
+                // Never let the bar regress, but always deliver the message:
+                // the frontend clamps the percentage itself, so suppressing
+                // the event here would only hide the current stage.
+                outer(pct.max(high), msg)
+            })
+        };
+
+        let file_futures = file_paths
+            .iter()
+            .enumerate()
+            .map(|(idx, path)| {
+                let ingest = self;
+                let file_progress = file_progress.clone();
+                let processed = &processed;
+                let errors = &errors;
+                let collection = &collection;
+                let embedding_options = &embedding_options;
+                let extract_dir = &extract_dir;
+                let repo_name = repo_name_for_dispatch;
+                let cancel = cancel.clone();
+                async move {
+                    // A cancelled zip stops before the next file starts; the
+                    // worker deletes the partially written data afterwards.
+                    if cancel.is_cancelled() {
+                        return;
                     }
+                    let file_name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let rel = path
+                        .strip_prefix(extract_dir.as_path())
+                        .unwrap_or(path.as_path())
+                        .display()
+                        .to_string();
+                    let (file_start, file_end) = zip_file_progress_bounds(idx, total_files);
                     debug!(
-                        "process_zip_upload: ok file={rel} chunks={n} running_total={processed} elapsed_ms={file_ms}"
+                        "process_zip_upload: file {}/{} pct={}-{} path={}",
+                        idx + 1,
+                        total_files,
+                        file_start,
+                        file_end,
+                        rel
                     );
-                    crate::write_ingest_breadcrumb(
-                        "zip_file_ok",
-                        &format!("{rel} chunks={n} ms={file_ms}"),
-                    );
-                }
-                Err(e) => {
-                    error!("process_zip_upload: skip file={rel} elapsed_ms={file_ms}: {e:#}");
-                    crate::write_ingest_breadcrumb(
-                        "zip_file_error",
-                        &format!("{rel} ms={file_ms}: {e:#}"),
-                    );
-                    errors.push(format!("{rel}: {e:#}"));
-                    progress(
-                        file_end.min(99),
+                    file_progress(
+                        file_start,
                         Some(format!(
-                            "Skipped {} ({}/{})",
+                            "Processing {} ({}/{})",
                             file_name,
                             idx + 1,
                             total_files
                         )),
                     )
                     .await;
+
+                    let file_t0 = std::time::Instant::now();
+                    // One bad file must not abort the whole zip job.
+                    let result = catch_async_panic(
+                        &format!("ingest {rel}"),
+                        ingest.ingest_text_file_with_range(
+                            path,
+                            collection,
+                            repo_name,
+                            embedding_options,
+                            &file_progress,
+                            file_start,
+                            file_end,
+                            &cancel,
+                        ),
+                    )
+                    .await;
+                    let file_ms = file_t0.elapsed().as_millis();
+                    match result {
+                        Ok(n) => {
+                            let total = processed.fetch_add(n, Ordering::SeqCst) + n;
+                            if file_ms >= 2_000 {
+                                info!(
+                                    "process_zip_upload: slow file={rel} chunks={n} elapsed_ms={file_ms}"
+                                );
+                            }
+                            debug!(
+                                "process_zip_upload: ok file={rel} chunks={n} running_total={total} elapsed_ms={file_ms}"
+                            );
+                        }
+                        Err(e) => {
+                            if crate::worker::is_job_cancelled(&e) || cancel.is_cancelled() {
+                                return;
+                            }
+                            error!(
+                                "process_zip_upload: skip file={rel} elapsed_ms={file_ms}: {e:#}"
+                            );
+                            crate::write_ingest_breadcrumb(
+                                "zip_file_error",
+                                &format!("{rel} ms={file_ms}: {e:#}"),
+                            );
+                            if let Ok(mut guard) = errors.lock() {
+                                guard.push(format!("{rel}: {e:#}"));
+                            }
+                            file_progress(
+                                file_end.min(99),
+                                Some(format!(
+                                    "Skipped {} ({}/{})",
+                                    file_name,
+                                    idx + 1,
+                                    total_files
+                                )),
+                            )
+                            .await;
+                        }
+                    }
                 }
-            }
-        }
+            })
+            .collect::<Vec<_>>();
+
+        stream::iter(file_futures)
+            .buffer_unordered(concurrency)
+            .for_each(|_| async {})
+            .await;
+
+        // Stop before reporting success: the worker deletes the archive and
+        // extraction dir, then marks the job CANCELLED.
+        ensure_not_cancelled(&cancel)?;
+
+        let processed = processed.load(Ordering::SeqCst);
+        let errors = errors.into_inner().unwrap_or_default();
         crate::write_ingest_breadcrumb(
             "zip_complete",
             &format!("processed_chunks={processed} errors={}", errors.len()),
@@ -415,6 +488,7 @@ impl IngestionService {
         &self,
         params: serde_json::Value,
         progress: crate::worker::ProgressCallback,
+        cancel: CancellationToken,
     ) -> Result<String> {
         let p: ProcessDocParams = serde_json::from_value(params)
             .map_err(|e| {
@@ -430,6 +504,7 @@ impl IngestionService {
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("document");
+        ensure_not_cancelled(&cancel)?;
         progress(5, Some(format!("Loading {display}"))).await;
 
         if !Path::new(&p.path).exists() {
@@ -466,15 +541,19 @@ impl IngestionService {
                     collection: Some(collection.clone()),
                     repo_name: None,
                     group: p.group.clone(),
+                    filter_test_files: None,
+                    code_files_only: None,
                     metadata: p.metadata.clone(),
                 },
                 &progress,
                 10,
                 95,
+                &cancel,
             ),
         )
         .await?;
 
+        ensure_not_cancelled(&cancel)?;
         let _ = std::fs::remove_file(&p.path);
 
         progress(100, Some("Document processing complete".to_string())).await;
@@ -486,6 +565,7 @@ impl IngestionService {
         &self,
         params: serde_json::Value,
         progress: crate::worker::ProgressCallback,
+        cancel: CancellationToken,
     ) -> Result<String> {
         let p: ProcessCodeFileParams = serde_json::from_value(params)
             .map_err(|e| {
@@ -501,6 +581,7 @@ impl IngestionService {
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("code");
+        ensure_not_cancelled(&cancel)?;
         progress(5, Some(format!("Loading {display}"))).await;
 
         if !Path::new(&p.path).exists() {
@@ -519,15 +600,19 @@ impl IngestionService {
                     collection: Some(p.collection.clone()),
                     repo_name: p.repo_name.clone(),
                     group: None,
+                    filter_test_files: None,
+                    code_files_only: None,
                     metadata: p.metadata.clone(),
                 },
                 &progress,
                 10,
                 95,
+                &cancel,
             ),
         )
         .await?;
 
+        ensure_not_cancelled(&cancel)?;
         let _ = std::fs::remove_file(&p.path);
         progress(100, Some("Code file processing complete".to_string())).await;
         Ok(format!("Processed {n} chunk(s)."))
@@ -539,6 +624,7 @@ impl IngestionService {
         &self,
         params: serde_json::Value,
         progress: crate::worker::ProgressCallback,
+        cancel: CancellationToken,
     ) -> Result<String> {
         let p: ProcessWebsiteParams = serde_json::from_value(params)
             .map_err(|e| {
@@ -564,28 +650,34 @@ impl IngestionService {
             base_metadata.insert(k.clone(), v.clone());
         }
 
-        let total_urls = p.urls.len().max(1);
-        let mut chunks = Vec::new();
-        for (i, url) in p.urls.iter().enumerate() {
-            let pct = 5 + ((i as i32) * 25 / total_urls as i32);
-            progress(
-                pct,
-                Some(format!("Scraping {} ({}/{})", url, i + 1, p.urls.len())),
-            )
-            .await;
-            let page_chunks = catch_async_panic("website scrape", async {
-                ingestion::website::process_website_with_splitter(
-                    std::slice::from_ref(url),
-                    &base_metadata,
-                    Some(&self.splitter),
-                    p.render_javascript.unwrap_or(false),
-                )
-                .await
-                .context("scraping + chunking website pages")
-            })
-            .await?;
-            chunks.extend(page_chunks);
+        struct HtmlCacheClearGuard;
+        impl Drop for HtmlCacheClearGuard {
+            fn drop(&mut self) {
+                ingestion::website::clear_html_cache();
+            }
         }
+        let _cache_guard = HtmlCacheClearGuard;
+
+        ensure_not_cancelled(&cancel)?;
+        progress(
+            5,
+            Some(format!("Scraping {} page(s)", p.urls.len())),
+        )
+        .await;
+        let chunks = catch_async_panic("website scrape", async {
+            ingestion::website::process_website_with_progress(
+                &p.urls,
+                &base_metadata,
+                Some(&self.splitter),
+                p.render_javascript.unwrap_or(false),
+                Some(&progress),
+                Some(&cancel),
+            )
+            .await
+            .context("scraping + chunking website pages")
+        })
+        .await?;
+        ensure_not_cancelled(&cancel)?;
         if chunks.is_empty() {
             return Err(anyhow!("No content extracted from any URL"));
         }
@@ -600,6 +692,7 @@ impl IngestionService {
                 &progress,
                 30,
                 100,
+                &cancel,
             ),
         )
         .await?;
@@ -616,24 +709,32 @@ impl IngestionService {
     pub fn build_task_registry(self: Arc<Self>) -> TaskRegistry {
         let mut reg = TaskRegistry::new();
         let ingest = self.clone();
-        reg.register("process_zip", move |params, progress| {
+        reg.register("process_zip", move |params, progress, cancel| {
             let ingest = ingest.clone();
-            async move { ingest.process_zip_upload(params, progress).await }
+            async move { ingest.process_zip_upload(params, progress, cancel).await }
         });
         let ingest = self.clone();
-        reg.register("process_documents_upload", move |params, progress| {
+        reg.register("process_documents_upload", move |params, progress, cancel| {
             let ingest = ingest.clone();
-            async move { ingest.process_documents_upload(params, progress).await }
+            async move {
+                ingest
+                    .process_documents_upload(params, progress, cancel)
+                    .await
+            }
         });
         let ingest = self.clone();
-        reg.register("process_code_file_upload", move |params, progress| {
+        reg.register("process_code_file_upload", move |params, progress, cancel| {
             let ingest = ingest.clone();
-            async move { ingest.process_code_file_upload(params, progress).await }
+            async move {
+                ingest
+                    .process_code_file_upload(params, progress, cancel)
+                    .await
+            }
         });
         let ingest = self.clone();
-        reg.register("process_website_scrape", move |params, progress| {
+        reg.register("process_website_scrape", move |params, progress, cancel| {
             let ingest = ingest.clone();
-            async move { ingest.process_website_embed(params, progress).await }
+            async move { ingest.process_website_embed(params, progress, cancel).await }
         });
         reg
     }
@@ -651,10 +752,12 @@ impl IngestionService {
         progress: &crate::worker::ProgressCallback,
         range_start: i32,
         range_end: i32,
+        cancel: &CancellationToken,
     ) -> Result<usize> {
-        if should_skip_ingest_path(path) {
+        if file_filters::is_junk(path) {
             return Ok(0);
         }
+        ensure_not_cancelled(cancel)?;
         let raw_file_name = path
             .file_name()
             .and_then(|n| n.to_str())
@@ -681,7 +784,6 @@ impl IngestionService {
         let is_code = collection == "codebase" && ingestion::code_chunker::is_code_file(path);
         let chunks: Vec<ingestion::DocumentChunk> = if is_code {
             progress(chunk_pct, Some(format!("Chunking code in {display}"))).await;
-            crate::write_ingest_breadcrumb("chunk_code", &path_display);
             let repo = repo_name.unwrap_or("");
             let name_override = Some(file_name.clone());
             let t0 = std::time::Instant::now();
@@ -707,16 +809,8 @@ impl IngestionService {
                     code_chunks.len()
                 );
             }
-            crate::write_ingest_breadcrumb(
-                "chunk_code_done",
-                &format!(
-                    "path={path_display} chunks={} ms={chunk_ms}",
-                    code_chunks.len()
-                ),
-            );
             enforce_max_chunk_chars(code_chunks)
         } else {
-            crate::write_ingest_breadcrumb("load_document", &path_display);
             let path_for_load = path_buf.clone();
             let load_t0 = std::time::Instant::now();
             let mut loaded = tokio::task::spawn_blocking(move || {
@@ -746,9 +840,9 @@ impl IngestionService {
                 );
             }
             let load_ms = load_t0.elapsed().as_millis();
-            crate::write_ingest_breadcrumb(
-                "load_document_done",
-                &format!("path={path_display} ms={load_ms}"),
+            debug!(
+                "ingest: loaded document path={} ms={load_ms}",
+                path_display
             );
 
             let source_pages = loaded.len();
@@ -760,9 +854,8 @@ impl IngestionService {
                 )),
             )
             .await;
-            crate::write_ingest_breadcrumb("chunk_text", &path_display);
             let split_t0 = std::time::Instant::now();
-            info!(
+            debug!(
                 "ingest: splitting document path={} source_documents={} source_chars={}",
                 path_display, source_pages, source_chars
             );
@@ -798,13 +891,6 @@ impl IngestionService {
                     )),
                 )
                 .await;
-                crate::write_ingest_breadcrumb(
-                    "chunk_text_progress",
-                    &format!(
-                        "path={path_display} documents={}/{} chunks={}",
-                        snapshot.completed, snapshot.total, snapshot.output_chunks
-                    ),
-                );
             }
             let split_chunks = split_task.await.map_err(|e| {
                 if e.is_panic() {
@@ -816,17 +902,9 @@ impl IngestionService {
                 }
             })??;
             let split_ms = split_t0.elapsed().as_millis();
-            info!(
+            debug!(
                 "ingest: split document path={} source_documents={} source_chars={} chunks={} elapsed_ms={split_ms}",
                 path_display, source_pages, source_chars, split_chunks.len()
-            );
-            crate::write_ingest_breadcrumb(
-                "chunk_text_done",
-                &format!(
-                    "path={path_display} chunks={} ms={}",
-                    split_chunks.len(),
-                    split_ms
-                ),
             );
             split_chunks
         };
@@ -844,11 +922,6 @@ impl IngestionService {
             )),
         )
         .await;
-        crate::write_ingest_breadcrumb(
-            "embed_start",
-            &format!("path={path_display} chunks={}", chunks.len()),
-        );
-
         let extra_meta = build_base_metadata(&file_name, &doc_type, repo_name, options);
         let n = self
             .embed_and_upsert_documents(
@@ -858,10 +931,10 @@ impl IngestionService {
                 progress,
                 range_start,
                 range_end,
+                cancel,
             )
             .await
             .with_context(|| format!("embed/upsert failed for {path_display}"))?;
-        crate::write_ingest_breadcrumb("embed_done", &format!("path={path_display} chunks={n}"));
         Ok(n)
     }
 
@@ -876,11 +949,12 @@ impl IngestionService {
         progress: &crate::worker::ProgressCallback,
         range_start: i32,
         range_end: i32,
+        cancel: &CancellationToken,
     ) -> Result<usize> {
         if chunks.is_empty() {
             return Ok(0);
         }
-        info!(
+        debug!(
             "embed_and_upsert: {} chunks → {collection} [{range_start}..{range_end}]",
             chunks.len()
         );
@@ -893,26 +967,20 @@ impl IngestionService {
             (((chunks.len() + EMBED_BATCH_SIZE - 1) / EMBED_BATCH_SIZE) as i32).max(1);
         let mut embeddings_list: Vec<Vec<f32>> = Vec::with_capacity(chunks.len());
         for batch_index in 0..total_batches {
+            ensure_not_cancelled(cancel)?;
             let batch_start = (batch_index as usize) * EMBED_BATCH_SIZE;
             let batch_end = (batch_start + EMBED_BATCH_SIZE).min(chunks.len());
             let batch_texts: Vec<&str> = chunk_refs[batch_start..batch_end].to_vec();
-            crate::write_ingest_breadcrumb(
-                "embed_batch",
-                &format!(
-                    "collection={collection} batch={}/{} size={}",
-                    batch_index + 1,
-                    total_batches,
-                    batch_texts.len()
-                ),
-            );
-            let batch_embeddings = catch_sync_panic(
-                &format!("dense encode batch {}/{}", batch_index + 1, total_batches),
-                || {
-                    self.embedders
-                        .dense
-                        .encode_documents(&batch_texts, EMBED_BATCH_SIZE)
-                },
-            )?
+            let batch_embeddings = tokio::task::block_in_place(|| {
+                catch_sync_panic(
+                    &format!("dense encode batch {}/{}", batch_index + 1, total_batches),
+                    || {
+                        self.embedders
+                            .dense
+                            .encode_documents(&batch_texts, EMBED_BATCH_SIZE)
+                    },
+                )
+            })?
             .with_context(|| format!("encoding batch {}/{}", batch_index + 1, total_batches))?;
             if batch_embeddings.len() != batch_texts.len() {
                 return Err(anyhow!(
@@ -923,9 +991,7 @@ impl IngestionService {
                     batch_texts.len()
                 ));
             }
-            for e in batch_embeddings {
-                embeddings_list.push(e);
-            }
+            embeddings_list.extend(batch_embeddings);
             let pct = map_batch_progress(range_start, range_end, batch_index, total_batches);
             progress(
                 pct,
@@ -965,10 +1031,6 @@ impl IngestionService {
             Some(format!("Upserting {} chunks to Qdrant", chunks.len())),
         )
         .await;
-        crate::write_ingest_breadcrumb(
-            "upsert",
-            &format!("collection={collection} chunks={}", chunks.len()),
-        );
 
         self.qdrant
             .upsert_items(
@@ -1021,133 +1083,75 @@ fn split_document_chunks_with_progress(
     chunks: Vec<ingestion::DocumentChunk>,
     splitter: &TextSplitter<Tokenizer>,
     markdown_splitter: &MarkdownSplitter<Tokenizer>,
-    mut report: impl FnMut(ChunkingProgress),
+    report: impl Fn(ChunkingProgress) + Sync,
 ) -> Vec<ingestion::DocumentChunk> {
     if chunks.is_empty() {
         return chunks;
     }
     let total = chunks.len();
-    let mut out: Vec<ingestion::DocumentChunk> = Vec::new();
-    for (source_index, chunk) in chunks.into_iter().enumerate() {
-        let parts: Vec<String> = if matches!(chunk.doc_type.as_str(), "md" | "mdx") {
-            markdown_splitter
-                .chunks(&chunk.content)
-                .map(String::from)
-                .collect()
-        } else {
-            splitter.chunks(&chunk.content).map(String::from).collect()
-        };
-        let parts = if parts.is_empty() {
-            vec![chunk.content.clone()]
-        } else {
-            parts
-        };
-        for sub in parts {
-            for piece in ingestion::types::hard_split_chars(&sub, MAX_CHUNK_CHARS) {
-                let mut child = chunk.clone();
-                child.id = Uuid::new_v4().to_string();
-                child.content = piece;
-                // Python assigns indexes after splitting every source document.
-                child.chunk_index = out.len() as i64;
-                out.push(child);
+    // Source documents are independent, so split them in parallel. Progress is
+    // driven by monotonic atomic counters rather than a loop index: each
+    // `fetch_add` returns a unique consecutive value, so every `% 100` /
+    // `== total` milestone fires exactly once, from exactly one worker, and the
+    // reported count never moves backwards.
+    let completed = AtomicUsize::new(0);
+    let output_chunks = AtomicUsize::new(0);
+    let per_document: Vec<Vec<ingestion::DocumentChunk>> = chunks
+        .into_par_iter()
+        .map(|chunk| {
+            let parts: Vec<String> = if matches!(chunk.doc_type.as_str(), "md" | "mdx") {
+                markdown_splitter
+                    .chunks(&chunk.content)
+                    .map(String::from)
+                    .collect()
+            } else {
+                splitter.chunks(&chunk.content).map(String::from).collect()
+            };
+            let parts = if parts.is_empty() {
+                vec![chunk.content.clone()]
+            } else {
+                parts
+            };
+            let mut doc_out: Vec<ingestion::DocumentChunk> = Vec::new();
+            for sub in parts {
+                for piece in ingestion::types::hard_split_chars(&sub, MAX_CHUNK_CHARS) {
+                    let mut child = chunk.clone();
+                    child.id = Uuid::new_v4().to_string();
+                    child.content = piece;
+                    doc_out.push(child);
+                }
             }
-        }
-        // Avoid one database/event write per PDF page while preserving useful
-        // visibility for very large documents.
-        let completed = source_index + 1;
-        if completed == total || completed % 100 == 0 {
-            report(ChunkingProgress {
-                completed,
-                total,
-                output_chunks: out.len(),
-            });
-        }
+            output_chunks.fetch_add(doc_out.len(), Ordering::SeqCst);
+            // Avoid one database/event write per PDF page while preserving
+            // useful visibility for very large documents.
+            let done = completed.fetch_add(1, Ordering::SeqCst) + 1;
+            if done == total || done % 100 == 0 {
+                report(ChunkingProgress {
+                    completed: done,
+                    total,
+                    output_chunks: output_chunks.load(Ordering::SeqCst),
+                });
+            }
+            doc_out
+        })
+        .collect();
+
+    // Python assigns indexes after splitting every source document. `collect`
+    // preserves source order, so flattening here yields the same index
+    // sequence as the previous sequential assignment.
+    let mut out: Vec<ingestion::DocumentChunk> = Vec::new();
+    for mut child in per_document.into_iter().flatten() {
+        child.chunk_index = out.len() as i64;
+        out.push(child);
     }
+    // Guarantee a final update with the exact totals so the bar lands on the
+    // band boundary even when `total` is not a multiple of 100.
+    report(ChunkingProgress {
+        completed: total,
+        total,
+        output_chunks: out.len(),
+    });
     out
-}
-
-/// Paths we never want in the vector DB (vendor, maps, binaries, minified,
-/// test fixtures). Used for zip walks and single-file guards.
-pub fn should_skip_ingest_path(path: &Path) -> bool {
-    if is_image_ext(path) {
-        return true;
-    }
-    let name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-
-    const SKIP_EXTS: &[&str] = &[
-        "map", "woff", "woff2", "ttf", "otf", "eot", "ico", "svg", "gif", "webp", "bmp", "mp3",
-        "mp4", "wav", "zip", "gz", "tar", "7z", "rar", "bin", "exe", "dll", "so", "dylib", "pdb",
-        "lock", "sum", "chm", "chw",
-    ];
-    if SKIP_EXTS.contains(&ext.as_str()) {
-        return true;
-    }
-    if name.ends_with(".min.js")
-        || name.ends_with(".min.mjs")
-        || name.ends_with(".min.cjs")
-        || name.ends_with(".bundle.js")
-        || name.ends_with(".min.css")
-    {
-        return true;
-    }
-    if matches!(
-        name.as_str(),
-        "package-lock.json"
-            | "yarn.lock"
-            | "pnpm-lock.yaml"
-            | "cargo.lock"
-            | "composer.lock"
-            | "go.sum"
-            | ".ds_store"
-            | "thumbs.db"
-    ) {
-        return true;
-    }
-
-    // Normalize separators so segment checks work on Windows and Unix paths.
-    let path_l = path
-        .to_string_lossy()
-        .to_ascii_lowercase()
-        .replace('\\', "/");
-    let padded = format!("/{path_l}/");
-    for seg in [
-        "/node_modules/",
-        "/.git/",
-        "/dist/",
-        "/build/",
-        "/target/",
-        "/.vs/",
-        "/bin/",
-        "/obj/",
-        // Test / fixture noise dominates large library zips (e.g. Chart.js)
-        // and is rarely useful for code-search RAG.
-        "/test/",
-        "/tests/",
-        "/__tests__/",
-        "/spec/",
-        "/specs/",
-        "/fixtures/",
-        "/.github/",
-        "/coverage/",
-        "/.nyc_output/",
-        "/vendor/",
-        "/third_party/",
-        "/third-party/",
-    ] {
-        if padded.contains(seg) {
-            return true;
-        }
-    }
-    false
 }
 
 /// Strip the job-id UUID prefix from a temp filename (mirrors the Python
@@ -1199,7 +1203,7 @@ fn build_base_metadata(
     serde_json::Value::Object(map)
 }
 
-fn strip_zip_ext(zip_path: &str) -> String {
+pub(crate) fn strip_zip_ext(zip_path: &str) -> String {
     if let Some(stripped) = zip_path.strip_suffix(".zip") {
         stripped.to_string()
     } else if let Some(stripped) = zip_path.strip_suffix(".ZIP") {
@@ -1224,35 +1228,31 @@ pub fn repo_name_from_zip_filename(zip_filename: &str) -> String {
     }
 }
 
-fn is_image_ext(path: &Path) -> bool {
-    matches!(
-        path.extension()
-            .and_then(|e| e.to_str())
-            .map(|s| s.to_lowercase())
-            .as_deref(),
-        Some("png") | Some("jpg") | Some("jpeg")
-    )
-}
-
 fn enforce_max_chunk_chars(chunks: Vec<ingestion::DocumentChunk>) -> Vec<ingestion::DocumentChunk> {
-    let mut out = Vec::with_capacity(chunks.len());
-    for chunk in chunks {
-        if chunk.content.chars().count() <= MAX_CHUNK_CHARS {
-            out.push(chunk);
-            continue;
-        }
-        for (i, piece) in ingestion::types::hard_split_chars(&chunk.content, MAX_CHUNK_CHARS)
-            .into_iter()
-            .enumerate()
-        {
-            let mut child = chunk.clone();
-            child.id = Uuid::new_v4().to_string();
-            child.content = piece;
-            child.chunk_index = chunk.chunk_index + i as i64;
-            out.push(child);
-        }
-    }
-    out
+    // Chunks are independent; splitting oversized ones is CPU-bound, so run it
+    // in parallel. `flat_map` preserves input order, and each child's
+    // `chunk_index` is derived locally from its parent, so the output matches
+    // the previous sequential loop exactly.
+    chunks
+        .into_par_iter()
+        .map(|chunk| {
+            if chunk.content.chars().count() <= MAX_CHUNK_CHARS {
+                return vec![chunk];
+            }
+            ingestion::types::hard_split_chars(&chunk.content, MAX_CHUNK_CHARS)
+                .into_iter()
+                .enumerate()
+                .map(|(i, piece)| {
+                    let mut child = chunk.clone();
+                    child.id = Uuid::new_v4().to_string();
+                    child.content = piece;
+                    child.chunk_index = chunk.chunk_index + i as i64;
+                    child
+                })
+                .collect()
+        })
+        .flatten()
+        .collect()
 }
 
 fn unzip_to(zip_path: &str, dest: &Path) -> Result<()> {
@@ -1333,20 +1333,13 @@ mod tests {
     }
 
     #[test]
-    fn is_image_ext_detects_image_extensions() {
-        assert!(is_image_ext(Path::new("photo.png")));
-        assert!(is_image_ext(Path::new("photo.JPG")));
-        assert!(is_image_ext(Path::new("photo.jpeg")));
-        assert!(!is_image_ext(Path::new("doc.pdf")));
-        assert!(!is_image_ext(Path::new("noext")));
-    }
-
-    #[test]
     fn build_base_metadata_includes_required_fields() {
         let opts = EmbeddingOptions {
             collection: Some("general".to_string()),
             repo_name: None,
             group: Some("docs".to_string()),
+            filter_test_files: None,
+            code_files_only: None,
             metadata: Some(serde_json::json!({"source": "manual"})),
         };
         let meta = build_base_metadata("notes.txt", "txt", None, &opts);
@@ -1365,6 +1358,8 @@ mod tests {
             collection: Some("codebase".to_string()),
             repo_name: Some("my_repo".to_string()),
             group: None,
+            filter_test_files: None,
+            code_files_only: None,
             metadata: None,
         };
         let meta = build_base_metadata("main.py", "py", Some("my_repo"), &opts);
@@ -1729,46 +1724,6 @@ mod tests {
         let combined: String = split.iter().map(|c| c.content.as_str()).collect();
         assert!(combined.contains("Markdown Sample"));
         assert!(combined.contains("Bullet one"));
-    }
-
-    #[test]
-    fn should_skip_ingest_junk_assets() {
-        assert!(should_skip_ingest_path(Path::new(
-            "wwwroot/chart.umd.min.js.map"
-        )));
-        assert!(should_skip_ingest_path(Path::new("bootstrap.min.css.map")));
-        assert!(should_skip_ingest_path(Path::new("open-iconic.woff")));
-        assert!(should_skip_ingest_path(Path::new("favicon.ico")));
-        assert!(should_skip_ingest_path(Path::new("lib/jquery.min.js")));
-        assert!(should_skip_ingest_path(Path::new("styles.min.css")));
-        assert!(!should_skip_ingest_path(Path::new("src/OptionsService.cs")));
-        assert!(!should_skip_ingest_path(Path::new("README.md")));
-        assert!(!should_skip_ingest_path(Path::new("app.js")));
-    }
-
-    #[test]
-    fn should_skip_test_and_fixture_paths() {
-        assert!(should_skip_ingest_path(Path::new(
-            "Chart.js-4.5.1/test/fixtures/controller.radar/radius/indexable.js"
-        )));
-        assert!(should_skip_ingest_path(Path::new("repo/tests/unit/foo.rs")));
-        assert!(should_skip_ingest_path(Path::new(
-            "pkg/__tests__/button.tsx"
-        )));
-        assert!(should_skip_ingest_path(Path::new("lib/spec/helpers.js")));
-        assert!(should_skip_ingest_path(Path::new(
-            "proj/.github/workflows/ci.yml"
-        )));
-        assert!(should_skip_ingest_path(Path::new(
-            r"repo\test\fixtures\a.js"
-        )));
-        // Real source must still ingest.
-        assert!(!should_skip_ingest_path(Path::new(
-            "Chart.js-4.5.1/src/core/core.controller.js"
-        )));
-        assert!(!should_skip_ingest_path(Path::new(
-            "src/services/ingestion_service.rs"
-        )));
     }
 
     #[test]

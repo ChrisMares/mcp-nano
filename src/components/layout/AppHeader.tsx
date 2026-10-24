@@ -58,7 +58,7 @@ const AppHeader: React.FC = () => {
 
           {/* Mobile logo */}
           <Link to="/" className="lg:hidden">
-            <span className="text-lg font-semibold text-foreground">NASA MCP</span>
+            <span className="text-lg font-semibold text-foreground">MCP Nano</span>
           </Link>
         </div>
 

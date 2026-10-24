@@ -44,7 +44,7 @@ const navItems: NavItem[] = [
   },
 ];
 
-const sidebarWidth = (expanded: boolean) => expanded ? "w-[290px]" : "w-[90px]";
+const sidebarWidth = (expanded: boolean) => expanded ? "w-[240px]" : "w-[90px]";
 
 const AppSidebar: React.FC = () => {
   const { isExpanded, isMobileOpen } = useSidebar();

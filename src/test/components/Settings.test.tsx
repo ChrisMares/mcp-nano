@@ -27,7 +27,7 @@ describe('Settings', () => {
     renderWithProviders(<Settings />)
 
     expect(screen.getByRole('heading', { name: 'Model Status' })).toBeInTheDocument()
-    expect(screen.getByText('Application')).toBeInTheDocument()
+    expect(screen.getByText('Application Version')).toBeInTheDocument()
     expect(screen.getByText(packageJson.version)).toBeInTheDocument()
     expect(screen.getByText('BM25')).toBeInTheDocument()
     expect(screen.getByText('Snowflake Arctic Embed XS')).toBeInTheDocument()

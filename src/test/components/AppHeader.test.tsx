@@ -12,11 +12,11 @@ describe('AppHeader', () => {
 
   it('renders the mobile logo link', () => {
     renderWithProviders(<AppHeader />)
-    expect(screen.getByText('NASA MCP')).toBeInTheDocument()
+    expect(screen.getByText('MCP Nano')).toBeInTheDocument()
   })
 
-  it('renders local mode dropdown', () => {
+  it('renders the account menu', () => {
     renderWithProviders(<AppHeader />)
-    expect(screen.getByText('Local')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Account menu' })).toBeInTheDocument()
   })
 })

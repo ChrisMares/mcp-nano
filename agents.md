@@ -124,7 +124,7 @@ only the library's public API.
 
 | Location | Type | Count | External deps |
 | --- | --- | --- | --- |
-| `src-tauri/src/**/mod tests` | Unit (inline) | 121 | None (temp SQLite in-process) |
+| `src-tauri/src/**/mod tests` | Unit (inline) | 157 | None (temp SQLite in-process) |
 | `src-tauri/tests/code_chunker.rs` | Integration (tree-sitter chunkers) | 20 | None |
 | `src-tauri/tests/data_management.rs` | Integration (SQLite metadata) | 8 | None |
 | `src-tauri/tests/document_loaders.rs` | Integration (loaders) | 7 | None |

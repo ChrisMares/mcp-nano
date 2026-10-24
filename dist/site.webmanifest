@@ -1,6 +1,6 @@
 {
-  "name": "NASA MCP",
-  "short_name": "NASA MCP",
+  "name": "MCP Nano",
+  "short_name": "MCP Nano",
   "description": "Local UI for embedding data, searching context, and managing MCP tools.",
   "id": "/",
   "start_url": "/",

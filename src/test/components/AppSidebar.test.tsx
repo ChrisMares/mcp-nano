@@ -31,6 +31,6 @@ describe('AppSidebar', () => {
 
   it('renders logo', () => {
     renderWithProviders(<AppSidebar />, { route: '/' })
-    expect(screen.getByLabelText('NASA MCP')).toBeInTheDocument()
+    expect(screen.getByRole('img', { name: /mcp nano/i })).toBeInTheDocument()
   })
 })

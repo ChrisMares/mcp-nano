@@ -64,7 +64,7 @@ export function useJobTracking() {
     });
   }, []);
 
-  const handleTerminal = useCallback((e: JobProgressEvent, status: "COMPLETED" | "FAILED") => {
+  const handleTerminal = useCallback((e: JobProgressEvent, status: "COMPLETED" | "FAILED" | "CANCELLED") => {
     const prev = trackedJobsRef.current.get(e.job_id);
     trackedJobsRef.current.delete(e.job_id);
     setActiveJobs((prevJobs) => prevJobs.filter((j) => j.job_id !== e.job_id));
@@ -96,6 +96,7 @@ export function useJobTracking() {
     },
     onFinished: (e) => handleTerminal(e, "COMPLETED"),
     onFailed: (e) => handleTerminal(e, "FAILED"),
+    onCancelled: (e) => handleTerminal(e, "CANCELLED"),
   });
 
   /** Register jobs returned by an upload command (already PENDING server-side). */

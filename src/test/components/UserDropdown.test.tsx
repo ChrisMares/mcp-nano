@@ -6,31 +6,44 @@ import UserDropdown from '@/components/header/UserDropdown'
 import { renderWithProviders } from '../helpers'
 
 describe('UserDropdown', () => {
-  it('renders Local label', () => {
+  it('starts with the account menu closed', () => {
     renderWithProviders(<UserDropdown />)
+    expect(screen.queryByText('Local')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Account menu' })).toHaveAttribute(
+      'aria-expanded',
+      'false',
+    )
+  })
+
+  it('opens the account menu on click', async () => {
+    const user = userEvent.setup()
+    renderWithProviders(<UserDropdown />)
+
+    await user.click(screen.getByRole('button', { name: 'Account menu' }))
+
     expect(screen.getByText('Local')).toBeInTheDocument()
-  })
-
-  it('opens dropdown on click', async () => {
-    const user = userEvent.setup()
-    renderWithProviders(<UserDropdown />)
-    await user.click(screen.getByText('Local'))
-    expect(screen.getByText('Account')).toBeInTheDocument()
-  })
-
-  it('shows Account as a disabled placeholder without a link', async () => {
-    const user = userEvent.setup()
-    renderWithProviders(<UserDropdown />)
-    await user.click(screen.getByText('Local'))
-    const item = screen.getByText('Account')
-    expect(item.closest('a')).toBeNull()
-    expect(item.closest('[aria-disabled="true"]')).not.toBeNull()
+    expect(screen.getByRole('button', { name: 'Account menu' })).toHaveAttribute(
+      'aria-expanded',
+      'true',
+    )
   })
 
   it('links to settings', async () => {
     const user = userEvent.setup()
     renderWithProviders(<UserDropdown />)
-    await user.click(screen.getByText('Local'))
+
+    await user.click(screen.getByRole('button', { name: 'Account menu' }))
+
     expect(screen.getByRole('link', { name: 'Settings' })).toHaveAttribute('href', '/settings')
+  })
+
+  it('closes the menu after choosing settings', async () => {
+    const user = userEvent.setup()
+    renderWithProviders(<UserDropdown />)
+
+    await user.click(screen.getByRole('button', { name: 'Account menu' }))
+    await user.click(screen.getByRole('link', { name: 'Settings' }))
+
+    expect(screen.queryByText('Local')).not.toBeInTheDocument()
   })
 })

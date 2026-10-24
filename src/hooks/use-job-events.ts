@@ -18,6 +18,7 @@ export interface JobEventHandlers {
   onProgress?: (e: JobProgressEvent) => void;
   onFinished?: (e: JobProgressEvent) => void;
   onFailed?: (e: JobProgressEvent) => void;
+  onCancelled?: (e: JobProgressEvent) => void;
 }
 
 /**
@@ -44,12 +45,15 @@ export function useJobEvents(handlers: JobEventHandlers): void {
         handlersRef.current.onFinished?.(ev.payload);
       const onFailed = (ev: Event<JobProgressEvent>) =>
         handlersRef.current.onFailed?.(ev.payload);
+      const onCancelled = (ev: Event<JobProgressEvent>) =>
+        handlersRef.current.onCancelled?.(ev.payload);
 
       const subs = await Promise.all([
         listen<JobProgressEvent>("job_queued", onQueued),
         listen<JobProgressEvent>("job_progress", onProgress),
         listen<JobProgressEvent>("job_finished", onFinished),
         listen<JobProgressEvent>("job_failed", onFailed),
+        listen<JobProgressEvent>("job_cancelled", onCancelled),
       ]);
       if (cancelled) {
         subs.forEach((u) => u());

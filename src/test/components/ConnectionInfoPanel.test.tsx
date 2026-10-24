@@ -13,6 +13,7 @@ const mockInfo: ConnectionInfo = {
     claude_desktop: { url: 'http://localhost:18653/mcp' },
     opencode: { url: 'http://localhost:18653/mcp' },
     vscode: { url: 'http://localhost:18653/mcp' },
+    codex: '[mcp_servers.test_mcp]\nurl = "http://localhost:18653/mcp?server_id=test_mcp"\n',
   },
 }
 
@@ -27,18 +28,24 @@ describe('ConnectionInfoPanel', () => {
     expect(screen.getByText('Claude Desktop Config')).toBeInTheDocument()
     expect(screen.getByText('OpenCode Config')).toBeInTheDocument()
     expect(screen.getByText('VS Code Config')).toBeInTheDocument()
+    expect(screen.getByText('OpenAI Codex Config (TOML)')).toBeInTheDocument()
   })
 
   it('renders copy buttons', () => {
     render(<ConnectionInfoPanel info={mockInfo} />)
     const copyButtons = screen.getAllByText('Copy')
-    // 1 for URL + 3 for config snippets
-    expect(copyButtons.length).toBe(4)
+    // 1 for URL + 4 for config snippets
+    expect(copyButtons.length).toBe(5)
   })
 
   it('renders formatted JSON for config snippets', () => {
     render(<ConnectionInfoPanel info={mockInfo} />)
     const pre = document.querySelectorAll('pre')
-    expect(pre.length).toBe(3)
+    expect(pre.length).toBe(4)
+  })
+
+  it('renders the codex snippet as raw TOML', () => {
+    render(<ConnectionInfoPanel info={mockInfo} />)
+    expect(screen.getByText(/\[mcp_servers\.test_mcp\]/)).toBeInTheDocument()
   })
 })

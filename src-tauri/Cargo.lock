@@ -3272,7 +3272,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-nano"
-version = "0.1.8"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum 0.8.9",
@@ -3290,6 +3290,7 @@ dependencies = [
  "portpicker",
  "qdrant-client",
  "quick-xml 0.41.0",
+ "rayon",
  "regex",
  "reqwest 0.13.4",
  "rmcp",

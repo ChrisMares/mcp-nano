@@ -134,6 +134,11 @@ export async function getJobStatus(jobId: string): Promise<JobStatus> {
   return invoke("get_job_status", { jobId });
 }
 
+/** Cancel a queued or running job and delete everything it produced. */
+export async function cancelJob(jobId: string): Promise<void> {
+  return invoke("cancel_job", { jobId });
+}
+
 export async function getFiles(): Promise<UserFiles> {
   return invoke("get_files");
 }
@@ -242,6 +247,10 @@ export async function crawlWebsite(
 
 export async function cancelWebsiteCrawl(): Promise<void> {
   return invoke("cancel_website_crawl");
+}
+
+export async function clearWebsiteCache(): Promise<void> {
+  return invoke("clear_website_cache");
 }
 
 export async function embedWebsite(

@@ -28,6 +28,8 @@ export interface EmbeddingOptions {
   collection: string;
   repo_name?: string;
   group?: string;
+  filter_test_files?: boolean;
+  code_files_only?: boolean;
   metadata: Record<string, unknown>;
 }
 

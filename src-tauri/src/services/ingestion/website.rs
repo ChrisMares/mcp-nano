@@ -14,15 +14,16 @@
 //! - `MERGE_MIN_TOKENS = 512`
 //! - `MAX_PAGES = 1000` (env-configurable via `WEBSITE_CRAWL_MAX_PAGES`)
 
-use std::collections::HashSet;
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::Context;
 use futures_util::stream::StreamExt;
+use rayon::prelude::*;
 use serde::Serialize;
 use serde_json::{Map, Value};
 use text_splitter::TextSplitter;
@@ -31,6 +32,7 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use super::types::DocumentChunk;
+use crate::worker::ProgressCallback;
 
 /// Live crawl progress pushed to the UI while `crawl_website` runs.
 #[derive(Debug, Clone, Serialize)]
@@ -47,9 +49,9 @@ pub struct CrawlProgressEvent {
 pub type CrawlProgressCallback = Arc<dyn Fn(CrawlProgressEvent) + Send + Sync>;
 
 const REQUEST_TIMEOUT_SECS: u64 = 3;
-const CRAWL_DELAY_MS: u64 = 100;
-/// Concurrent page fetches during a crawl.
-const CRAWL_CONCURRENCY: usize = 10;
+const SITEMAP_DISCOVERY_CONCURRENCY: usize = 8;
+const MAX_CACHED_PAGE_BYTES: usize = 4 * 1024 * 1024;
+const HTML_CACHE_TTL_SECS: u64 = 300;
 const MERGE_MIN_TOKENS: usize = 512;
 const MIN_ANCHOR_LEN: usize = 4;
 
@@ -152,6 +154,45 @@ fn max_sitemap_urls() -> usize {
         .unwrap_or(250_000)
 }
 
+fn crawl_concurrency(render_javascript: bool) -> usize {
+    std::env::var("WEBSITE_CRAWL_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(if render_javascript { 4 } else { 16 })
+}
+
+fn crawl_delay_ms() -> u64 {
+    std::env::var("WEBSITE_CRAWL_DELAY_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
+fn render_virtual_time_budget_ms() -> u64 {
+    std::env::var("WEBSITE_RENDER_VIRTUAL_TIME_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(3000)
+}
+
+fn render_timeout_ms() -> u64 {
+    std::env::var("WEBSITE_RENDER_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(15000)
+}
+
+fn html_cache_max_bytes() -> usize {
+    std::env::var("WEBSITE_HTML_CACHE_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(128)
+        .saturating_mul(1024 * 1024)
+}
+
 /// Concurrent page scrapes during embedding. Browser renders dominate
 /// CPU/memory, so they default lower than plain HTTP fetches.
 /// `WEBSITE_SCRAPE_CONCURRENCY` overrides.
@@ -161,6 +202,130 @@ fn scrape_concurrency(render_javascript: bool) -> usize {
         .and_then(|v| v.parse().ok())
         .filter(|v| *v > 0)
         .unwrap_or(if render_javascript { 4 } else { 8 })
+}
+
+#[derive(Clone)]
+struct CachedPage {
+    content_type: String,
+    response_url: Url,
+    body: String,
+}
+
+#[derive(Default)]
+struct HtmlCache {
+    entries: HashMap<String, CachedPage>,
+    order: VecDeque<String>,
+    total_bytes: usize,
+    generation: u64,
+}
+
+static HTML_CACHE: OnceLock<Mutex<HtmlCache>> = OnceLock::new();
+
+fn html_cache() -> &'static Mutex<HtmlCache> {
+    HTML_CACHE.get_or_init(|| Mutex::new(HtmlCache::default()))
+}
+
+fn cache_key(url_str: &str) -> Option<String> {
+    let normalized = normalize_website_url(url_str).ok()?;
+    let parsed = Url::parse(&normalized).ok()?;
+    Some(canonical_url(&parsed))
+}
+
+pub fn clear_html_cache() {
+    if let Ok(mut cache) = html_cache().lock() {
+        cache.entries.clear();
+        cache.entries.shrink_to_fit();
+        cache.order.clear();
+        cache.order.shrink_to_fit();
+        cache.total_bytes = 0;
+        cache.generation = cache.generation.wrapping_add(1);
+    }
+}
+
+fn current_cache_generation() -> u64 {
+    html_cache().lock().map(|c| c.generation).unwrap_or(0)
+}
+
+fn schedule_html_cache_ttl(expected_generation: u64) {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async move {
+            tokio::time::sleep(Duration::from_secs(HTML_CACHE_TTL_SECS)).await;
+            if let Ok(mut cache) = html_cache().lock() {
+                if cache.generation == expected_generation && !cache.entries.is_empty() {
+                    cache.entries.clear();
+                    cache.entries.shrink_to_fit();
+                    cache.order.clear();
+                    cache.order.shrink_to_fit();
+                    cache.total_bytes = 0;
+                }
+            }
+        });
+    }
+}
+
+fn store_cached_page(url_str: &str, content_type: &str, response_url: &Url, body: &str) {
+    let max_bytes = html_cache_max_bytes();
+    if max_bytes == 0 || body.is_empty() || body.len() > MAX_CACHED_PAGE_BYTES {
+        return;
+    }
+    let Some(key) = cache_key(url_str) else {
+        return;
+    };
+    let Ok(mut cache) = html_cache().lock() else {
+        return;
+    };
+    let entry_bytes = body.len() + key.len();
+    if entry_bytes > max_bytes {
+        return;
+    }
+    if let Some(old) = cache.entries.remove(&key) {
+        cache.total_bytes = cache.total_bytes.saturating_sub(old.body.len() + key.len());
+    }
+    while cache.total_bytes + entry_bytes > max_bytes {
+        let Some(oldest_key) = cache.order.pop_front() else {
+            break;
+        };
+        if let Some(removed) = cache.entries.remove(&oldest_key) {
+            cache.total_bytes = cache
+                .total_bytes
+                .saturating_sub(removed.body.len() + oldest_key.len());
+        }
+    }
+    cache.order.push_back(key.clone());
+    cache.total_bytes += entry_bytes;
+    cache.entries.insert(
+        key,
+        CachedPage {
+            content_type: content_type.to_string(),
+            response_url: response_url.clone(),
+            body: body.to_string(),
+        },
+    );
+}
+
+fn peek_cached_page(url_str: &str) -> Option<(String, Url, String)> {
+    let key = cache_key(url_str)?;
+    let cache = html_cache().lock().ok()?;
+    let page = cache.entries.get(&key)?;
+    Some((
+        page.content_type.clone(),
+        page.response_url.clone(),
+        page.body.clone(),
+    ))
+}
+
+fn take_cached_page(url_str: &str) -> Option<(String, Url, String)> {
+    let key = cache_key(url_str)?;
+    let mut cache = html_cache().lock().ok()?;
+    let page = cache.entries.remove(&key)?;
+    cache.total_bytes = cache.total_bytes.saturating_sub(page.body.len() + key.len());
+    if cache.entries.is_empty() {
+        cache.entries.shrink_to_fit();
+        cache.order.clear();
+        cache.order.shrink_to_fit();
+        cache.total_bytes = 0;
+    }
+    Some((page.content_type, page.response_url, page.body))
 }
 
 /// Default headers applied to every outbound request.
@@ -206,6 +371,27 @@ fn browser_path() -> Option<PathBuf> {
             .into_iter()
             .find(|path| path.is_file())
         })
+}
+
+fn resolve_browser(render_javascript: bool) -> Option<PathBuf> {
+    if !render_javascript {
+        return None;
+    }
+    let found = browser_path();
+    if found.is_none() {
+        tracing::warn!(
+            "JavaScript rendering requested but no Chromium-family browser was found; using HTTP HTML"
+        );
+    }
+    found
+}
+
+fn resolve_document_base(requested_url: &str, response_url: Url) -> Url {
+    if requested_url.ends_with('/') && !response_url.path().ends_with('/') {
+        Url::parse(requested_url).unwrap_or(response_url)
+    } else {
+        response_url
+    }
 }
 
 /// Resolve `name` against each directory of `path_value` (a `PATH` string).
@@ -258,8 +444,10 @@ fn windows_browser_candidates(
 
 async fn render_page(url: &str, browser: &PathBuf) -> anyhow::Result<String> {
     let profile = tempfile::tempdir().context("creating browser profile")?;
+    let timeout_ms = render_timeout_ms();
+    let budget_ms = render_virtual_time_budget_ms();
     let output = tokio::time::timeout(
-        Duration::from_secs(30),
+        Duration::from_millis(timeout_ms),
         tokio::process::Command::new(browser)
             .args([
                 "--headless=new",
@@ -267,16 +455,22 @@ async fn render_page(url: &str, browser: &PathBuf) -> anyhow::Result<String> {
                 "--disable-dev-shm-usage",
                 "--no-sandbox",
                 "--no-first-run",
+                "--disable-extensions",
+                "--disable-background-networking",
+                "--disable-sync",
+                "--disable-default-apps",
+                "--mute-audio",
+                "--blink-settings=imagesEnabled=false",
                 "--dump-dom",
-                "--virtual-time-budget=10000",
             ])
+            .arg(format!("--virtual-time-budget={budget_ms}"))
             .arg(format!("--user-data-dir={}", profile.path().display()))
             .arg(url)
             .kill_on_drop(true)
             .output(),
     )
     .await
-    .map_err(|_| anyhow::anyhow!("browser timed out after 30 seconds"))??;
+    .map_err(|_| anyhow::anyhow!("browser timed out after {timeout_ms}ms"))??;
     if !output.status.success() {
         anyhow::bail!("browser exited with status {}", output.status);
     }
@@ -515,64 +709,74 @@ async fn fetch_body(
 
 /// Fetch a page over HTTP, optionally rendering it with a headless browser.
 ///
-/// With `browser` set, the rendered DOM replaces the HTTP body (keeping the
-/// HTTP body when rendering fails), and an unsuccessful HTTP fetch falls
-/// back to rendering alone.
+/// With `browser` set, renders directly with the headless browser first and
+/// falls back to plain HTTP if rendering fails.
 async fn fetch_page(
     client: &reqwest::Client,
     url_str: &str,
     browser: Option<&PathBuf>,
     cancellation: Option<&CancellationToken>,
 ) -> Option<(String, Url, String)> {
-    let response = cancel_aware(client.get(url_str).send(), cancellation).await;
-    let (content_type, response_url, body) = match response {
-        Some(Ok(resp)) if resp.status().is_success() => {
-            let content_type = resp
-                .headers()
-                .get(reqwest::header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or_default()
-                .to_string();
-            let response_url = resp.url().clone();
-            let body = response_text(resp, cancellation).await?;
-            (content_type, response_url, body)
+    if browser.is_none() {
+        if let Some(cached) = peek_cached_page(url_str) {
+            return Some(cached);
         }
-        _ if browser.is_some() => (
-            "text/html".to_string(),
-            Url::parse(url_str).ok()?,
-            String::new(),
-        ),
-        _ => return None,
-    };
-    let body = match browser {
-        Some(browser) => match cancel_aware(render_page(url_str, browser), cancellation).await {
-            Some(Ok(rendered)) => rendered,
-            Some(Err(error)) => {
-                tracing::debug!("JavaScript render failed for {url_str}: {error:#}");
-                body
+    }
+    if let Some(browser) = browser {
+        match cancel_aware(render_page(url_str, browser), cancellation).await? {
+            Ok(rendered) if !rendered.trim().is_empty() => {
+                let parsed = Url::parse(url_str).ok()?;
+                return Some(("text/html".to_string(), parsed, rendered));
             }
-            None => return None,
-        },
-        None => body,
+            Ok(_) => {}
+            Err(error) => {
+                tracing::debug!("JavaScript render failed for {url_str}: {error:#}");
+            }
+        }
+    }
+    let response = cancel_aware(client.get(url_str).send(), cancellation).await?;
+    let Ok(resp) = response else {
+        return None;
     };
+    if !resp.status().is_success() {
+        return None;
+    }
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let response_url = resp.url().clone();
+    let body = response_text(resp, cancellation).await?;
     Some((content_type, response_url, body))
 }
 
 async fn discover_sitemap_urls(
     client: &reqwest::Client,
     start: &Url,
+    render_javascript: bool,
     cancellation: Option<CancellationToken>,
+    on_progress: Option<&CrawlProgressCallback>,
 ) -> Vec<String> {
     let origin = origin_url(start);
     let mut pending: VecDeque<Url> = sitemap_seed_urls(start).into();
 
-    if let Some((body, _)) = fetch_body(
-        client,
-        origin.join("robots.txt").unwrap_or_else(|_| origin.clone()),
-        cancellation.as_ref(),
-    )
-    .await
-    {
+    let robots_url = origin.join("robots.txt").unwrap_or_else(|_| origin.clone());
+    let start_str = start.to_string();
+    if let Some(cb) = on_progress {
+        cb(CrawlProgressEvent {
+            url: start_str.clone(),
+            phase: "fetching".into(),
+            found_count: 1,
+        });
+    }
+    let (robots_res, start_res) = tokio::join!(
+        fetch_body(client, robots_url, cancellation.as_ref()),
+        fetch_page(client, &start_str, None, cancellation.as_ref()),
+    );
+
+    if let Some((body, _)) = robots_res {
         for sitemap in sitemap_urls_from_robots(&body, &origin) {
             pending.push_back(sitemap);
         }
@@ -580,56 +784,101 @@ async fn discover_sitemap_urls(
 
     // Some sites advertise a sitemap only through the HTML head. This is a
     // discovery hint, not a replacement for robots.txt or conventional paths.
-    if let Some((body, base)) = fetch_body(client, start.clone(), cancellation.as_ref()).await {
-        if let Ok(html) = String::from_utf8(body) {
-            for sitemap in sitemap_urls_from_html(&html, &base) {
-                pending.push_back(sitemap);
-            }
+    if let Some((content_type, response_url, html)) = start_res {
+        for sitemap in sitemap_urls_from_html(&html, &response_url) {
+            pending.push_back(sitemap);
+        }
+        if !render_javascript && is_html_response(&content_type, &html) {
+            let document_base = resolve_document_base(&start_str, response_url);
+            let result_key = canonical_url(&document_base);
+            store_cached_page(&result_key, &content_type, &document_base, &html);
         }
     }
 
     let mut seen_sitemaps = HashSet::new();
     let mut urls = Vec::new();
+    let sitemaps_cap = max_sitemaps();
+    let urls_cap = max_sitemap_urls();
 
-    while let Some(sitemap) = pending.pop_front() {
+    while !pending.is_empty() {
         if cancellation
             .as_ref()
             .is_some_and(CancellationToken::is_cancelled)
         {
             break;
         }
-        let sitemap_key = canonical_url(&sitemap);
-        if !seen_sitemaps.insert(sitemap_key) || seen_sitemaps.len() > max_sitemaps() {
-            continue;
+        let mut batch = Vec::with_capacity(SITEMAP_DISCOVERY_CONCURRENCY);
+        while batch.len() < SITEMAP_DISCOVERY_CONCURRENCY {
+            let Some(sitemap) = pending.pop_front() else {
+                break;
+            };
+            let sitemap_key = canonical_url(&sitemap);
+            if seen_sitemaps.len() >= sitemaps_cap || !seen_sitemaps.insert(sitemap_key) {
+                continue;
+            }
+            if let Some(cb) = on_progress {
+                cb(CrawlProgressEvent {
+                    url: sitemap.to_string(),
+                    phase: "fetching".into(),
+                    found_count: urls.len().max(1),
+                });
+            }
+            batch.push(sitemap);
         }
-        let Some((body, response_url)) =
-            fetch_sitemap_body(client, sitemap, cancellation.as_ref()).await
-        else {
-            continue;
-        };
-        match parse_sitemap(&body) {
-            Some((is_index, locations)) => {
-                for location in locations {
-                    let Some(url) = normalize_url(&location, &response_url)
-                        .and_then(|value| Url::parse(&value).ok())
-                    else {
-                        continue;
-                    };
-                    if is_index {
-                        pending.push_back(url);
-                    } else if urls.len() < max_sitemap_urls() {
-                        urls.push(canonical_url(&url));
+        if batch.is_empty() {
+            break;
+        }
+
+        let fetched: Vec<Option<(Vec<u8>, Url)>> = futures_util::stream::iter(batch)
+            .map(|sitemap| fetch_sitemap_body(client, sitemap, cancellation.as_ref()))
+            .buffered(SITEMAP_DISCOVERY_CONCURRENCY)
+            .collect()
+            .await;
+
+        for item in fetched.into_iter().flatten() {
+            let (body, response_url) = item;
+            match parse_sitemap(&body) {
+                Some((is_index, locations)) => {
+                    for location in locations {
+                        let Some(url) = normalize_url(&location, &response_url)
+                            .and_then(|value| Url::parse(&value).ok())
+                        else {
+                            continue;
+                        };
+                        if is_index {
+                            pending.push_back(url);
+                        } else if urls.len() < urls_cap {
+                            let canonical = canonical_url(&url);
+                            urls.push(canonical.clone());
+                            if let Some(cb) = on_progress {
+                                cb(CrawlProgressEvent {
+                                    url: canonical,
+                                    phase: "found".into(),
+                                    found_count: urls.len(),
+                                });
+                            }
+                        }
+                    }
+                }
+                None => {
+                    for url in plain_text_sitemap_urls(&body, &response_url) {
+                        if urls.len() >= urls_cap {
+                            break;
+                        }
+                        urls.push(url.clone());
+                        if let Some(cb) = on_progress {
+                            cb(CrawlProgressEvent {
+                                url,
+                                phase: "found".into(),
+                                found_count: urls.len(),
+                            });
+                        }
                     }
                 }
             }
-            None => {
-                for url in plain_text_sitemap_urls(&body, &response_url) {
-                    if urls.len() >= max_sitemap_urls() {
-                        break;
-                    }
-                    urls.push(url);
-                }
-            }
+        }
+        if urls.len() >= urls_cap {
+            break;
         }
     }
 
@@ -779,6 +1028,8 @@ struct CrawlRun {
     depth: usize,
     same_domain_only: bool,
     max_pages: usize,
+    bfs_in_flight: AtomicUsize,
+    notify: tokio::sync::Notify,
     visited: Arc<tokio::sync::Mutex<HashSet<String>>>,
     seen: Arc<tokio::sync::Mutex<HashSet<String>>>,
     results: Arc<tokio::sync::Mutex<Vec<String>>>,
@@ -798,19 +1049,16 @@ pub async fn crawl_website_with_options_and_cancellation(
     let start = Url::parse(&normalized_start)?;
     let start_key = canonical_url(&start);
 
-    let browser = if render_javascript {
-        browser_path()
-    } else {
-        None
-    };
-    if render_javascript && browser.is_none() {
-        tracing::warn!(
-            "JavaScript rendering requested but no Chromium-family browser was found; using HTTP HTML"
-        );
-    }
-
+    let browser = resolve_browser(render_javascript);
     let client = http_client()?;
-    let sitemap_urls = discover_sitemap_urls(&client, &start, cancellation.clone()).await;
+    let sitemap_urls = discover_sitemap_urls(
+        &client,
+        &start,
+        render_javascript,
+        cancellation.clone(),
+        on_progress.as_ref(),
+    )
+    .await;
 
     // The queue stores the fetch URL (directory paths keep their trailing
     // slash, which affects relative link resolution) + depth.
@@ -823,6 +1071,8 @@ pub async fn crawl_website_with_options_and_cancellation(
         depth,
         same_domain_only,
         max_pages: max_pages(),
+        bfs_in_flight: AtomicUsize::new(0),
+        notify: tokio::sync::Notify::new(),
         visited: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
         seen: Arc::new(tokio::sync::Mutex::new(HashSet::from([start_key.clone()]))),
         results: Arc::new(tokio::sync::Mutex::new(vec![start_key])),
@@ -834,7 +1084,9 @@ pub async fn crawl_website_with_options_and_cancellation(
     });
     enqueue_sitemap_urls(&run, sitemap_urls).await;
 
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(CRAWL_CONCURRENCY));
+    let concurrency = crawl_concurrency(render_javascript);
+    let delay_ms = crawl_delay_ms();
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
     let mut handles = Vec::new();
 
     loop {
@@ -845,22 +1097,27 @@ pub async fn crawl_website_with_options_and_cancellation(
         {
             break;
         }
-        let item = run.queue.lock().await.pop_front();
-        let item = if item.is_some() {
-            item
-        } else if semaphore.available_permits() == CRAWL_CONCURRENCY {
-            run.sitemap_queue.lock().await.pop_front()
-        } else {
-            None
+        let notified = run.notify.notified();
+        let (item, from_bfs) = {
+            let mut q = run.queue.lock().await;
+            if let Some(item) = q.pop_front() {
+                (Some(item), true)
+            } else if run.bfs_in_flight.load(Ordering::Acquire) == 0 {
+                drop(q);
+                (run.sitemap_queue.lock().await.pop_front(), false)
+            } else {
+                (None, false)
+            }
         };
         let Some((url_str, cur_depth)) = item else {
             // Nothing queued; done when no fetch is in flight either.
-            if semaphore.available_permits() == CRAWL_CONCURRENCY
+            if semaphore.available_permits() == concurrency
+                && run.queue.lock().await.is_empty()
                 && run.sitemap_queue.lock().await.is_empty()
             {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = tokio::time::timeout(Duration::from_millis(25), notified).await;
             continue;
         };
 
@@ -878,9 +1135,19 @@ pub async fn crawl_website_with_options_and_cancellation(
             visited.insert(visit_key);
         }
 
-        tokio::time::sleep(Duration::from_millis(CRAWL_DELAY_MS)).await;
+        if delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        }
 
-        let permit = semaphore.clone().acquire_owned().await?;
+        if from_bfs {
+            run.bfs_in_flight.fetch_add(1, Ordering::AcqRel);
+        }
+        let Ok(permit) = semaphore.clone().acquire_owned().await else {
+            if from_bfs {
+                run.bfs_in_flight.fetch_sub(1, Ordering::AcqRel);
+            }
+            break;
+        };
         if let Some(cb) = run.on_progress.as_ref() {
             cb(CrawlProgressEvent {
                 url: url_str.clone(),
@@ -892,7 +1159,11 @@ pub async fn crawl_website_with_options_and_cancellation(
         let task_run = run.clone();
         handles.push(tokio::spawn(async move {
             let _permit = permit;
-            crawl_page(task_run, url_str, cur_depth).await;
+            crawl_page(task_run.clone(), url_str, cur_depth).await;
+            if from_bfs {
+                task_run.bfs_in_flight.fetch_sub(1, Ordering::AcqRel);
+            }
+            task_run.notify.notify_waiters();
         }));
     }
 
@@ -904,8 +1175,10 @@ pub async fn crawl_website_with_options_and_cancellation(
         .as_ref()
         .is_some_and(CancellationToken::is_cancelled)
     {
+        clear_html_cache();
         anyhow::bail!("website crawl cancelled");
     }
+    schedule_html_cache_ttl(current_cache_generation());
     let urls = run.results.lock().await.clone();
     if let Some(cb) = run.on_progress.as_ref() {
         cb(CrawlProgressEvent {
@@ -967,18 +1240,12 @@ async fn crawl_page(run: Arc<CrawlRun>, url_str: String, cur_depth: usize) {
     else {
         return;
     };
-    // Use the final URL after redirects, unless the HTTP client has removed
-    // a slash from the directory URL we requested. That slash changes how
-    // relative links such as `../learn/` are resolved.
-    let document_base = if url_str.ends_with('/') && !response_url.path().ends_with('/') {
-        Url::parse(&url_str).unwrap_or(response_url)
-    } else {
-        response_url
-    };
+    let document_base = resolve_document_base(&url_str, response_url);
     let result_key = canonical_url(&document_base);
     if !is_html_response(&content_type, &body) {
         return;
     }
+    store_cached_page(&result_key, &content_type, &document_base, &body);
 
     let found_count = {
         let mut results = run.results.lock().await;
@@ -1001,6 +1268,7 @@ async fn crawl_page(run: Arc<CrawlRun>, url_str: String, cur_depth: usize) {
     let found = extract_page_links(&body, &document_base, run.same_domain_only, &run.start);
     let mut seen = run.seen.lock().await;
     let mut queue = run.queue.lock().await;
+    let mut enqueued = false;
     for url in found {
         let Ok(parsed) = Url::parse(&url) else {
             continue;
@@ -1008,8 +1276,25 @@ async fn crawl_page(run: Arc<CrawlRun>, url_str: String, cur_depth: usize) {
         let key = canonical_url(&parsed);
         if seen.insert(key.clone()) {
             queue.push_back((url, cur_depth + 1));
-            run.results.lock().await.push(key);
+            let count = {
+                let mut res = run.results.lock().await;
+                res.push(key.clone());
+                res.len()
+            };
+            if let Some(cb) = run.on_progress.as_ref() {
+                cb(CrawlProgressEvent {
+                    url: key,
+                    phase: "found".into(),
+                    found_count: count,
+                });
+            }
+            enqueued = true;
         }
+    }
+    drop(queue);
+    drop(seen);
+    if enqueued {
+        run.notify.notify_waiters();
     }
 }
 
@@ -1088,7 +1373,7 @@ type ScrapedPage = (String, Vec<WebSection>, Vec<Link>);
 
 /// Fetch + sectionize a single page. Direct port of `scrape_website`.
 pub async fn scrape_website(url: &str) -> anyhow::Result<(String, Vec<WebSection>)> {
-    let (title, sections, _) = scrape_page(&http_client()?, None, url).await?;
+    let (title, sections, _) = scrape_page(&http_client()?, None, url, None).await?;
     Ok((title, sections))
 }
 
@@ -1099,31 +1384,39 @@ async fn scrape_page(
     client: &reqwest::Client,
     browser: Option<&PathBuf>,
     url: &str,
+    cancellation: Option<&CancellationToken>,
 ) -> anyhow::Result<ScrapedPage> {
     let url = normalize_website_url(url)?;
-    let response = client.get(&url).send().await;
-    let (content_type, response_url, mut body) = match response {
-        Ok(resp) if resp.status().is_success() => {
-            let content_type = resp
-                .headers()
-                .get(reqwest::header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or_default()
-                .to_string();
-            let response_url = resp.url().clone();
-            let body = resp
-                .text()
-                .await
-                .map_err(|e| anyhow::anyhow!("reading body: {e}"))?;
-            (content_type, response_url, body)
+    let (content_type, response_url, body) = if let Some(cached) = take_cached_page(&url) {
+        cached
+    } else if let Some(browser) = browser {
+        let rendered = cancel_aware(render_page(&url, browser), cancellation)
+            .await
+            .ok_or(crate::worker::JobCancelled)??;
+        ("text/html".to_string(), Url::parse(&url)?, rendered)
+    } else {
+        let response = cancel_aware(client.get(&url).send(), cancellation)
+            .await
+            .ok_or(crate::worker::JobCancelled)?;
+        match response {
+            Ok(resp) if resp.status().is_success() => {
+                let content_type = resp
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string();
+                let response_url = resp.url().clone();
+                let body = cancel_aware(resp.text(), cancellation)
+                    .await
+                    .ok_or(crate::worker::JobCancelled)?
+                    .map_err(|e| anyhow::anyhow!("reading body: {e}"))?;
+                (content_type, response_url, body)
+            }
+            Ok(resp) => anyhow::bail!("failed to load page: HTTP {}", resp.status()),
+            Err(error) => return Err(anyhow::anyhow!("fetching {url}: {error}")),
         }
-        _ if browser.is_some() => ("text/html".to_string(), Url::parse(&url)?, String::new()),
-        Ok(resp) => anyhow::bail!("failed to load page: HTTP {}", resp.status()),
-        Err(error) => return Err(anyhow::anyhow!("fetching {url}: {error}")),
     };
-    if let Some(browser) = browser {
-        body = render_page(&url, browser).await?;
-    }
     if !is_html_response(&content_type, &body) {
         anyhow::bail!("page is not HTML (Content-Type: {content_type})");
     }
@@ -1395,6 +1688,21 @@ pub async fn process_website_with_splitter(
     splitter: Option<&TextSplitter<Tokenizer>>,
     render_javascript: bool,
 ) -> anyhow::Result<Vec<DocumentChunk>> {
+    process_website_with_progress(urls, metadata, splitter, render_javascript, None, None).await
+}
+
+pub async fn process_website_with_progress(
+    urls: &[String],
+    metadata: &Map<String, Value>,
+    splitter: Option<&TextSplitter<Tokenizer>>,
+    render_javascript: bool,
+    progress: Option<&ProgressCallback>,
+    cancellation: Option<&CancellationToken>,
+) -> anyhow::Result<Vec<DocumentChunk>> {
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return Err(crate::worker::JobCancelled.into());
+    }
+
     let chunk_size: usize = std::env::var("DOC_CHUNK_SIZE")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -1405,19 +1713,13 @@ pub async fn process_website_with_splitter(
         .unwrap_or(50);
 
     let embedded_at = super::types::now_iso();
-    let mut all_chunks: Vec<DocumentChunk> = Vec::new();
 
     let client = http_client()?;
-    let browser = if render_javascript {
-        browser_path()
-    } else {
-        None
-    };
-    if render_javascript && browser.is_none() {
-        tracing::warn!(
-            "JavaScript rendering requested but no Chromium-family browser was found; using HTTP HTML"
-        );
-    }
+    let browser = resolve_browser(render_javascript);
+
+    let total_urls = urls.len().max(1);
+    let completed = AtomicUsize::new(0);
+    let max_pct = std::sync::atomic::AtomicI32::new(5);
 
     // Scrape pages concurrently: a JavaScript render takes seconds per page,
     // so a sequential loop dominates the total embed time on large sites.
@@ -1426,196 +1728,214 @@ pub async fn process_website_with_splitter(
         .map(|url| {
             let client = client.clone();
             let browser = browser.clone();
+            let completed = &completed;
+            let max_pct = &max_pct;
             async move {
-                match scrape_page(&client, browser.as_ref(), &url).await {
+                if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                    return None;
+                }
+                let result = match scrape_page(&client, browser.as_ref(), &url, cancellation).await
+                {
                     Ok(page) => Some(page),
                     Err(e) => {
-                        tracing::warn!("failed to scrape {url}: {e:#}");
+                        if !cancellation.is_some_and(CancellationToken::is_cancelled) {
+                            tracing::warn!("failed to scrape {url}: {e:#}");
+                        }
                         None
                     }
+                };
+                let done = completed.fetch_add(1, Ordering::AcqRel) + 1;
+                if let Some(progress) = progress {
+                    if !cancellation.is_some_and(CancellationToken::is_cancelled) {
+                        let raw_pct = 5 + ((done as i32) * 25 / total_urls as i32);
+                        let high = max_pct.fetch_max(raw_pct, Ordering::SeqCst);
+                        progress(
+                            raw_pct.max(high),
+                            Some(format!("Scraping {} ({}/{})", url, done, urls.len())),
+                        )
+                        .await;
+                    }
                 }
+                result
             }
         })
         .buffered(scrape_concurrency(render_javascript))
         .collect()
         .await;
 
-    for (url, page) in urls.iter().zip(pages) {
-        let Some((page_title, sections, navigation_links)) = page else {
-            continue;
-        };
-        if sections.is_empty() {
-            continue;
-        }
-        let page_id = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, url.as_bytes()).to_string();
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return Err(crate::worker::JobCancelled.into());
+    }
 
-        // Build a link_map: anchor_text -> href (first occurrence wins).
-        let mut link_map: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
-        for section in &sections {
-            for link in &section.links {
+    let per_page_chunks: Vec<Vec<DocumentChunk>> = urls
+        .par_iter()
+        .zip(pages.into_par_iter())
+        .filter_map(|(url, page)| {
+            let (page_title, sections, navigation_links) = page?;
+            if sections.is_empty() {
+                return None;
+            }
+            let page_id =
+                uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, url.as_bytes()).to_string();
+
+            let mut link_map: HashMap<String, String> = HashMap::new();
+            for link in sections.iter().flat_map(|s| &s.links).chain(&navigation_links) {
                 link_map
                     .entry(link.anchor_text.clone())
                     .or_insert_with(|| link.href.clone());
             }
-        }
-        for link in &navigation_links {
-            link_map
-                .entry(link.anchor_text.clone())
-                .or_insert_with(|| link.href.clone());
-        }
 
-        let mut base_md: Map<String, Value> = metadata.clone();
-        base_md.insert("url".into(), Value::String(url.clone()));
-        base_md.insert("doc_type".into(), Value::String("website".into()));
-        base_md.insert("embedded_at".into(), Value::String(embedded_at.clone()));
-        base_md.insert("page_id".into(), Value::String(page_id.clone()));
-        base_md.insert("page_title".into(), Value::String(page_title.clone()));
-        base_md.insert(
-            "navigation_links".into(),
-            Value::Array(
-                navigation_links
-                    .iter()
-                    .map(|link| {
-                        serde_json::json!({
-                            "href": link.href,
-                            "anchor_text": link.anchor_text,
+            let mut base_md: Map<String, Value> = metadata.clone();
+            base_md.insert("url".into(), Value::String(url.clone()));
+            base_md.insert("doc_type".into(), Value::String("website".into()));
+            base_md.insert("embedded_at".into(), Value::String(embedded_at.clone()));
+            base_md.insert("page_id".into(), Value::String(page_id));
+            base_md.insert("page_title".into(), Value::String(page_title.clone()));
+            base_md.insert(
+                "navigation_links".into(),
+                Value::Array(
+                    navigation_links
+                        .iter()
+                        .map(|link| {
+                            serde_json::json!({
+                                "href": link.href,
+                                "anchor_text": link.anchor_text,
+                            })
                         })
-                    })
-                    .collect(),
-            ),
-        );
-        base_md.insert(
-            "website_key".into(),
-            Value::String(make_website_key(
-                url,
-                base_md
-                    .get("group")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("default"),
-                &embedded_at,
-            )),
-        );
+                        .collect(),
+                ),
+            );
+            base_md.insert(
+                "website_key".into(),
+                Value::String(make_website_key(
+                    url,
+                    base_md
+                        .get("group")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("default"),
+                    &embedded_at,
+                )),
+            );
 
-        // Build the full-page text (prose only) and split into chunks.
-        let full_page_text: String = sections
-            .iter()
-            .map(|s| {
-                if s.heading_path.is_empty() {
-                    s.content.clone()
-                } else {
-                    format!("{}\n{}", s.heading_path.join(" > "), s.content)
+            let full_page_text: String = sections
+                .iter()
+                .map(|s| {
+                    if s.heading_path.is_empty() {
+                        s.content.clone()
+                    } else {
+                        format!("{}\n{}", s.heading_path.join(" > "), s.content)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            let prose_docs = splitter
+                .map(|splitter| {
+                    splitter
+                        .chunks(&full_page_text)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_else(|| simple_chunk(&full_page_text, chunk_size, chunk_overlap));
+            let prose_docs = if prose_docs.len() > 1 {
+                merge_small_chunks(prose_docs, MERGE_MIN_TOKENS)
+            } else {
+                prose_docs
+            };
+
+            let created_at = super::types::now_iso();
+            let mut page_chunks: Vec<DocumentChunk> = Vec::new();
+            for (idx, c) in prose_docs.iter().enumerate() {
+                let mut md = base_md.clone();
+                md.insert("heading_path".into(), Value::String(page_title.clone()));
+                md.insert("content_type".into(), Value::String("prose".into()));
+                page_chunks.push(DocumentChunk {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    file_name: url.clone(),
+                    content: c.clone(),
+                    doc_type: "website".to_string(),
+                    chunk_index: idx as i64,
+                    page: None,
+                    metadata: md,
+                    created_at: created_at.clone(),
+                });
+            }
+
+            let mut code_entries: Vec<(String, String, String)> = Vec::new();
+            for section in &sections {
+                let hp = section.heading_path.join(" > ");
+                for cb in &section.code_blocks {
+                    code_entries.push((cb.raw.clone(), cb.language.clone(), hp.clone()));
                 }
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        let prose_docs = splitter
-            .map(|splitter| {
-                splitter
-                    .chunks(&full_page_text)
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_else(|| simple_chunk(&full_page_text, chunk_size, chunk_overlap));
-        let prose_docs = if prose_docs.len() > 1 {
-            merge_small_chunks(prose_docs, MERGE_MIN_TOKENS)
-        } else {
-            prose_docs
-        };
-
-        let mut page_chunks: Vec<DocumentChunk> = Vec::new();
-        for (idx, c) in prose_docs.iter().enumerate() {
-            let mut md = base_md.clone();
-            md.insert("heading_path".into(), Value::String(page_title.clone()));
-            md.insert("content_type".into(), Value::String("prose".into()));
-            page_chunks.push(DocumentChunk {
-                id: uuid::Uuid::new_v4().to_string(),
-                file_name: url.clone(),
-                content: c.clone(),
-                doc_type: "website".to_string(),
-                chunk_index: idx as i64,
-                page: None,
-                metadata: md,
-                created_at: super::types::now_iso(),
-            });
-        }
-
-        let mut code_entries: Vec<(String, String, String)> = Vec::new(); // (raw, lang, heading_path)
-        for section in &sections {
-            let hp = section.heading_path.join(" > ");
-            for cb in &section.code_blocks {
-                code_entries.push((cb.raw.clone(), cb.language.clone(), hp.clone()));
             }
-        }
-        for (cb_idx, (raw, lang, hp)) in code_entries.into_iter().enumerate() {
-            let mut md = base_md.clone();
-            md.insert("heading_path".into(), Value::String(hp));
-            md.insert("content_type".into(), Value::String("code".into()));
-            if !lang.is_empty() {
-                md.insert("language".into(), Value::String(lang));
+            for (cb_idx, (raw, lang, hp)) in code_entries.into_iter().enumerate() {
+                let mut md = base_md.clone();
+                md.insert("heading_path".into(), Value::String(hp));
+                md.insert("content_type".into(), Value::String("code".into()));
+                if !lang.is_empty() {
+                    md.insert("language".into(), Value::String(lang));
+                }
+                page_chunks.push(DocumentChunk {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    file_name: url.clone(),
+                    content: raw,
+                    doc_type: "website".to_string(),
+                    chunk_index: prose_docs.len() as i64 + cb_idx as i64,
+                    page: None,
+                    metadata: md,
+                    created_at: created_at.clone(),
+                });
             }
-            page_chunks.push(DocumentChunk {
-                id: uuid::Uuid::new_v4().to_string(),
-                file_name: url.clone(),
-                content: raw,
-                doc_type: "website".to_string(),
-                chunk_index: prose_docs.len() as i64 + cb_idx as i64,
-                page: None,
-                metadata: md,
-                created_at: super::types::now_iso(),
-            });
-        }
 
-        if page_chunks.is_empty() {
-            continue;
-        }
+            if page_chunks.is_empty() {
+                return None;
+            }
 
-        // Assign chunk_hash + prev/next ids + matched links.
-        let total = page_chunks.len() as i64;
-        let ids: Vec<String> = page_chunks.iter().map(|c| c.id.clone()).collect();
-        use sha2::{Digest, Sha256};
-        for (i, c) in page_chunks.iter_mut().enumerate() {
-            let mut hasher = Sha256::new();
-            hasher.update(c.content.as_bytes());
-            let hash_hex = hasher.finalize();
-            let chunk_hash = hash_hex
-                .iter()
-                .take(8)
-                .map(|b| format!("{:02x}", b))
-                .collect::<String>();
-            c.metadata
-                .insert("chunk_hash".into(), Value::String(chunk_hash));
-            c.metadata
-                .insert("total_chunks".into(), Value::Number(total.into()));
-            c.metadata.insert(
-                "prev_chunk_id".into(),
-                if i > 0 {
-                    Value::String(ids[i - 1].clone())
-                } else {
-                    Value::Null
-                },
-            );
-            c.metadata.insert(
-                "next_chunk_id".into(),
-                if i < ids.len() - 1 {
-                    Value::String(ids[i + 1].clone())
-                } else {
-                    Value::Null
-                },
-            );
-            let matches: Vec<Value> = link_map
-                .iter()
-                .filter(|(anchor, _)| c.content.contains(anchor.as_str()))
-                .map(|(anchor, href)| serde_json::json!({"href": href, "anchor_text": anchor}))
-                .collect();
-            c.metadata.insert("links".into(), Value::Array(matches));
-        }
+            let total = page_chunks.len() as i64;
+            let ids: Vec<String> = page_chunks.iter().map(|c| c.id.clone()).collect();
+            use sha2::{Digest, Sha256};
+            for (i, c) in page_chunks.iter_mut().enumerate() {
+                let mut hasher = Sha256::new();
+                hasher.update(c.content.as_bytes());
+                let hash_hex = hasher.finalize();
+                let chunk_hash = hash_hex
+                    .iter()
+                    .take(8)
+                    .map(|b| format!("{:02x}", b))
+                    .collect::<String>();
+                c.metadata
+                    .insert("chunk_hash".into(), Value::String(chunk_hash));
+                c.metadata
+                    .insert("total_chunks".into(), Value::Number(total.into()));
+                c.metadata.insert(
+                    "prev_chunk_id".into(),
+                    if i > 0 {
+                        Value::String(ids[i - 1].clone())
+                    } else {
+                        Value::Null
+                    },
+                );
+                c.metadata.insert(
+                    "next_chunk_id".into(),
+                    if i < ids.len() - 1 {
+                        Value::String(ids[i + 1].clone())
+                    } else {
+                        Value::Null
+                    },
+                );
+                let matches: Vec<Value> = link_map
+                    .iter()
+                    .filter(|(anchor, _)| c.content.contains(anchor.as_str()))
+                    .map(|(anchor, href)| serde_json::json!({"href": href, "anchor_text": anchor}))
+                    .collect();
+                c.metadata.insert("links".into(), Value::Array(matches));
+            }
 
-        all_chunks.extend(page_chunks);
-    }
+            Some(page_chunks)
+        })
+        .collect();
 
-    Ok(all_chunks)
+    Ok(per_page_chunks.into_iter().flatten().collect())
 }
 
 /// Approximate the Python `TokenTextSplitter` for website prose. Returns

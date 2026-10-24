@@ -36,6 +36,12 @@ const Settings: React.FC = () => {
       </div>
 
       <section className={card} aria-labelledby="model-status-heading">
+        <h2
+          id="model-status-heading"
+          className="text-lg font-semibold text-foreground mb-2"
+        >
+          Model Status
+        </h2>
         {!status ? (
           <p className="mt-4 text-sm text-muted-foreground">
             Loading model status...
