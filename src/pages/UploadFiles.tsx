@@ -36,9 +36,7 @@ const urlToGroupName = (raw: string): string => {
 type CollectionType = "codebase" | "general" | "website" | "";
 
 const getStepLabels = (collection: CollectionType) =>
-  collection === "website"
-    ? ["Embedding Type", "Configure", "Processing"]
-    : ["Embedding Type", "Configure", "Upload Files"];
+  collection === "website" ? ["Embedding Type", "Configure", "Processing"] : ["Embedding Type", "Configure", "Upload Files"];
 
 const UploadFiles: React.FC = () => {
   const [step, setStep] = useState(1);
@@ -99,10 +97,13 @@ const UploadFiles: React.FC = () => {
     };
   }, []);
 
-  const handleUploadSuccess = useCallback((submittedCount: number, jobs: UploadJobEntry[]) => {
-    setLastSubmittedCount(submittedCount);
-    trackUploadedJobs(jobs);
-  }, [trackUploadedJobs]);
+  const handleUploadSuccess = useCallback(
+    (submittedCount: number, jobs: UploadJobEntry[]) => {
+      setLastSubmittedCount(submittedCount);
+      trackUploadedJobs(jobs);
+    },
+    [trackUploadedJobs],
+  );
 
   const handleWebsiteSubmit = useCallback(async () => {
     setWebsiteCrawlError(false);
@@ -113,12 +114,7 @@ const UploadFiles: React.FC = () => {
     setWebsiteCrawling(true);
     const session = ++crawlSessionRef.current;
     try {
-      const res = await crawlWebsite(
-        websiteUrl,
-        websiteDepth,
-        websiteSameDomainOnly,
-        websiteRenderJavascript,
-      );
+      const res = await crawlWebsite(websiteUrl, websiteDepth, websiteSameDomainOnly, websiteRenderJavascript);
       if (crawlSessionRef.current === session) {
         setWebsiteUrls(res.urls ?? []);
         setStep((s) => (s === 2 ? 3 : s));
@@ -149,26 +145,25 @@ const UploadFiles: React.FC = () => {
     setStep(nextStep);
   }, []);
 
-  const handleWebsiteEmbed = useCallback(async (urls: string[]) => {
-    try {
-      const res = await embedWebsite(
-        urls,
-        urlToGroupName(websiteUrl),
-        websiteRenderJavascript,
-      );
-      const jobId = res.job_id;
-      setWebsiteEmbedJobId(jobId);
-      trackQueuedJob({
-        job_id: jobId,
-        status: "PENDING",
-        progress_percentage: 0,
-        file_name: urls[0],
-        created_at: new Date().toISOString(),
-      });
-    } catch (err) {
-      console.error("Failed to start website embedding:", err);
-    }
-  }, [websiteUrl, websiteRenderJavascript, trackQueuedJob]);
+  const handleWebsiteEmbed = useCallback(
+    async (urls: string[]) => {
+      try {
+        const res = await embedWebsite(urls, urlToGroupName(websiteUrl), websiteRenderJavascript);
+        const jobId = res.job_id;
+        setWebsiteEmbedJobId(jobId);
+        trackQueuedJob({
+          job_id: jobId,
+          status: "PENDING",
+          progress_percentage: 0,
+          file_name: urls[0],
+          created_at: new Date().toISOString(),
+        });
+      } catch (err) {
+        console.error("Failed to start website embedding:", err);
+      }
+    },
+    [websiteUrl, websiteRenderJavascript, trackQueuedJob],
+  );
 
   // Fetch repo names when codebase is selected
   useEffect(() => {
@@ -207,7 +202,10 @@ const UploadFiles: React.FC = () => {
 
   // Prevent mixing zip and non-zip
   useEffect(() => {
-    if (files.length === 0) { setMixWarning(""); return; }
+    if (files.length === 0) {
+      setMixWarning("");
+      return;
+    }
     const hasZip = files.some(isZipFile);
     const hasNonZip = files.some((f) => !isZipFile(f));
     if (hasZip && hasNonZip) {
@@ -247,8 +245,14 @@ const UploadFiles: React.FC = () => {
     setCodeUploadMode("");
     setFilterTestFiles(true);
     setCodeFilesOnly(true);
-    if (val !== "codebase") { setRepoName(""); setRepoMode("existing"); }
-    if (val !== "general" && val !== "website") { setGroupName(""); setGroupMode("existing"); }
+    if (val !== "codebase") {
+      setRepoName("");
+      setRepoMode("existing");
+    }
+    if (val !== "general" && val !== "website") {
+      setGroupName("");
+      setGroupMode("existing");
+    }
     if (val !== "website") resetWebsiteState();
     setStep(2);
   };
@@ -269,22 +273,14 @@ const UploadFiles: React.FC = () => {
   const stepLabels = getStepLabels(collection);
 
   return (
-    <div className="rounded-lg border border-border bg-card p-6">
-      <PageHead
-        title="Embed Files & Code Repos"
-        description="Upload documents and code repositories for embedding and search."
-      />
+    <div className="rounded-lg border border-border bg-card p-4">
+      <PageHead title="Embed Files & Code Repos" description="Upload documents and code repositories for embedding and search." />
       <h1 className="text-2xl font-bold text-foreground mb-1">Upload &amp; Embed Files</h1>
-      <p className="text-muted-foreground mb-6 text-sm">
-        Use the steps below to select data type, configure scope, and upload files.
-      </p>
 
       <StepIndicator current={step} total={3} labels={stepLabels} onStepClick={handleStepClick} />
 
-      <div className="max-w-3xl mx-auto">
-        {step === 1 && (
-          <EmbeddingTypeStep onSelect={handleCollectionSelect} />
-        )}
+      <div className="">
+        {step === 1 && <EmbeddingTypeStep onSelect={handleCollectionSelect} />}
 
         {step === 2 && collection === "codebase" && (
           <ConfigureCodeStep
@@ -292,10 +288,21 @@ const UploadFiles: React.FC = () => {
             repoName={repoName}
             repoMode={repoMode}
             repoOptions={repoOptions}
-            onSelectZip={() => { setCodeUploadMode("zip"); setRepoName(""); setRepoMode("existing"); setStep(3); }}
+            onSelectZip={() => {
+              setCodeUploadMode("zip");
+              setRepoName("");
+              setRepoMode("existing");
+              setStep(3);
+            }}
             onSelectIndividual={() => setCodeUploadMode("individual")}
-            onRepoChange={(value, mode) => { setRepoName(value); setRepoMode(mode); }}
-            onBack={() => { setStep(1); setCodeUploadMode(""); }}
+            onRepoChange={(value, mode) => {
+              setRepoName(value);
+              setRepoMode(mode);
+            }}
+            onBack={() => {
+              setStep(1);
+              setCodeUploadMode("");
+            }}
             onNext={() => setStep(3)}
           />
         )}
@@ -305,7 +312,10 @@ const UploadFiles: React.FC = () => {
             groupName={groupName}
             groupMode={groupMode}
             groupOptions={groupOptions}
-            onGroupChange={(value, mode) => { setGroupName(value); setGroupMode(mode); }}
+            onGroupChange={(value, mode) => {
+              setGroupName(value);
+              setGroupMode(mode);
+            }}
             onBack={() => setStep(1)}
             onNext={() => setStep(3)}
           />
@@ -362,11 +372,7 @@ const UploadFiles: React.FC = () => {
         )}
       </div>
 
-      <JobStatusPanel
-        processing={uploadProps.loading}
-        activeJobs={activeJobs}
-        completedJobs={completedJobs}
-      />
+      <JobStatusPanel processing={uploadProps.loading} activeJobs={activeJobs} completedJobs={completedJobs} />
     </div>
   );
 };

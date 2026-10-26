@@ -1,9 +1,6 @@
 import React from "react";
 import { CheckCircle } from "lucide-react";
-import {
-  wizardStepDot, wizardStepDotActive, wizardStepDotCompleted, wizardStepDotPending,
-  wizardStepLabel, wizardConnector,
-} from "@/styles/classes";
+import { wizardStepDot, wizardStepDotActive, wizardStepDotCompleted, wizardStepDotPending, wizardStepLabel, wizardConnector } from "@/styles/classes";
 
 interface StepIndicatorProps {
   current: number;
@@ -13,7 +10,7 @@ interface StepIndicatorProps {
 }
 
 const StepIndicator: React.FC<StepIndicatorProps> = ({ current, total, labels, onStepClick }) => (
-  <div className="flex items-center justify-center mb-8">
+  <div className="flex items-center justify-center my-6">
     {Array.from({ length: total }, (_, i) => {
       const stepNum = i + 1;
       const isCompleted = stepNum < current;
@@ -30,13 +27,9 @@ const StepIndicator: React.FC<StepIndicatorProps> = ({ current, total, labels, o
             >
               {isCompleted ? <CheckCircle size={16} /> : stepNum}
             </button>
-            <span className={`${wizardStepLabel} ${isActive ? "text-foreground" : "text-muted-foreground"}`}>
-              {labels[i]}
-            </span>
+            <span className={`${wizardStepLabel} ${isActive ? "text-foreground" : "text-muted-foreground"}`}>{labels[i]}</span>
           </div>
-          {i < total - 1 && (
-            <div className={`${wizardConnector} ${stepNum < current ? "bg-success" : "bg-border"} self-start mt-4`} />
-          )}
+          {i < total - 1 && <div className={`${wizardConnector} ${stepNum < current ? "bg-success" : "bg-border"} self-start mt-4`} />}
         </React.Fragment>
       );
     })}
