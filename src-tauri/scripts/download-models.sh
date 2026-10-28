@@ -31,13 +31,13 @@ fetch() {
 }
 
 echo "Dense embedder: Snowflake/snowflake-arctic-embed-xs (ONNX)"
-DENSE_BASE="https://huggingface.co/Snowflake/snowflake-arctic-embed-xs/resolve/main"
+DENSE_BASE="https://huggingface.co/Snowflake/snowflake-arctic-embed-xs/resolve/d8c86521100d3556476a063fc2342036d45c106f"
 fetch "${DENSE_BASE}/onnx/model.onnx" "${MODELS_DIR}/arctic-embed-xs/model.onnx"
 fetch "${DENSE_BASE}/tokenizer.json"  "${MODELS_DIR}/arctic-embed-xs/tokenizer.json"
 fetch "${DENSE_BASE}/config.json"     "${MODELS_DIR}/arctic-embed-xs/config.json"
 
 echo "Reranker: cross-encoder/ms-marco-MiniLM-L6-v2 (ONNX)"
-RERANKER_BASE="https://huggingface.co/cross-encoder/ms-marco-MiniLM-L6-v2/resolve/main"
+RERANKER_BASE="https://huggingface.co/cross-encoder/ms-marco-MiniLM-L6-v2/resolve/233902d25c440f23af6f7d6e94d2946bac0bee0a"
 fetch "${RERANKER_BASE}/onnx/model.onnx" "${MODELS_DIR}/minilm-l6-v2/model.onnx"
 fetch "${RERANKER_BASE}/tokenizer.json"  "${MODELS_DIR}/minilm-l6-v2/tokenizer.json"
 fetch "${RERANKER_BASE}/config.json"     "${MODELS_DIR}/minilm-l6-v2/config.json"
