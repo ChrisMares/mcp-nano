@@ -1,5 +1,5 @@
 import React, { useEffect } from "react";
-import { ArrowLeft, CheckCircle, X } from "lucide-react";
+import { ArrowLeft } from "lucide-react";
 import { Dropzone, DropzoneContent, DropzoneEmptyState } from "@/components/ui/dropzone";
 import { type UseLocalUploadReturn } from "@/hooks/use-local-upload";
 import { wizardNav, btnSecondary } from "@/styles/classes";
