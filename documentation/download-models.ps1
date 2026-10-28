@@ -23,13 +23,13 @@ function Fetch-File {
 }
 
 Write-Host "Dense embedder: Snowflake/snowflake-arctic-embed-xs"
-$dense = 'https://huggingface.co/Snowflake/snowflake-arctic-embed-xs/resolve/main'
+$dense = 'https://huggingface.co/Snowflake/snowflake-arctic-embed-xs/resolve/d8c86521100d3556476a063fc2342036d45c106f'
 Fetch-File "$dense/onnx/model.onnx" (Join-Path $ModelsDir 'arctic-embed-xs\model.onnx')
 Fetch-File "$dense/tokenizer.json" (Join-Path $ModelsDir 'arctic-embed-xs\tokenizer.json')
 Fetch-File "$dense/config.json" (Join-Path $ModelsDir 'arctic-embed-xs\config.json')
 
 Write-Host "Reranker: cross-encoder/ms-marco-MiniLM-L6-v2"
-$rr = 'https://huggingface.co/cross-encoder/ms-marco-MiniLM-L6-v2/resolve/main'
+$rr = 'https://huggingface.co/cross-encoder/ms-marco-MiniLM-L6-v2/resolve/233902d25c440f23af6f7d6e94d2946bac0bee0a'
 Fetch-File "$rr/onnx/model.onnx" (Join-Path $ModelsDir 'minilm-l6-v2\model.onnx')
 Fetch-File "$rr/tokenizer.json" (Join-Path $ModelsDir 'minilm-l6-v2\tokenizer.json')
 Fetch-File "$rr/config.json" (Join-Path $ModelsDir 'minilm-l6-v2\config.json')

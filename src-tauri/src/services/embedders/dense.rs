@@ -8,7 +8,7 @@ use ort::session::Session;
 use ort::value::Tensor;
 use ort::inputs;
 use tokenizers::{Tokenizer, TruncationParams, TruncationStrategy};
-use tracing::info;
+use tracing::debug;
 
 use super::traits::{EncodeDocuments, EncodeQuery};
 
@@ -145,7 +145,7 @@ impl DenseEmbedder {
             "attention_mask" => attention_mask_t,
             "token_type_ids" => token_type_ids,
         })?;
-        info!(
+        debug!(
             "dense ORT run device={} batch={batch} seq_len={seq_len} elapsed_ms={}",
             self.device.label(),
             run_start.elapsed().as_millis()

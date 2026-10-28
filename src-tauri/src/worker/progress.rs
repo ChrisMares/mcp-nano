@@ -1,6 +1,7 @@
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use serde::Serialize;
@@ -53,11 +54,29 @@ impl JobProgressEvent {
     }
 }
 
+/// Message stored on a cancelled row and shown in the UI.
+pub const CANCELLED_MESSAGE: &str = "Cancelled by user";
+
 /// Emit a job lifecycle event if an app handle is available.
 pub fn emit_job_event(app: &AppHandle, event_name: &str, event: &JobProgressEvent) {
     if let Err(e) = app.emit(event_name, event) {
         error!("emit {event_name} failed for job {}: {e:#}", event.job_id);
     }
+}
+
+/// Emit a standardized `job_cancelled` event.
+pub fn emit_job_cancelled(app: &AppHandle, job_id: &str, file_name: Option<String>) {
+    emit_job_event(
+        app,
+        "job_cancelled",
+        &JobProgressEvent::new(
+            job_id,
+            100,
+            "CANCELLED",
+            file_name,
+            Some(CANCELLED_MESSAGE.to_string()),
+        ),
+    );
 }
 
 /// A no-op progress callback for tests / tasks that don't report progress.
@@ -80,22 +99,63 @@ pub fn progress_for_job(pool: SqlitePool, job_id: String) -> ProgressCallback {
     })
 }
 
+/// How often progress is written to SQLite. The UI event fires on every
+/// update; only the persisted row is throttled, so a fast pipeline cannot
+/// saturate the database with writes.
+const PROGRESS_PERSIST_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Rate-limits database writes for progress updates.
+struct PersistGate {
+    last: Mutex<Instant>,
+    interval: Duration,
+}
+
+impl PersistGate {
+    fn new(interval: Duration) -> Self {
+        Self {
+            last: Mutex::new(Instant::now()),
+            interval,
+        }
+    }
+
+    /// True when enough time has passed since the last allowed write.
+    fn allow(&self) -> bool {
+        let mut last = self
+            .last
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if last.elapsed() < self.interval {
+            return false;
+        }
+        *last = Instant::now();
+        true
+    }
+}
+
 /// Build a progress callback bound to a specific `job_id` that also pushes
 /// a `job_progress` Tauri event via the supplied `AppHandle`.
+///
+/// Every call emits an event so the UI always shows movement, but the
+/// `job_status` row is written at most once per [`PROGRESS_PERSIST_INTERVAL`].
+/// The row is a recovery/`get_active_jobs` record, not the live display.
 pub fn progress_for_job_with_app(
     pool: SqlitePool,
     job_id: String,
     app: AppHandle,
     file_name: Option<String>,
 ) -> ProgressCallback {
+    let gate = Arc::new(PersistGate::new(PROGRESS_PERSIST_INTERVAL));
     Arc::new(move |pct, msg| {
         let pool = pool.clone();
         let job_id = job_id.clone();
         let app = app.clone();
         let file_name = file_name.clone();
+        let gate = gate.clone();
         Box::pin(async move {
-            if let Err(e) = update_job_progress(&pool, &job_id, pct, msg.as_deref()).await {
-                error!("progress update failed for job {job_id}: {e:#}");
+            if gate.allow() {
+                if let Err(e) = update_job_progress(&pool, &job_id, pct, msg.as_deref()).await {
+                    error!("progress update failed for job {job_id}: {e:#}");
+                }
             }
             let event = JobProgressEvent::new(
                 job_id.clone(),
@@ -166,6 +226,17 @@ pub fn now_iso() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persist_gate_rate_limits_writes() {
+        let gate = PersistGate::new(Duration::from_millis(50));
+        // The first call right after construction is skipped, so a burst of
+        // progress events produces at most one write per interval.
+        assert!(!gate.allow());
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(gate.allow());
+        assert!(!gate.allow());
+    }
 
     #[test]
     fn job_progress_event_clamps_percentage() {

@@ -275,9 +275,10 @@ pub async fn connection_info(
         server_name: server.name.clone(),
         full_url: full_url.clone(),
         config_snippets: json!({
-            "claude_desktop": { "mcpServers": { server.name.clone(): { "url": full_url } } },
-            "opencode": { "mcp": { server.name.clone(): { "type": "remote", "url": full_url } } },
+            "claude_desktop": { "mcpServers": { server.name.clone(): { "type": "http", "url": full_url } } },
+            "opencode": { "mcp": { server.name.clone(): { "type": "remote", "url": full_url, "oauth": false } } },
             "vscode": { "servers": { server.name.clone(): { "type": "http", "url": full_url } } },
+            "codex": format!("[mcp_servers.{}]\nurl = \"{full_url}\"\n", server.name),
         }),
     })
 }

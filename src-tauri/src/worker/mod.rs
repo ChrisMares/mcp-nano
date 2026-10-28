@@ -1,9 +1,11 @@
+pub mod cancel;
 pub mod progress;
 pub mod tasks;
 
+pub use cancel::{is_job_cancelled, JobCancellation, JobCancelled};
 pub use progress::{
-    emit_job_event, noop_progress, progress_for_job, progress_for_job_with_app, set_job_status,
-    update_job_progress, JobProgressEvent, ProgressCallback,
+    emit_job_cancelled, emit_job_event, noop_progress, progress_for_job, progress_for_job_with_app,
+    set_job_status, update_job_progress, JobProgressEvent, ProgressCallback, CANCELLED_MESSAGE,
 };
 pub use tasks::{BoxedTaskFuture, TaskFn, TaskRegistry};
 
@@ -12,12 +14,13 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use sqlx::SqlitePool;
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::models::entities::JobStatus;
+use crate::services::QdrantService;
 
 /// Maximum concurrent in-flight jobs. Mirrors the Python
 /// `MAX_CONCURRENT_JOBS = 2`.
@@ -40,14 +43,19 @@ const STALE_TIMEOUT_MINUTES: i64 = 15;
 /// When `app` is `Some`, every progress callback emits a `job_progress`
 /// Tauri event that the UI listens to live (no polling of `get_job_status`).
 /// Tests pass `None` so progress callbacks only update the SQLite row.
+///
+/// `cancellations` is the shared registry of in-flight job tokens. The worker
+/// registers a token per job so `cancel_job` can stop a running task, and
+/// removes it once the job reaches a terminal state.
 pub fn start(
     pool: SqlitePool,
     registry: TaskRegistry,
     cancel: CancellationToken,
     app: Option<AppHandle>,
+    cancellations: JobCancellation,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        run_loop(pool, registry, cancel, app).await;
+        run_loop(pool, registry, cancel, app, cancellations).await;
     })
 }
 
@@ -56,6 +64,7 @@ async fn run_loop(
     registry: TaskRegistry,
     cancel: CancellationToken,
     app: Option<AppHandle>,
+    cancellations: JobCancellation,
 ) {
     use tokio::sync::Semaphore;
     let sem = Arc::new(Semaphore::new(MAX_CONCURRENT_JOBS));
@@ -89,6 +98,7 @@ async fn run_loop(
                         let registry = registry.clone();
                         let sem = sem.clone();
                         let app = app.clone();
+                        let cancellations = cancellations.clone();
                         let task = tokio::spawn(async move {
                             let _permit = sem.acquire_owned().await.expect("sem closed");
                             let job_id = job.job_id.clone();
@@ -111,10 +121,23 @@ async fn run_loop(
                                     job.task_name, job.file_name
                                 ),
                             );
+
+                            // Register the token before the task can run so
+                            // `cancel_job` always finds it. A cancel that landed
+                            // between the claim and this point is only recorded
+                            // in the DB, so re-check the row and self-cancel.
+                            let job_cancel = CancellationToken::new();
+                            cancellations.register(&job_id, job_cancel.clone());
+                            if job_row_is_cancelled(&pool, &job_id).await {
+                                job_cancel.cancel();
+                            }
+
                             let inner = tokio::spawn(async move {
-                                run_job(&pool, &registry, job, app).await;
+                                run_job(&pool, &registry, job, app, job_cancel).await;
                             });
-                            if let Err(join_err) = inner.await {
+                            let joined = inner.await;
+                            cancellations.remove(&job_id);
+                            if let Err(join_err) = joined {
                                 let msg = if join_err.is_panic() {
                                     let payload = join_err.into_panic();
                                     let detail = crate::panic_payload_to_string(&*payload);
@@ -195,6 +218,7 @@ async fn run_job(
     registry: &TaskRegistry,
     job: JobStatus,
     app: Option<AppHandle>,
+    cancel: CancellationToken,
 ) {
     let job_id = job.job_id.clone();
     let file_name = job.file_name.clone();
@@ -271,7 +295,16 @@ async fn run_job(
         None => progress_for_job(pool.clone(), job_id.clone()),
     };
 
-    let result = task_fn(params.clone(), progress).await;
+    let result = task_fn(params.clone(), progress, cancel.clone()).await;
+
+    // A cancelled job is terminal in its own right: the row was already
+    // flipped to CANCELLED by `cancel_job`, so the task's real outcome must
+    // not overwrite it.
+    if cancel.is_cancelled() || result.as_ref().err().is_some_and(is_job_cancelled) {
+        finish_cancelled_job(pool, app.as_ref(), &job_id, &task_name, &file_name, &params).await;
+        return;
+    }
+
     match result {
         Ok(msg) => {
             if let Err(e) = update_job_progress(pool, &job_id, 100, None).await {
@@ -316,6 +349,54 @@ async fn run_job(
             }
         }
     }
+}
+
+/// True when `job_id`'s row is already terminal-`CANCELLED` in SQLite.
+///
+/// Used by the worker right after registering a job's cancellation token: a
+/// cancel that landed between the claim and the registration is only visible
+/// in the database, so the job cancels itself instead of running to the end.
+async fn job_row_is_cancelled(pool: &SqlitePool, job_id: &str) -> bool {
+    sqlx::query_scalar::<_, String>("SELECT status FROM job_status WHERE job_id = ?")
+        .bind(job_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|status| status == "CANCELLED")
+}
+
+/// Terminal handling for a cancelled job.
+///
+/// The row was already flipped to `CANCELLED` by `cancel_job` (or by the
+/// self-cancel check), so the status is confirmed here rather than derived
+/// from the task result, the UI is told, and everything the run produced is
+/// deleted.
+async fn finish_cancelled_job(
+    pool: &SqlitePool,
+    app: Option<&AppHandle>,
+    job_id: &str,
+    task_name: &str,
+    file_name: &Option<String>,
+    params: &serde_json::Value,
+) {
+    let _ = set_job_status(pool, job_id, "CANCELLED", None, Some(CANCELLED_MESSAGE)).await;
+
+    let qdrant = app
+        .and_then(|app| app.try_state::<crate::qdrant::QdrantState>())
+        .map(|state| QdrantService::new(state.client.clone()));
+    if let Err(e) =
+        crate::services::job_cleanup::cleanup_cancelled_job(qdrant.as_ref(), pool, task_name, params)
+            .await
+    {
+        error!("cancel cleanup failed for {job_id}: {e:#}");
+    }
+
+    if let Some(app) = app {
+        emit_job_cancelled(app, job_id, file_name.clone());
+    }
+    info!("worker: job {job_id} cancelled and cleaned up");
+    crate::write_ingest_breadcrumb("job_cancelled", &format!("job_id={job_id}"));
 }
 
 /// Update `file_metadata.status` (and optionally `error_message`) for the
@@ -475,7 +556,7 @@ mod tests {
 
         // Register a noop task that reports progress 0 -> 50 -> 100.
         let mut reg = TaskRegistry::new();
-        reg.register("noop", |_params, progress| {
+        reg.register("noop", |_params, progress, _cancel| {
             async move {
                 progress(0, Some("starting".to_string())).await;
                 progress(50, Some("halfway".to_string())).await;
@@ -487,7 +568,13 @@ mod tests {
         let job_id = insert_pending_job(&pool, "noop", "{}").await;
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
-        let handle = start(pool.clone(), reg, cancel, None);
+        let handle = start(
+            pool.clone(),
+            reg,
+            cancel,
+            None,
+            JobCancellation::new(),
+        );
 
         // Wait for the job to reach FINISHED (poll up to 5s).
         let mut final_status = String::new();
@@ -518,7 +605,13 @@ mod tests {
         let job_id = insert_pending_job(&pool, "unknown_task", "{}").await;
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
-        let handle = start(pool.clone(), reg, cancel, None);
+        let handle = start(
+            pool.clone(),
+            reg,
+            cancel,
+            None,
+            JobCancellation::new(),
+        );
 
         let mut final_status = String::new();
         for _ in 0..50 {
@@ -638,6 +731,108 @@ mod tests {
         let pool = open_pool(&dir).await;
         let claimed = claim_jobs(&pool, 5).await.unwrap();
         assert!(claimed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn claim_jobs_skips_cancelled_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pool = open_pool(&dir).await;
+        let job_id = insert_pending_job(&pool, "noop", "{}").await;
+        sqlx::query("UPDATE job_status SET status = 'CANCELLED' WHERE job_id = ?")
+            .bind(&job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let claimed = claim_jobs(&pool, 5).await.unwrap();
+        assert!(claimed.is_empty(), "a CANCELLED row must never be claimed");
+    }
+
+    #[tokio::test]
+    async fn reset_running_to_pending_leaves_cancelled_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pool = open_pool(&dir).await;
+        let cancelled = insert_pending_job(&pool, "noop", "{}").await;
+        let running = insert_pending_job(&pool, "noop", "{}").await;
+        sqlx::query("UPDATE job_status SET status = 'CANCELLED' WHERE job_id = ?")
+            .bind(&cancelled)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE job_status SET status = 'RUNNING' WHERE job_id = ?")
+            .bind(&running)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        reset_running_to_pending(&pool).await.unwrap();
+        let (cancelled_status, _, _) = fetch_job_status(&pool, &cancelled).await;
+        let (running_status, _, _) = fetch_job_status(&pool, &running).await;
+        assert_eq!(cancelled_status, "CANCELLED");
+        assert_eq!(running_status, "PENDING");
+    }
+
+    #[tokio::test]
+    async fn cancelled_running_job_ends_cancelled_not_failed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pool = open_pool(&dir).await;
+
+        let mut reg = TaskRegistry::new();
+        reg.register("long_running", |_params, _progress, cancel| async move {
+            tokio::select! {
+                _ = cancel.cancelled() => Err(anyhow::Error::new(JobCancelled)),
+                _ = tokio::time::sleep(Duration::from_secs(30)) => Ok("finished".to_string()),
+            }
+        });
+
+        let job_id = insert_pending_job(&pool, "long_running", "{}").await;
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        let cancellations = JobCancellation::new();
+        let handle = start(
+            pool.clone(),
+            reg,
+            cancel_clone,
+            None,
+            cancellations.clone(),
+        );
+
+        // Wait for the worker to claim the job and register its token.
+        let mut running = false;
+        for _ in 0..80 {
+            let (status, _, _) = fetch_job_status(&pool, &job_id).await;
+            if status == "RUNNING" {
+                running = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(running, "job should be claimed");
+
+        // Mirror `cancel_job`: mark the row, then fire the token.
+        sqlx::query("UPDATE job_status SET status = 'CANCELLED' WHERE job_id = ?")
+            .bind(&job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(cancellations.cancel(&job_id), "token should be registered");
+
+        let mut final_status = String::new();
+        for _ in 0..80 {
+            let (status, _, _) = fetch_job_status(&pool, &job_id).await;
+            if status != "RUNNING" && status != "PENDING" {
+                final_status = status;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        cancel.cancel();
+        let _ = handle.await;
+
+        assert_eq!(
+            final_status, "CANCELLED",
+            "a cancelled job must not be recorded as FAILED"
+        );
     }
 
     #[tokio::test]

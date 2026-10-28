@@ -163,8 +163,7 @@ fn init_logging(app: &tauri::AppHandle) {
 
     static INIT: OnceLock<()> = OnceLock::new();
     INIT.get_or_init(|| {
-        let log_level =
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "info,mcp_nano_lib=debug".to_string());
+        let log_level = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
 
         let mut file_writer: Option<Arc<Mutex<std::fs::File>>> = None;
         if let Ok(data_dir) = app.path().app_local_data_dir() {
@@ -391,6 +390,8 @@ pub fn run() {
 
             let cancel = CancellationToken::new();
             app.manage(cancel.clone());
+            let job_cancellations = worker::JobCancellation::new();
+            app.manage(job_cancellations.clone());
             let app_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let pool = wait_for_pool(&app_handle).await;
@@ -445,7 +446,13 @@ pub fn run() {
                     "Starting background worker: tasks={} concurrency=2",
                     registry.names().join(", "),
                 );
-                let _join = worker::start(pool, registry, cancel, Some(app_handle.clone()));
+                let _join = worker::start(
+                    pool,
+                    registry,
+                    cancel,
+                    Some(app_handle.clone()),
+                    job_cancellations,
+                );
                 qdrant::publish_status(&app_handle, |s| s.worker_ready = true);
             });
 
@@ -460,6 +467,7 @@ pub fn run() {
             jobs::upload_code_files,
             jobs::get_active_jobs,
             jobs::get_job_status,
+            jobs::cancel_job,
             data::get_files,
             data::delete_repo,
             data::delete_document,
@@ -480,6 +488,7 @@ pub fn run() {
             mcpconfig::get_mcp_connection_info,
             website::crawl_website,
             website::cancel_website_crawl,
+            website::clear_website_cache,
             website::embed_website,
         ])
         .build(tauri::generate_context!())

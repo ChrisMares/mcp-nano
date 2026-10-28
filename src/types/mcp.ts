@@ -113,5 +113,6 @@ export interface ConnectionInfo {
     claude_desktop: object;
     opencode: object;
     vscode: object;
+    codex: string;
   };
 }

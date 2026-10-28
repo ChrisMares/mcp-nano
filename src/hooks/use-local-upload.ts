@@ -27,6 +27,8 @@ type UseLocalUploadOptions = {
   codeUploadMode: "zip" | "individual" | "";
   repoName?: string;
   groupName?: string;
+  filterTestFiles?: boolean;
+  codeFilesOnly?: boolean;
   maxFileSize?: number;
   maxFiles?: number;
   onSuccess?: (submittedCount: number, jobs: UploadJobEntry[]) => void | Promise<void>;
@@ -51,6 +53,8 @@ export const useLocalUpload = (options: UseLocalUploadOptions) => {
     codeUploadMode,
     repoName = "",
     groupName = "",
+    filterTestFiles = true,
+    codeFilesOnly = true,
     maxFileSize = Number.POSITIVE_INFINITY,
     maxFiles = 10,
     onSuccess,
@@ -175,6 +179,8 @@ export const useLocalUpload = (options: UseLocalUploadOptions) => {
               codeUploadMode === "individual"
                 ? repoName.trim() || undefined
                 : undefined,
+            filter_test_files: codeUploadMode === "zip" ? filterTestFiles : undefined,
+            code_files_only: codeUploadMode === "zip" ? codeFilesOnly : undefined,
             metadata: {},
           }
         : {
@@ -204,7 +210,7 @@ export const useLocalUpload = (options: UseLocalUploadOptions) => {
     } finally {
       setLoading(false);
     }
-  }, [codeUploadMode, collection, files, groupName, onSuccess, repoName]);
+  }, [codeUploadMode, collection, files, filterTestFiles, codeFilesOnly, groupName, onSuccess, repoName]);
 
   return {
     files,

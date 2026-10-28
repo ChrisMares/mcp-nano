@@ -1,6 +1,6 @@
 import { Helmet } from "react-helmet-async";
 
-const SITE_NAME = "NASA MCP";
+const SITE_NAME = "MCP Nano";
 
 interface PageHeadProps {
   title: string;

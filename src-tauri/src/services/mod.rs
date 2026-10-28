@@ -1,7 +1,9 @@
 pub mod embedder_state;
 pub mod embedders;
+pub mod file_filters;
 pub mod ingestion;
 pub mod ingestion_service;
+pub mod job_cleanup;
 pub mod mcp_config;
 pub mod qdrant_service;
 pub mod rag_service;

@@ -5,18 +5,8 @@ import AppHeader from '@/components/layout/AppHeader'
 import { renderWithProviders } from '../helpers'
 
 describe('AppHeader', () => {
-  it('renders sidebar toggle button', () => {
+  it('renders the account menu and theme toggle', () => {
     renderWithProviders(<AppHeader />)
-    expect(screen.getByLabelText('Toggle Sidebar')).toBeInTheDocument()
-  })
-
-  it('renders the mobile logo link', () => {
-    renderWithProviders(<AppHeader />)
-    expect(screen.getByText('NASA MCP')).toBeInTheDocument()
-  })
-
-  it('renders local mode dropdown', () => {
-    renderWithProviders(<AppHeader />)
-    expect(screen.getByText('Local')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Account menu' })).toBeInTheDocument()
   })
 })

@@ -3,7 +3,6 @@ import { render, type RenderOptions } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import { HelmetProvider } from 'react-helmet-async'
 import { ThemeProvider } from '@/contexts/ThemeContext'
-import { SidebarProvider } from '@/contexts/SidebarContext'
 
 interface WrapperOptions {
   route?: string
@@ -17,9 +16,7 @@ export function createWrapper(options: WrapperOptions = {}) {
       <HelmetProvider>
         <MemoryRouter initialEntries={[route]}>
           <ThemeProvider>
-            <SidebarProvider>
-              {children}
-            </SidebarProvider>
+            {children}
           </ThemeProvider>
         </MemoryRouter>
       </HelmetProvider>

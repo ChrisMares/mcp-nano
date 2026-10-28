@@ -4,7 +4,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::SqlitePool;
 use tauri::{AppHandle, Manager};
 use tracing::info;
@@ -100,7 +100,11 @@ async fn connect(path: &PathBuf) -> Result<SqlitePool, String> {
     let options = SqliteConnectOptions::new()
         .filename(path)
         .create_if_missing(true)
-        .foreign_keys(true);
+        .foreign_keys(true)
+        // WAL keeps readers (get_active_jobs, the UI) from blocking on the
+        // worker's progress writes, and NORMAL avoids an fsync per commit.
+        .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Normal);
     let pool = SqlitePoolOptions::new()
         .connect_with(options)
         .await
@@ -116,6 +120,19 @@ async fn connect(path: &PathBuf) -> Result<SqlitePool, String> {
 mod tests {
     use super::*;
     use sqlx::Row;
+
+    #[tokio::test]
+    async fn connect_enables_wal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("app.db");
+        let pool = connect(&path).await.expect("connect and migrate");
+
+        let mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(&pool)
+            .await
+            .expect("read journal_mode");
+        assert_eq!(mode.to_lowercase(), "wal");
+    }
 
     #[tokio::test]
     async fn migrations_create_expected_schema() {

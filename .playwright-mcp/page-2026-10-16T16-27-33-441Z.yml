@@ -1,0 +1,78 @@
+- generic [ref=f1e3]:
+  - complementary [ref=f1e4]:
+    - link [ref=f1e6] [cursor=pointer]:
+      - /url: /
+      - img "mcp nano" [ref=f1e7]
+    - navigation [ref=f1e123]:
+      - list [ref=f1e126]:
+        - listitem [ref=f1e127]:
+          - link "Dashboard" [ref=f1e128] [cursor=pointer]:
+            - /url: /dashboard
+        - listitem [ref=f1e137]:
+          - generic [ref=f1e138] [cursor=pointer]: Embed
+          - list [ref=f1e143]:
+            - listitem [ref=f1e144]:
+              - link "Upload Files" [ref=f1e145] [cursor=pointer]:
+                - /url: /embed/upload
+            - listitem [ref=f1e146]:
+              - link "Data Management" [ref=f1e147] [cursor=pointer]:
+                - /url: /embed/data
+        - listitem [ref=f1e148]:
+          - generic [ref=f1e149] [cursor=pointer]: Query
+          - list [ref=f1e154]:
+            - listitem [ref=f1e155]:
+              - link "Fetch Context" [ref=f1e156] [cursor=pointer]:
+                - /url: /query/fetch
+        - listitem [ref=f1e157]:
+          - generic [ref=f1e158] [cursor=pointer]: MCP
+          - list [ref=f1e163]:
+            - listitem [ref=f1e164]:
+              - link "Create" [ref=f1e165] [cursor=pointer]:
+                - /url: /mcp/create
+            - listitem [ref=f1e166]:
+              - link "Manage" [ref=f1e167] [cursor=pointer]:
+                - /url: /mcp/manage
+            - listitem [ref=f1e168]:
+              - link "Connect" [ref=f1e169] [cursor=pointer]:
+                - /url: /mcp/connect
+  - generic [ref=f1e170]:
+    - banner [ref=f1e171]:
+      - generic [ref=f1e172]:
+        - button "Toggle Sidebar" [ref=f1e174]
+        - generic [ref=f1e177]:
+          - status "Embedders loading…" [ref=f1e178]:
+            - generic [ref=f1e180]: …
+          - button [ref=f1e181]
+          - button [ref=f1e185]
+    - status [ref=f1e191]:
+      - generic [ref=f1e192]: "Backend error: backend unreachable"
+    - main [ref=f1e193]:
+      - generic [ref=f1e195]:
+        - heading "Welcome to MCP Nano" [level=1] [ref=f1e197]
+        - generic [ref=f1e198]:
+          - heading "Getting Started" [level=2] [ref=f1e199]
+          - generic [ref=f1e200]:
+            - generic [ref=f1e201]:
+              - generic [ref=f1e202]:
+                - generic [ref=f1e203]: "1"
+                - heading "Embed Your Data" [level=3] [ref=f1e208]
+              - paragraph [ref=f1e209]: Upload documents or code repositories. Files are indexed as embeddings for search and MCP tools.
+              - link "Start Embedding" [ref=f1e210] [cursor=pointer]:
+                - /url: /embed/upload
+            - generic [ref=f1e213]:
+              - generic [ref=f1e214]:
+                - generic [ref=f1e215]: "2"
+                - heading "Fetch Context" [level=3] [ref=f1e219]
+              - paragraph [ref=f1e220]: Run natural-language queries against embedded data and review the returned context.
+              - link "Try a Search" [ref=f1e221] [cursor=pointer]:
+                - /url: /query/fetch
+            - generic [ref=f1e224]:
+              - generic [ref=f1e225]:
+                - generic [ref=f1e226]: "3"
+                - heading "Create MCP Server & Tools" [level=3] [ref=f1e229]
+              - paragraph [ref=f1e230]: Create MCP servers and tools, then scope each tool to selected repos, document groups, or websites.
+              - link "Create a Server" [ref=f1e231] [cursor=pointer]:
+                - /url: /mcp/create
+        - generic [ref=f1e234]:
+          - heading "Overview" [level=2] [ref=f1e235]
+          - generic [ref=f1e236]: Loading stats...

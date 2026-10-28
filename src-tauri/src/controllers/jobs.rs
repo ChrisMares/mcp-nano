@@ -16,14 +16,20 @@ use std::path::{Path, PathBuf};
 
 use serde_json::json;
 use tauri::{AppHandle, Manager};
-use tracing::info;
+use tracing::{error, info};
 use uuid::Uuid;
 
 use crate::db::DbState;
 use crate::models::entities::JobStatus;
 use crate::models::request::EmbeddingOptions;
 use crate::models::response::{ActiveJobsResponse, UploadJobEntry, UploadResponse};
-use crate::worker::progress::{emit_job_event, now_iso, JobProgressEvent};
+use crate::qdrant::QdrantState;
+use crate::services::job_cleanup::cleanup_cancelled_job;
+use crate::services::qdrant_service::QdrantService;
+use crate::worker::progress::{
+    emit_job_cancelled, emit_job_event, now_iso, JobProgressEvent, CANCELLED_MESSAGE,
+};
+use crate::worker::JobCancellation;
 
 #[tauri::command]
 pub async fn upload_repo_zip(
@@ -150,6 +156,120 @@ pub async fn get_job_status(app: AppHandle, job_id: String) -> Result<JobStatus,
         .fetch_one(&pool)
         .await
         .map_err(|e| format!("querying job_status: {e}"))
+}
+
+/// Cancel a queued or running job and delete everything it produced.
+///
+/// A `PENDING` job is cancelled with a conditional `UPDATE` that races safely
+/// with `claim_jobs`: SQLite serializes writers, so exactly one of the two
+/// statements can match the row. A `RUNNING` job is marked `CANCELLED` first
+/// and then stopped through its cancellation token; the worker deletes the
+/// partial data and emits `job_cancelled`.
+#[tauri::command]
+pub async fn cancel_job(app: AppHandle, job_id: String) -> Result<(), String> {
+    let pool = pool_from_state(&app)?;
+    let now = now_iso();
+
+    let pending = sqlx::query(
+        "UPDATE job_status SET status = 'CANCELLED', error_message = ?, updated_at = ? \
+         WHERE job_id = ? AND status = 'PENDING'",
+    )
+    .bind(CANCELLED_MESSAGE)
+    .bind(&now)
+    .bind(&job_id)
+    .execute(&pool)
+    .await
+    .map_err(|e| format!("cancelling pending job: {e}"))?;
+
+    let job = sqlx::query_as::<_, JobStatus>("SELECT * FROM job_status WHERE job_id = ?")
+        .bind(&job_id)
+        .fetch_optional(&pool)
+        .await
+        .map_err(|e| format!("querying job_status: {e}"))?
+        .ok_or_else(|| format!("job {job_id} not found"))?;
+
+    if pending.rows_affected() == 1 {
+        // The job never ran, but the copied upload and its metadata row exist.
+        let params = parse_params(job.task_params.as_deref());
+        let qdrant = qdrant_from_state(&app);
+        if let Err(e) = cleanup_cancelled_job(
+            qdrant.as_ref(),
+            &pool,
+            job.task_name.as_deref().unwrap_or_default(),
+            &params,
+        )
+        .await
+        {
+            error!("cancel cleanup failed for {job_id}: {e:#}");
+        }
+        emit_job_cancelled(&app, &job_id, job.file_name.clone());
+        info!("cancel_job: {job_id} was PENDING and is now CANCELLED");
+        return Ok(());
+    }
+
+    if job.status == "CANCELLED" {
+        // Idempotent: a second click while the worker is tearing down.
+        return Ok(());
+    }
+
+    if job.status != "RUNNING" {
+        return Err(format!(
+            "job {job_id} is not active (status: {})",
+            job.status
+        ));
+    }
+
+    // Mark the row before firing the token. The worker re-reads the row right
+    // after registering its token, so a cancel landing in that window is not
+    // lost.
+    let running = sqlx::query(
+        "UPDATE job_status SET status = 'CANCELLED', error_message = ?, updated_at = ? \
+         WHERE job_id = ? AND status = 'RUNNING'",
+    )
+    .bind(CANCELLED_MESSAGE)
+    .bind(&now)
+    .bind(&job_id)
+    .execute(&pool)
+    .await
+    .map_err(|e| format!("cancelling running job: {e}"))?;
+
+    if running.rows_affected() == 0 {
+        // The worker reached a terminal state between our SELECT and UPDATE.
+        let current: Option<String> =
+            sqlx::query_scalar("SELECT status FROM job_status WHERE job_id = ?")
+                .bind(&job_id)
+                .fetch_optional(&pool)
+                .await
+                .map_err(|e| format!("querying job_status: {e}"))?;
+        return match current.as_deref() {
+            Some("CANCELLED") => Ok(()),
+            Some(status) => Err(format!("job {job_id} already {status}")),
+            None => Err(format!("job {job_id} not found")),
+        };
+    }
+
+    let fired = app
+        .try_state::<JobCancellation>()
+        .map(|registry| registry.cancel(&job_id))
+        .unwrap_or(false);
+    if fired {
+        info!("cancel_job: {job_id} RUNNING, token fired");
+    } else {
+        // Registered a moment later; the worker sees the CANCELLED row and
+        // stops itself.
+        info!("cancel_job: {job_id} marked CANCELLED before its token was registered");
+    }
+    Ok(())
+}
+
+fn parse_params(raw: Option<&str>) -> serde_json::Value {
+    raw.and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or(serde_json::Value::Null)
+}
+
+fn qdrant_from_state(app: &AppHandle) -> Option<QdrantService> {
+    app.try_state::<QdrantState>()
+        .map(|state| QdrantService::new(state.client.clone()))
 }
 
 /// Resolve the SqlitePool from managed state. Returns a useful error

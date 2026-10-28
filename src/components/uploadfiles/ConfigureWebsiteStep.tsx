@@ -1,13 +1,6 @@
 import React from "react";
 import { ArrowLeft, ArrowRight, Loader2, X } from "lucide-react";
-import {
-  wizardNav,
-  btnPrimary,
-  btnSecondary,
-  fieldLabel,
-  textInput,
-  sliderBounds,
-} from "@/styles/classes";
+import { wizardNav, btnPrimary, btnSecondary, fieldLabel, textInput, sliderBounds } from "@/styles/classes";
 
 interface Props {
   websiteUrl: string;
@@ -26,14 +19,7 @@ interface Props {
   onNext: () => void;
 }
 
-const DEPTH_LABELS = [
-  "This page only",
-  "1 level deep",
-  "2 levels deep",
-  "3 levels deep",
-  "4 levels deep",
-  "5 levels deep",
-];
+const DEPTH_LABELS = ["This page only", "1 level deep", "2 levels deep", "3 levels deep", "4 levels deep", "5 levels deep"];
 
 const ConfigureWebsiteStep: React.FC<Props> = ({
   websiteUrl,
@@ -55,13 +41,8 @@ const ConfigureWebsiteStep: React.FC<Props> = ({
 
   return (
     <div>
-      <h2 className="text-lg font-semibold text-foreground mb-1">
-        Configure Website Crawl
-      </h2>
-      <p className="text-sm text-muted-foreground mb-5">
-        Provide the URL to crawl. Sitemap URLs are included alongside links
-        discovered from each page.
-      </p>
+      <h2 className="text-lg font-semibold text-foreground mb-1">Configure Website Crawl</h2>
+      <p className="text-sm text-muted-foreground mb-5">Provide the URL to crawl.</p>
 
       <div className="mb-5">
         <label className={fieldLabel}>
@@ -75,9 +56,6 @@ const ConfigureWebsiteStep: React.FC<Props> = ({
           onChange={(e) => onUrlChange(e.target.value)}
           disabled={isCrawling}
         />
-        <p className="text-xs text-muted-foreground mt-1">
-          The starting URL for sitemap and page-link discovery.
-        </p>
       </div>
 
       <div className="mb-5">
@@ -96,8 +74,7 @@ const ConfigureWebsiteStep: React.FC<Props> = ({
           Render JavaScript
         </label>
         <p className="text-xs text-muted-foreground mt-1 ml-6">
-          Client-rendered navigation if any Chromium browser is installed.
-          Slower crawl, but more thorough.
+          Client-rendered navigation if any Chromium browser is installed. Slower crawl, but more thorough.
         </p>
       </div>
 
@@ -116,8 +93,7 @@ const ConfigureWebsiteStep: React.FC<Props> = ({
           Only crawl current site section
         </label>
         <p className="text-xs text-muted-foreground mt-1 ml-6">
-          When checked, only URLs under the starting host and path are crawled.
-          For example, /docs/ excludes /blog/.
+          When checked, only URLs under the starting host and path are crawled. For example, /docs/ excludes /blog/.
         </p>
       </div>
 
@@ -126,10 +102,7 @@ const ConfigureWebsiteStep: React.FC<Props> = ({
           className={fieldLabel}
           title="The number of link levels to follow from the starting URL. Higher depth means the crawler explores more pages, but takes longer."
         >
-          Crawl Depth —{" "}
-          <span className="text-foreground font-semibold">
-            {DEPTH_LABELS[depth]}
-          </span>
+          Crawl Depth — <span className="text-foreground font-semibold">{DEPTH_LABELS[depth]}</span>
         </label>
         <input
           type="range"
@@ -145,10 +118,7 @@ const ConfigureWebsiteStep: React.FC<Props> = ({
           <span>0 — page only</span>
           <span>5 — deep crawl</span>
         </div>
-        <p className="text-xs text-muted-foreground mt-1">
-          Sitemap URLs are not limited by this depth. Higher depth adds more
-          page-link discovery.
-        </p>
+        <p className="text-xs text-muted-foreground mt-1">Higher depth adds more page-link discovery.</p>
       </div>
 
       {isCrawling && (
@@ -164,9 +134,7 @@ const ConfigureWebsiteStep: React.FC<Props> = ({
           </button>
           <Loader2 size={16} className="animate-spin text-primary shrink-0" />
           <span className="truncate" title={crawlCurrentUrl ?? undefined}>
-            {crawlCurrentUrl
-              ? `Crawling ${crawlCurrentUrl}`
-              : "Crawl in progress…"}
+            {crawlCurrentUrl ? `Crawling ${crawlCurrentUrl}` : "Crawl in progress…"}
             {crawlFoundCount > 0 ? ` · ${crawlFoundCount} found` : ""}
           </span>
         </div>

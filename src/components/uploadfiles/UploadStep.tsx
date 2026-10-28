@@ -1,10 +1,6 @@
 import React, { useEffect } from "react";
 import { ArrowLeft, CheckCircle, X } from "lucide-react";
-import {
-  Dropzone,
-  DropzoneContent,
-  DropzoneEmptyState,
-} from "@/components/ui/dropzone";
+import { Dropzone, DropzoneContent, DropzoneEmptyState } from "@/components/ui/dropzone";
 import { type UseLocalUploadReturn } from "@/hooks/use-local-upload";
 import { wizardNav, btnSecondary } from "@/styles/classes";
 
@@ -13,6 +9,10 @@ interface Props {
   codeUploadMode: "zip" | "individual" | "";
   repoName: string;
   groupName: string;
+  filterTestFiles: boolean;
+  onFilterTestFilesChange: (val: boolean) => void;
+  codeFilesOnly: boolean;
+  onCodeFilesOnlyChange: (val: boolean) => void;
   uploadProps: UseLocalUploadReturn;
   disableUpload: boolean;
   disableReason: string;
@@ -23,8 +23,21 @@ interface Props {
 }
 
 const UploadStep: React.FC<Props> = ({
-  collection, codeUploadMode, repoName, groupName, uploadProps,
-  disableUpload, disableReason, mixWarning, lastSubmittedCount, onDismissSubmitted, onBack,
+  collection,
+  codeUploadMode,
+  repoName,
+  groupName,
+  filterTestFiles,
+  onFilterTestFilesChange,
+  codeFilesOnly,
+  onCodeFilesOnlyChange,
+  uploadProps,
+  disableUpload,
+  disableReason,
+  mixWarning,
+  lastSubmittedCount,
+  onDismissSubmitted,
+  onBack,
 }) => {
   // Auto-dismiss the submitted banner after 6 seconds
   useEffect(() => {
@@ -37,27 +50,57 @@ const UploadStep: React.FC<Props> = ({
     <div>
       <h2 className="text-lg font-semibold text-foreground mb-1">Upload Your Files</h2>
       <div className="text-sm text-muted-foreground mb-5 space-y-0.5">
-        <p>Collection: <span className="font-medium text-foreground">{collection}</span></p>
+        <p>
+          Collection: <span className="font-medium text-foreground">{collection}</span>
+        </p>
         {collection === "codebase" && codeUploadMode === "zip" && (
-          <p>Upload zip files <span className="text-xs">(zip filename becomes the repo name)</span></p>
+          <p>
+            Upload zip files <span className="text-xs">(zip filename becomes the repo name)</span>
+          </p>
         )}
         {collection === "codebase" && codeUploadMode === "individual" && repoName && (
-          <p>Uploading to repo: <span className="font-medium text-foreground">"{repoName}"</span></p>
+          <p>
+            Uploading to repo: <span className="font-medium text-foreground">"{repoName}"</span>
+          </p>
         )}
         {collection === "general" && groupName && (
-          <p>Document group: <span className="font-medium text-foreground">"{groupName}"</span></p>
+          <p>
+            Document group: <span className="font-medium text-foreground">"{groupName}"</span>
+          </p>
         )}
       </div>
 
-      {lastSubmittedCount > 0 && (
-        <div className="flex items-center gap-2 mb-4 px-3 py-2 rounded-lg bg-success/15 border border-success/30 text-sm text-success">
-          <CheckCircle size={16} className="shrink-0" />
-          <span>
-            {lastSubmittedCount} file{lastSubmittedCount > 1 ? "s" : ""} submitted for processing. Track progress below.
-          </span>
-          <button onClick={onDismissSubmitted} className="ml-auto text-success/70 hover:text-success">
-            <X size={14} />
-          </button>
+      {collection === "codebase" && codeUploadMode === "zip" && (
+        <div className="mb-1 space-y-4 flex">
+          <div>
+            <label
+              className="flex items-center gap-2 cursor-pointer text-sm text-foreground"
+              title="When checked, only source code, documentation and config files are embedded. Data and asset files (.csv, .jsonl, .xlsx, .pdf, images, archives, databases, keys, …) inside the zip are skipped. Uncheck to embed every file type."
+            >
+              <input
+                type="checkbox"
+                checked={codeFilesOnly}
+                onChange={(e) => onCodeFilesOnlyChange(e.target.checked)}
+                className="w-4 h-4 rounded border-border text-primary focus:ring-brand-cyan"
+              />
+              Code files only
+            </label>
+          </div>
+
+          <div className="pl-5">
+            <label
+              className="flex items-center gap-2 cursor-pointer text-sm text-foreground"
+              title="When checked, test files (foo.test.ts, test_bar.py, *_test.go, etc.) and test directories (test/, tests/, __tests__/, spec/, …) inside the zip are not embedded. Uncheck to include test code alongside the rest."
+            >
+              <input
+                type="checkbox"
+                checked={filterTestFiles}
+                onChange={(e) => onFilterTestFilesChange(e.target.checked)}
+                className="w-4 h-4 rounded border-border text-primary focus:ring-brand-cyan"
+              />
+              Filter out test files
+            </label>
+          </div>
         </div>
       )}
 

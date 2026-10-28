@@ -394,6 +394,128 @@ async fn process_website_scrapes_pages_concurrently() {
 }
 
 #[tokio::test]
+async fn crawl_populates_html_cache_and_scrape_consumes_it_once() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_handler = hits.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr: SocketAddr = listener.local_addr().unwrap();
+    let app = Router::new().route(
+        "/cached",
+        get(move || {
+            let hits = hits_handler.clone();
+            async move {
+                let n = hits.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    (
+                        axum::http::StatusCode::OK,
+                        Html(
+                            "<html><head><title>Cached</title></head>\
+                             <body><h1>Cached Heading</h1><p>From crawl cache.</p></body></html>",
+                        ),
+                    )
+                } else {
+                    (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        Html("server error"),
+                    )
+                }
+            }
+        }),
+    );
+    let (shutdown, shutdown_rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .ok();
+    });
+
+    let url = format!("http://{addr}/cached");
+    let crawled = website::crawl_website(&url, 0, true, None)
+        .await
+        .expect("crawl");
+    assert_eq!(crawled, vec![url.clone()]);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+    let chunks = website::process_website(&crawled, &Map::new())
+        .await
+        .expect("scrape from cache");
+    assert_eq!(chunks.len(), 1);
+    assert!(chunks[0].content.contains("From crawl cache."));
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "scrape should consume cached HTML without hitting server a second time"
+    );
+
+    let second = website::process_website(&crawled, &Map::new())
+        .await
+        .expect("second scrape after cache entry was consumed");
+    assert!(
+        second.is_empty(),
+        "cache entry must be evicted once consumed so second scrape hits the 500 response"
+    );
+    website::clear_html_cache();
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn process_website_with_progress_aborts_on_cancellation() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr: SocketAddr = listener.local_addr().unwrap();
+    let app = Router::new().route(
+        "/slow",
+        get(|| async {
+            sleep(Duration::from_secs(5)).await;
+            Html("<html><body><h1>Slow</h1><p>Content</p></body></html>")
+        }),
+    );
+    let (shutdown, shutdown_rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .ok();
+    });
+
+    let cancellation = CancellationToken::new();
+    let cancel_for_task = cancellation.clone();
+    let urls = vec![format!("http://{addr}/slow")];
+    let started = std::time::Instant::now();
+    let handle = tokio::spawn(async move {
+        website::process_website_with_progress(
+            &urls,
+            &Map::new(),
+            None,
+            false,
+            None,
+            Some(&cancel_for_task),
+        )
+        .await
+    });
+    sleep(Duration::from_millis(80)).await;
+    cancellation.cancel();
+
+    let err = handle.await.unwrap().unwrap_err();
+    let _ = shutdown.send(());
+    assert!(
+        mcp_nano_lib::worker::is_job_cancelled(&err),
+        "expected JobCancelled, got {err:#}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "cancellation should abort in-flight request promptly"
+    );
+}
+
+#[tokio::test]
 async fn crawl_website_gojs_api_discovers_symbol_pages() {
     std::env::set_var("WEBSITE_CRAWL_MAX_PAGES", "500");
     let start = "https://gojs.net/latest/api/";
@@ -558,6 +680,7 @@ async fn gojs_api_crawl_and_embed_e2e() {
                 "group": group,
             }),
             noop_progress(),
+            CancellationToken::new(),
         )
         .await
         .expect("embed gojs pages");

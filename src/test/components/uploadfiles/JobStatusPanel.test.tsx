@@ -60,6 +60,23 @@ describe('JobStatusPanel', () => {
     expect(screen.getByText('pdf-extract panicked')).toBeInTheDocument()
   })
 
+  it('renders cancelled jobs', () => {
+    const jobs = [
+      {
+        job_id: 'j-cancel',
+        status: 'CANCELLED',
+        progress_percentage: 100,
+        file_name: 'stopped.zip',
+        created_at: null,
+        message: 'Cancelled by user',
+      },
+    ]
+    renderWithProviders(<JobStatusPanel processing={false} activeJobs={[]} completedJobs={jobs} />)
+    expect(screen.getByText('stopped.zip')).toBeInTheDocument()
+    expect(screen.getByText('Cancelled')).toBeInTheDocument()
+    expect(screen.getByText('Cancelled by user')).toBeInTheDocument()
+  })
+
   it('shows Untitled when file_name is null instead of a bare GUID', () => {
     const jobs = [
       { job_id: 'abc-123-guid', status: 'PENDING', progress_percentage: 0, file_name: null, created_at: null },

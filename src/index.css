@@ -653,6 +653,7 @@
   .sidebar-block-logo {
     width: 100%;
     height: auto;
+    shape-rendering: crispEdges;
   }
 
   /* Logo block fills - Light mode (dark navy, matching --foreground) */

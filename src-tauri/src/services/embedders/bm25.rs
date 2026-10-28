@@ -12,6 +12,7 @@ use std::io::Cursor;
 use std::sync::OnceLock;
 
 use anyhow::Result;
+use rayon::prelude::*;
 use rust_stemmers::{Algorithm, Stemmer};
 
 use super::traits::{SparseEmbed, SparseVector};
@@ -88,12 +89,12 @@ impl Bm25Embedder {
 
     /// Document embedding: TF-saturation weights (IDF applied by Qdrant).
     pub fn embed_documents(&self, texts: &[&str]) -> Result<Vec<SparseVector>> {
-        Ok(texts.iter().map(|t| self.embed_document(t)).collect())
+        Ok(texts.par_iter().map(|t| self.embed_document(t)).collect())
     }
 
     /// Query embedding: unique tokens with weight 1.0 (fastembed `query_embed`).
     pub fn embed_queries(&self, texts: &[&str]) -> Result<Vec<SparseVector>> {
-        Ok(texts.iter().map(|t| self.embed_query(t)).collect())
+        Ok(texts.par_iter().map(|t| self.embed_query(t)).collect())
     }
 
     fn embed_document(&self, text: &str) -> SparseVector {
