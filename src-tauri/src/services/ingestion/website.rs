@@ -19,7 +19,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use futures_util::stream::StreamExt;
@@ -50,6 +50,9 @@ pub type CrawlProgressCallback = Arc<dyn Fn(CrawlProgressEvent) + Send + Sync>;
 
 const REQUEST_TIMEOUT_SECS: u64 = 3;
 const SITEMAP_DISCOVERY_CONCURRENCY: usize = 8;
+const MAX_PAGE_BYTES: usize = 10 * 1024 * 1024;
+const MAX_SITEMAP_BYTES: usize = 52_428_800;
+const MAX_DECODED_SITEMAP_BYTES: usize = 104_857_600;
 const MAX_CACHED_PAGE_BYTES: usize = 4 * 1024 * 1024;
 const HTML_CACHE_TTL_SECS: u64 = 300;
 const MERGE_MIN_TOKENS: usize = 512;
@@ -131,13 +134,29 @@ const LEAF_TEXT_TAGS: &[&str] = &[
 ];
 
 /// Maximum pages fetched in a single crawl. Sitemap discovery is not limited
-/// by this value, so a large sitemap remains fully selectable in the UI.
+/// by this value; [`max_result_urls`] caps how many URLs are handed to the UI.
 fn max_pages() -> usize {
     std::env::var("WEBSITE_CRAWL_MAX_PAGES")
         .ok()
         .and_then(|v| v.parse().ok())
         .map(|value| if value == 0 { usize::MAX } else { value })
         .unwrap_or(1000)
+}
+
+fn max_result_urls() -> usize {
+    std::env::var("WEBSITE_CRAWL_MAX_RESULTS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|value| value.max(1))
+        .unwrap_or(5000)
+}
+
+fn max_pending_urls() -> usize {
+    std::env::var("WEBSITE_CRAWL_MAX_PENDING")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|value| value.max(1))
+        .unwrap_or(20_000)
 }
 
 fn max_sitemaps() -> usize {
@@ -266,6 +285,12 @@ fn schedule_html_cache_ttl(expected_generation: u64) {
 fn store_cached_page(url_str: &str, content_type: &str, response_url: &Url, body: &str) {
     let max_bytes = html_cache_max_bytes();
     if max_bytes == 0 || body.is_empty() || body.len() > MAX_CACHED_PAGE_BYTES {
+        if body.len() > MAX_CACHED_PAGE_BYTES {
+            tracing::warn!(
+                "crawl: cache skip url={url_str} bytes={} reason=too_large",
+                body.len()
+            );
+        }
         return;
     }
     let Some(key) = cache_key(url_str) else {
@@ -474,6 +499,12 @@ async fn render_page(url: &str, browser: &PathBuf) -> anyhow::Result<String> {
     if !output.status.success() {
         anyhow::bail!("browser exited with status {}", output.status);
     }
+    if output.stdout.len() > MAX_PAGE_BYTES {
+        anyhow::bail!(
+            "rendered DOM too large ({} bytes, cap {MAX_PAGE_BYTES})",
+            output.stdout.len()
+        );
+    }
     String::from_utf8(output.stdout).context("browser returned non-UTF-8 HTML")
 }
 
@@ -667,28 +698,83 @@ async fn request_response(
     url: Url,
     cancellation: Option<&CancellationToken>,
 ) -> Option<reqwest::Response> {
-    cancel_aware(client.get(url).send(), cancellation)
-        .await
-        .and_then(|response| response.ok())
+    let url_str = url.to_string();
+    let Some(result) = cancel_aware(client.get(url).send(), cancellation).await else {
+        tracing::warn!("crawl: request cancelled url={url_str}");
+        return None;
+    };
+    match result {
+        Ok(response) if response.status().is_success() => Some(response),
+        Ok(response) => {
+            tracing::debug!(
+                "crawl: request status url={url_str} status={}",
+                response.status()
+            );
+            None
+        }
+        Err(error) => {
+            tracing::warn!("crawl: request error url={url_str}: {error:#}");
+            None
+        }
+    }
+}
+
+/// Read at most `max_bytes` from a response body, streaming so an oversized or
+/// decompression-bomb response is skipped instead of exhausting memory.
+async fn read_body_capped(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+    cancellation: Option<&CancellationToken>,
+    url: &str,
+) -> Option<Vec<u8>> {
+    let mut body = Vec::new();
+    loop {
+        let Some(result) = cancel_aware(response.chunk(), cancellation).await else {
+            tracing::debug!("crawl: body read cancelled url={url}");
+            return None;
+        };
+        let chunk = match result {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                tracing::warn!("crawl: body read error url={url}: {error:#}");
+                return None;
+            }
+        };
+        let Some(chunk) = chunk else {
+            break;
+        };
+        if body.len() + chunk.len() > max_bytes {
+            tracing::warn!(
+                "crawl: body exceeds cap url={url} cap={max_bytes} partial={}",
+                body.len()
+            );
+            return None;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Some(body)
+}
+
+fn decode_body(body: &[u8], content_type: &str) -> String {
+    let encoding = content_type
+        .split(';')
+        .find_map(|part| {
+            let (key, value) = part.split_once('=')?;
+            key.trim()
+                .eq_ignore_ascii_case("charset")
+                .then(|| value.trim().trim_matches('"'))
+        })
+        .and_then(|label| encoding_rs::Encoding::for_label(label.as_bytes()))
+        .unwrap_or(encoding_rs::UTF_8);
+    encoding.decode(body).0.into_owned()
 }
 
 async fn response_bytes(
     response: reqwest::Response,
     cancellation: Option<&CancellationToken>,
+    url: &str,
 ) -> Option<Vec<u8>> {
-    cancel_aware(response.bytes(), cancellation)
-        .await
-        .and_then(|bytes| bytes.ok())
-        .map(|bytes| bytes.to_vec())
-}
-
-async fn response_text(
-    response: reqwest::Response,
-    cancellation: Option<&CancellationToken>,
-) -> Option<String> {
-    cancel_aware(response.text(), cancellation)
-        .await
-        .and_then(|body| body.ok())
+    read_body_capped(response, MAX_SITEMAP_BYTES, cancellation, url).await
 }
 
 /// Fetch `url`, returning the body and the final (post-redirect) URL when
@@ -698,12 +784,14 @@ async fn fetch_body(
     url: Url,
     cancellation: Option<&CancellationToken>,
 ) -> Option<(Vec<u8>, Url)> {
+    let url_str = url.to_string();
     let response = request_response(client, url, cancellation).await?;
-    if !response.status().is_success() {
-        return None;
-    }
     let response_url = response.url().clone();
-    let body = response_bytes(response, cancellation).await?;
+    let body = response_bytes(response, cancellation, &url_str).await?;
+    tracing::debug!(
+        "crawl: body url={url_str} final={response_url} bytes={}",
+        body.len()
+    );
     Some((body, response_url))
 }
 
@@ -719,26 +807,37 @@ async fn fetch_page(
 ) -> Option<(String, Url, String)> {
     if browser.is_none() {
         if let Some(cached) = peek_cached_page(url_str) {
+            tracing::debug!("crawl: cache hit url={url_str} bytes={}", cached.2.len());
             return Some(cached);
         }
     }
     if let Some(browser) = browser {
         match cancel_aware(render_page(url_str, browser), cancellation).await? {
             Ok(rendered) if !rendered.trim().is_empty() => {
+                tracing::info!("crawl: rendered url={url_str} bytes={}", rendered.len());
                 let parsed = Url::parse(url_str).ok()?;
                 return Some(("text/html".to_string(), parsed, rendered));
             }
             Ok(_) => {}
             Err(error) => {
-                tracing::debug!("JavaScript render failed for {url_str}: {error:#}");
+                tracing::warn!("crawl: render failed url={url_str}: {error:#}");
             }
         }
     }
-    let response = cancel_aware(client.get(url_str).send(), cancellation).await?;
-    let Ok(resp) = response else {
+    let Some(response) = cancel_aware(client.get(url_str).send(), cancellation).await else {
+        tracing::warn!("crawl: fetch cancelled url={url_str}");
         return None;
     };
-    if !resp.status().is_success() {
+    let resp = match response {
+        Ok(resp) => resp,
+        Err(error) => {
+            tracing::warn!("crawl: fetch error url={url_str}: {error:#}");
+            return None;
+        }
+    };
+    let status = resp.status();
+    if !status.is_success() {
+        tracing::warn!("crawl: fetch status url={url_str} status={status}");
         return None;
     }
     let content_type = resp
@@ -748,7 +847,25 @@ async fn fetch_page(
         .unwrap_or_default()
         .to_string();
     let response_url = resp.url().clone();
-    let body = response_text(resp, cancellation).await?;
+    tracing::info!(
+        "crawl: fetch url={url_str} status={} content_type={content_type:?} final={response_url}",
+        status.as_u16()
+    );
+    let body = match read_body_capped(resp, MAX_PAGE_BYTES, cancellation, url_str).await {
+        Some(bytes) => decode_body(&bytes, &content_type),
+        None => return None,
+    };
+    if body.len() > MAX_CACHED_PAGE_BYTES {
+        tracing::warn!(
+            "crawl: large body url={url_str} final={response_url} bytes={}",
+            body.len()
+        );
+    } else {
+        tracing::debug!(
+            "crawl: body url={url_str} final={response_url} bytes={}",
+            body.len()
+        );
+    }
     Some((content_type, response_url, body))
 }
 
@@ -761,6 +878,10 @@ async fn discover_sitemap_urls(
 ) -> Vec<String> {
     let origin = origin_url(start);
     let mut pending: VecDeque<Url> = sitemap_seed_urls(start).into();
+    tracing::debug!(
+        "sitemap: discover origin={origin} render_javascript={render_javascript} seeds={}",
+        pending.len()
+    );
 
     let robots_url = origin.join("robots.txt").unwrap_or_else(|_| origin.clone());
     let start_str = start.to_string();
@@ -774,6 +895,12 @@ async fn discover_sitemap_urls(
     let (robots_res, start_res) = tokio::join!(
         fetch_body(client, robots_url, cancellation.as_ref()),
         fetch_page(client, &start_str, None, cancellation.as_ref()),
+    );
+    tracing::debug!(
+        "sitemap: probes origin={origin} robots={} start_page={} pending={}",
+        robots_res.is_some(),
+        start_res.is_some(),
+        pending.len()
     );
 
     if let Some((body, _)) = robots_res {
@@ -884,6 +1011,17 @@ async fn discover_sitemap_urls(
 
     urls.sort();
     urls.dedup();
+    tracing::info!(
+        "sitemap: discovered urls={} sitemaps={}",
+        urls.len(),
+        seen_sitemaps.len()
+    );
+    if urls.len() >= urls_cap {
+        tracing::warn!("sitemap: url cap reached cap={urls_cap}");
+    }
+    if seen_sitemaps.len() >= sitemaps_cap {
+        tracing::warn!("sitemap: sitemap cap reached cap={sitemaps_cap}");
+    }
     urls
 }
 
@@ -894,7 +1032,6 @@ async fn fetch_sitemap_body(
     url: Url,
     cancellation: Option<&CancellationToken>,
 ) -> Option<(Vec<u8>, Url)> {
-    const MAX_SITEMAP_BYTES: usize = 52_428_800;
     let (body, response_url) = fetch_body(client, url, cancellation).await?;
     if body.len() > MAX_SITEMAP_BYTES {
         return None;
@@ -906,12 +1043,16 @@ fn gunzip(body: Vec<u8>) -> Option<Vec<u8>> {
     if !body.starts_with(&[0x1f, 0x8b]) {
         return Some(body);
     }
+    use std::io::Read;
     let mut decoded = Vec::new();
-    std::io::Read::read_to_end(
-        &mut flate2::read::GzDecoder::new(body.as_slice()),
-        &mut decoded,
-    )
-    .ok()?;
+    flate2::read::GzDecoder::new(body.as_slice())
+        .take(MAX_DECODED_SITEMAP_BYTES as u64 + 1)
+        .read_to_end(&mut decoded)
+        .ok()?;
+    if decoded.len() > MAX_DECODED_SITEMAP_BYTES {
+        tracing::warn!("sitemap: decoded body exceeds cap cap={MAX_DECODED_SITEMAP_BYTES}");
+        return None;
+    }
     Some(decoded)
 }
 
@@ -1028,6 +1169,8 @@ struct CrawlRun {
     depth: usize,
     same_domain_only: bool,
     max_pages: usize,
+    max_results: usize,
+    max_pending: usize,
     bfs_in_flight: AtomicUsize,
     notify: tokio::sync::Notify,
     visited: Arc<tokio::sync::Mutex<HashSet<String>>>,
@@ -1045,11 +1188,20 @@ pub async fn crawl_website_with_options_and_cancellation(
     cancellation: Option<CancellationToken>,
     on_progress: Option<CrawlProgressCallback>,
 ) -> anyhow::Result<Vec<String>> {
+    let started = Instant::now();
     let normalized_start = normalize_website_url(start_url)?;
     let start = Url::parse(&normalized_start)?;
+    tracing::info!(
+        "crawl: start url={} depth={depth} same_domain_only={same_domain_only} render_javascript={render_javascript}",
+        start
+    );
     let start_key = canonical_url(&start);
 
     let browser = resolve_browser(render_javascript);
+    tracing::debug!(
+        "crawl: browser={:?}",
+        browser.as_ref().map(|path| path.display().to_string())
+    );
     let client = http_client()?;
     let sitemap_urls = discover_sitemap_urls(
         &client,
@@ -1059,6 +1211,11 @@ pub async fn crawl_website_with_options_and_cancellation(
         on_progress.as_ref(),
     )
     .await;
+    tracing::info!(
+        "crawl: sitemap discovery done url={} urls={}",
+        start,
+        sitemap_urls.len()
+    );
 
     // The queue stores the fetch URL (directory paths keep their trailing
     // slash, which affects relative link resolution) + depth.
@@ -1071,6 +1228,8 @@ pub async fn crawl_website_with_options_and_cancellation(
         depth,
         same_domain_only,
         max_pages: max_pages(),
+        max_results: max_result_urls(),
+        max_pending: max_pending_urls(),
         bfs_in_flight: AtomicUsize::new(0),
         notify: tokio::sync::Notify::new(),
         visited: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
@@ -1086,6 +1245,11 @@ pub async fn crawl_website_with_options_and_cancellation(
 
     let concurrency = crawl_concurrency(render_javascript);
     let delay_ms = crawl_delay_ms();
+    tracing::info!(
+        "crawl: queue start url={} concurrency={concurrency} delay_ms={delay_ms} max_pages={}",
+        start,
+        run.max_pages
+    );
     let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
     let mut handles = Vec::new();
 
@@ -1176,10 +1340,21 @@ pub async fn crawl_website_with_options_and_cancellation(
         .is_some_and(CancellationToken::is_cancelled)
     {
         clear_html_cache();
+        tracing::warn!(
+            "crawl: cancelled url={} elapsed_ms={}",
+            start,
+            started.elapsed().as_millis()
+        );
         anyhow::bail!("website crawl cancelled");
     }
     schedule_html_cache_ttl(current_cache_generation());
     let urls = run.results.lock().await.clone();
+    tracing::info!(
+        "crawl: done url={} urls={} elapsed_ms={}",
+        start,
+        urls.len(),
+        started.elapsed().as_millis()
+    );
     if let Some(cb) = run.on_progress.as_ref() {
         cb(CrawlProgressEvent {
             url: String::new(),
@@ -1198,6 +1373,13 @@ async fn enqueue_sitemap_urls(run: &CrawlRun, sitemap_urls: Vec<String>) {
     let mut results = Vec::new();
     let mut seen = run.seen.lock().await;
     for sitemap_url in sitemap_urls {
+        if results.len() >= run.max_results {
+            tracing::warn!(
+                "crawl: result cap reached cap={} source=sitemap",
+                run.max_results
+            );
+            break;
+        }
         let Some(url) = normalize_url(&sitemap_url, &run.start) else {
             continue;
         };
@@ -1217,6 +1399,11 @@ async fn enqueue_sitemap_urls(run: &CrawlRun, sitemap_urls: Vec<String>) {
         }
     }
     drop(seen);
+    tracing::debug!(
+        "crawl: sitemap queue urls={} results={}",
+        queue.len(),
+        results.len()
+    );
     *run.sitemap_queue.lock().await = queue;
     run.results.lock().await.extend(results);
 }
@@ -1228,8 +1415,10 @@ async fn crawl_page(run: Arc<CrawlRun>, url_str: String, cur_depth: usize) {
         .as_ref()
         .is_some_and(CancellationToken::is_cancelled)
     {
+        tracing::debug!("crawl: page skipped (cancelled) url={url_str}");
         return;
     }
+    tracing::info!("crawl: page start url={url_str} depth={cur_depth}");
     let Some((content_type, response_url, body)) = fetch_page(
         &run.client,
         &url_str,
@@ -1238,22 +1427,31 @@ async fn crawl_page(run: Arc<CrawlRun>, url_str: String, cur_depth: usize) {
     )
     .await
     else {
+        tracing::info!("crawl: page failed url={url_str} depth={cur_depth}");
         return;
     };
     let document_base = resolve_document_base(&url_str, response_url);
     let result_key = canonical_url(&document_base);
     if !is_html_response(&content_type, &body) {
+        tracing::info!(
+            "crawl: page skipped url={url_str} content_type={content_type:?} bytes={} reason=not_html",
+            body.len()
+        );
         return;
     }
     store_cached_page(&result_key, &content_type, &document_base, &body);
 
     let found_count = {
         let mut results = run.results.lock().await;
-        if !results.iter().any(|u| u == &result_key) {
+        if results.len() < run.max_results && !results.iter().any(|u| u == &result_key) {
             results.push(result_key.clone());
         }
         results.len()
     };
+    tracing::info!(
+        "crawl: page done url={url_str} final={result_key} depth={cur_depth} bytes={} found_count={found_count}",
+        body.len()
+    );
     if let Some(cb) = run.on_progress.as_ref() {
         cb(CrawlProgressEvent {
             url: result_key,
@@ -1266,10 +1464,21 @@ async fn crawl_page(run: Arc<CrawlRun>, url_str: String, cur_depth: usize) {
         return;
     }
     let found = extract_page_links(&body, &document_base, run.same_domain_only, &run.start);
+    tracing::info!(
+        "crawl: links url={url_str} depth={cur_depth} found={}",
+        found.len()
+    );
     let mut seen = run.seen.lock().await;
     let mut queue = run.queue.lock().await;
     let mut enqueued = false;
     for url in found {
+        if seen.len() >= run.max_pending {
+            tracing::warn!(
+                "crawl: pending url cap reached cap={} url={url_str}",
+                run.max_pending
+            );
+            break;
+        }
         let Ok(parsed) = Url::parse(&url) else {
             continue;
         };
@@ -1278,7 +1487,9 @@ async fn crawl_page(run: Arc<CrawlRun>, url_str: String, cur_depth: usize) {
             queue.push_back((url, cur_depth + 1));
             let count = {
                 let mut res = run.results.lock().await;
-                res.push(key.clone());
+                if res.len() < run.max_results {
+                    res.push(key.clone());
+                }
                 res.len()
             };
             if let Some(cb) = run.on_progress.as_ref() {
@@ -1407,10 +1618,15 @@ async fn scrape_page(
                     .unwrap_or_default()
                     .to_string();
                 let response_url = resp.url().clone();
-                let body = cancel_aware(resp.text(), cancellation)
-                    .await
-                    .ok_or(crate::worker::JobCancelled)?
-                    .map_err(|e| anyhow::anyhow!("reading body: {e}"))?;
+                let body = match read_body_capped(resp, MAX_PAGE_BYTES, cancellation, &url).await {
+                    Some(bytes) => decode_body(&bytes, &content_type),
+                    None if cancellation.is_some_and(CancellationToken::is_cancelled) => {
+                        return Err(crate::worker::JobCancelled.into());
+                    }
+                    None => {
+                        anyhow::bail!("page body exceeds {MAX_PAGE_BYTES} bytes or is unreadable")
+                    }
+                };
                 (content_type, response_url, body)
             }
             Ok(resp) => anyhow::bail!("failed to load page: HTTP {}", resp.status()),

@@ -48,6 +48,7 @@ ort = { version = "=2.0.0-rc.12", default-features = true }
 tokenizers = { version = "0.23.1", default-features = false }
 text-splitter = { version = "0.32.0", features = ["tokenizers", "markdown"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "http2", "charset", "json", "gzip"] }
+encoding_rs = "0.8"
 scraper = "0.27.0"
 flate2 = "1.1.5"
 rayon = "1.12.0"

@@ -10,6 +10,8 @@ interface UrlGroup {
   urls: string[];
 }
 
+const MAX_PATH_SEGMENTS = 64;
+
 interface Props {
   websiteUrl: string;
   crawledUrls: string[];
@@ -30,13 +32,29 @@ function sortUrls(urls: string[]): string[] {
   });
 }
 
+function parseUrl(raw: string): URL {
+  const trimmed = raw.trim();
+  return new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`);
+}
+
+function tryParseUrl(raw: string): URL | null {
+  try {
+    return parseUrl(raw);
+  } catch {
+    return null;
+  }
+}
+
 function buildUrlGroups(urls: string[], baseUrl: string): UrlGroup[] {
-  if (urls.length === 0) return [];
-  const baseHostname = new URL(baseUrl).hostname;
+  const parsedUrls = urls.flatMap((url) => {
+    const parsed = tryParseUrl(url);
+    return parsed ? [{ url, hostname: parsed.hostname }] : [];
+  });
+  if (parsedUrls.length === 0) return [];
+  const baseHostname = tryParseUrl(baseUrl)?.hostname ?? parsedUrls[0].hostname;
 
   const groups = new Map<string, string[]>();
-  for (const url of urls) {
-    const hostname = new URL(url).hostname;
+  for (const { url, hostname } of parsedUrls) {
     if (!groups.has(hostname)) groups.set(hostname, []);
     groups.get(hostname)!.push(url);
   }
@@ -59,15 +77,23 @@ function buildPathTree(urls: string[]): UrlTreeNode[] {
   const root: UrlTreeNode = { segment: "", fullPath: "/", depth: 0, children: [], url: null };
 
   for (const url of urls) {
-    const pathname = new URL(url).pathname.replace(/\/$/, "") || "/";
+    let pathname: string;
+    try {
+      pathname = new URL(url).pathname.replace(/\/$/, "") || "/";
+    } catch {
+      continue;
+    }
     const segments = pathname === "/" ? [] : pathname.slice(1).split("/");
+    const capped = segments.length > MAX_PATH_SEGMENTS
+      ? [...segments.slice(0, MAX_PATH_SEGMENTS - 1), segments.slice(MAX_PATH_SEGMENTS - 1).join("/")]
+      : segments;
 
     let node = root;
-    for (let i = 0; i < segments.length; i++) {
-      let child = node.children.find(c => c.segment === segments[i]);
+    for (let i = 0; i < capped.length; i++) {
+      let child = node.children.find(c => c.segment === capped[i]);
       if (!child) {
-        const childPath = "/" + segments.slice(0, i + 1).join("/");
-        child = { segment: segments[i], fullPath: childPath, depth: node.depth + 1, children: [], url: null };
+        const childPath = "/" + capped.slice(0, i + 1).join("/");
+        child = { segment: capped[i], fullPath: childPath, depth: node.depth + 1, children: [], url: null };
         node.children.push(child);
       }
       node = child;
@@ -117,7 +143,12 @@ const WebsiteProcessingStep: React.FC<Props> = ({
   const [collapsedHosts, setCollapsedHosts] = useState<Set<string>>(new Set());
   const [collapsedPaths, setCollapsedPaths] = useState<Set<string>>(new Set());
 
-  const urlGroups = useMemo(() => buildUrlGroups(crawledUrls, websiteUrl), [crawledUrls, websiteUrl]);
+  const validUrls = useMemo(
+    () => crawledUrls.filter((url) => tryParseUrl(url) !== null),
+    [crawledUrls],
+  );
+
+  const urlGroups = useMemo(() => buildUrlGroups(validUrls, websiteUrl), [validUrls, websiteUrl]);
 
   const { pathTrees, branchLeaves, allBranchPaths } = useMemo(() => {
     const treeMap = new Map<string, UrlTreeNode[]>();
@@ -139,8 +170,8 @@ const WebsiteProcessingStep: React.FC<Props> = ({
   }, [urlGroups]);
 
   useEffect(() => {
-    setChecked(new Set(crawledUrls));
-  }, [crawledUrls]);
+    setChecked(new Set(validUrls));
+  }, [validUrls]);
 
   useEffect(() => {
     if (urlGroups.length > 0) {
@@ -175,9 +206,9 @@ const WebsiteProcessingStep: React.FC<Props> = ({
   }, [checked]);
 
   const toggleAll = useCallback(() => {
-    const allChecked = checked.size === crawledUrls.length;
-    setChecked(allChecked ? new Set() : new Set(crawledUrls));
-  }, [checked, crawledUrls]);
+    const allChecked = checked.size === validUrls.length;
+    setChecked(allChecked ? new Set() : new Set(validUrls));
+  }, [checked, validUrls]);
 
   const toggleHostCollapse = useCallback((hostname: string) => {
     setCollapsedHosts(prev => {
@@ -224,10 +255,17 @@ const WebsiteProcessingStep: React.FC<Props> = ({
           </div>
         )}
 
-        {crawledUrls.length > 0 && (
+        {crawledUrls.length > 0 && validUrls.length === 0 && (
+          <div className="flex items-start gap-2 mb-4 px-3 py-2.5 rounded-lg bg-warning/10 border border-warning/40 text-sm text-warning">
+            <AlertTriangle size={16} className="shrink-0 mt-0.5" />
+            <span>No usable URLs were returned by the crawl.</span>
+          </div>
+        )}
+
+        {validUrls.length > 0 && (
           <>
             <p className="text-sm text-muted-foreground mb-4">
-              Found <span className="font-semibold text-foreground">{crawledUrls.length}</span> URLs from{" "}
+              Found <span className="font-semibold text-foreground">{validUrls.length}</span> URLs from{" "}
               <span className="font-medium text-foreground break-all">{websiteUrl}</span>.
               Deselect URLs you don't want embedded.
             </p>
@@ -237,12 +275,12 @@ const WebsiteProcessingStep: React.FC<Props> = ({
                 <label className="flex items-center gap-2 cursor-pointer select-none">
                   <input
                     type="checkbox"
-                    checked={totalChecked === crawledUrls.length && crawledUrls.length > 0}
+                    checked={totalChecked === validUrls.length && validUrls.length > 0}
                     onChange={toggleAll}
                     className="w-4 h-4 rounded accent-primary cursor-pointer"
                   />
                   <span className="text-sm font-medium text-foreground">
-                    {totalChecked === crawledUrls.length ? "Deselect all" : "Select all"} ({totalChecked} of {crawledUrls.length})
+                    {totalChecked === validUrls.length ? "Deselect all" : "Select all"} ({totalChecked} of {validUrls.length})
                   </span>
                 </label>
                 <div className="flex gap-1">
