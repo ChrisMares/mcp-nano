@@ -94,7 +94,7 @@ jobs:
           CARGO_PROFILE_TEST_DEBUG: "0"
         run: |
           cargo clippy --all-targets ${{ matrix.args }} -- -D warnings
-          cargo test --all-targets ${{ matrix.args }}
+          cargo test --all-targets --no-fail-fast ${{ matrix.args }}
 
       - uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5
         env:

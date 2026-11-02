@@ -2380,14 +2380,11 @@ mod tests {
         let bin = dir.path().join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         std::fs::write(bin.join("google-chrome"), b"#!/bin/sh\n").unwrap();
-        let path_value = format!("{}:{}", bin.display(), dir.path().join("missing").display());
+        let path_value = std::env::join_paths([bin.clone(), dir.path().join("missing")]).unwrap();
         assert_eq!(
-            find_on_path(std::ffi::OsStr::new(&path_value), "google-chrome"),
+            find_on_path(&path_value, "google-chrome"),
             Some(bin.join("google-chrome"))
         );
-        assert_eq!(
-            find_on_path(std::ffi::OsStr::new(&path_value), "chromium"),
-            None
-        );
+        assert_eq!(find_on_path(&path_value, "chromium"), None);
     }
 }
