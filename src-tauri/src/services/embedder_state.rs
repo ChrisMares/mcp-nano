@@ -131,21 +131,21 @@ impl EmbedderState {
         #[cfg(all(feature = "directml", target_os = "windows"))]
         {
             info!("Embedding device: DirectML (GPU)");
-            return (
+            (
                 InferenceDevice::DirectMl,
                 InferenceDevice::DirectMl.label().to_string(),
                 None,
-            );
+            )
         }
 
         #[cfg(all(feature = "cuda", target_os = "linux"))]
         {
             info!("Embedding device: CUDA (GPU 0)");
-            return (
+            (
                 InferenceDevice::Cuda,
                 InferenceDevice::Cuda.label().to_string(),
                 None,
-            );
+            )
         }
 
         #[cfg(not(any(
