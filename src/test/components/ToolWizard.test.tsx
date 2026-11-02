@@ -1,7 +1,6 @@
 import { describe, it, expect, vi } from 'vitest'
 import { screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import React from 'react'
 import ToolWizard from '@/components/mcp/ToolWizard'
 import { renderWithProviders } from '../helpers'
 
@@ -66,7 +65,7 @@ describe('ToolWizard', () => {
     renderWithProviders(
       <ToolWizard
         {...baseProps}
-        initialData={{ name: 'my-tool', description: 'my desc', selectedRepos: new Set(['repo-1']), selectedGroups: new Set(), selectedWebsites: new Set() }}
+        initialData={{ name: 'my-tool', description: 'my desc', selectedRepos: new Set(['repo-1']), selectedGroups: new Set(), selectedWebsites: new Set(), maxChunkLimit: 5 }}
       />
     )
     await user.click(screen.getByText('Next'))

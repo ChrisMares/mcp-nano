@@ -33,6 +33,9 @@ const POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Mirrors `STALE_TIMEOUT_MINUTES = 15`.
 const STALE_TIMEOUT_MINUTES: i64 = 15;
 
+/// Error message stored on jobs reclaimed by the stale timeout.
+const STALE_MESSAGE: &str = "Timed out: no progress update for 15 minutes";
+
 /// Start the worker poll loop. Returns the `JoinHandle` of the loop task so
 /// the caller can `.await` it if desired (typically just left running until
 /// `cancel` is triggered).
@@ -83,9 +86,19 @@ async fn run_loop(
             }
         }
 
-        // Reclaim stale RUNNING jobs.
-        if let Err(e) = reclaim_stale_jobs(&pool).await {
-            eprintln!("stale reclaim failed: {e:#}");
+        // Reclaim stale RUNNING jobs and delete their partial output. A
+        // reclaimed job still running in this process is stopped first so it
+        // cannot write after the cleanup.
+        match reclaim_stale_jobs(&pool).await {
+            Ok(stale) => {
+                for job in stale {
+                    cancellations.cancel(&job.job_id);
+                    warn!("worker: job {} timed out; cleaning up", job.job_id);
+                    finish_failed_job(&pool, app.as_ref(), &job, &job_params(&job), STALE_MESSAGE)
+                        .await;
+                }
+            }
+            Err(e) => error!("stale reclaim failed: {e:#}"),
         }
 
         // Claim PENDING jobs up to the available semaphore slots.
@@ -102,14 +115,6 @@ async fn run_loop(
                         let task = tokio::spawn(async move {
                             let _permit = sem.acquire_owned().await.expect("sem closed");
                             let job_id = job.job_id.clone();
-                            let file_name = job.file_name.clone();
-                            let params: serde_json::Value = job
-                                .task_params
-                                .as_deref()
-                                .and_then(|s| serde_json::from_str(s).ok())
-                                .unwrap_or(serde_json::Value::Null);
-                            let pool_for_fail = pool.clone();
-                            let app_for_fail = app.clone();
                             info!(
                                 "worker starting job_id={job_id} task={:?} file={:?}",
                                 job.task_name, job.file_name
@@ -132,8 +137,13 @@ async fn run_loop(
                                 job_cancel.cancel();
                             }
 
-                            let inner = tokio::spawn(async move {
-                                run_job(&pool, &registry, job, app, job_cancel).await;
+                            let inner = tokio::spawn({
+                                let pool = pool.clone();
+                                let app = app.clone();
+                                let job = job.clone();
+                                async move {
+                                    run_job(&pool, &registry, job, app, job_cancel).await;
+                                }
                             });
                             let joined = inner.await;
                             cancellations.remove(&job_id);
@@ -150,32 +160,14 @@ async fn run_loop(
                                     "job_panic",
                                     &format!("job_id={job_id} {msg}"),
                                 );
-                                if let Some(app) = app_for_fail.as_ref() {
-                                    progress::emit_job_event(
-                                        app,
-                                        "job_failed",
-                                        &progress::JobProgressEvent::new(
-                                            job_id.clone(),
-                                            100,
-                                            "FAILED",
-                                            file_name,
-                                            Some(msg.clone()),
-                                        ),
-                                    );
-                                }
-                                let _ = set_job_status(
-                                    &pool_for_fail,
-                                    &job_id,
-                                    "FAILED",
-                                    None,
-                                    Some(&msg),
-                                )
-                                .await;
-                                let _ = post_process_file_status(
-                                    &pool_for_fail,
-                                    &params,
-                                    "failed",
-                                    Some(&msg),
+                                let _ = set_job_status(&pool, &job_id, "FAILED", None, Some(&msg))
+                                    .await;
+                                finish_failed_job(
+                                    &pool,
+                                    app.as_ref(),
+                                    &job,
+                                    &job_params(&job),
+                                    &msg,
                                 )
                                 .await;
                             }
@@ -196,7 +188,10 @@ async fn run_loop(
 
     // Graceful shutdown: reset any still-RUNNING jobs to PENDING so the next
     // launch can pick them up.
-    warn!("worker shutting down: awaiting {} inflight tasks", inflight.len());
+    warn!(
+        "worker shutting down: awaiting {} inflight tasks",
+        inflight.len()
+    );
     for h in inflight {
         let _ = h.await;
     }
@@ -225,20 +220,9 @@ async fn run_job(
     let task_name = match &job.task_name {
         Some(n) => n.clone(),
         None => {
-            let _ = set_job_status(pool, &job_id, "FAILED", None, Some("missing task_name")).await;
-            if let Some(app) = app.as_ref() {
-                progress::emit_job_event(
-                    app,
-                    "job_failed",
-                    &progress::JobProgressEvent::new(
-                        job_id.clone(),
-                        100,
-                        "FAILED",
-                        file_name.clone(),
-                        Some("missing task_name".to_string()),
-                    ),
-                );
-            }
+            let msg = "missing task_name";
+            let _ = set_job_status(pool, &job_id, "FAILED", None, Some(msg)).await;
+            emit_job_failed(app.as_ref(), &job, msg);
             return;
         }
     };
@@ -248,28 +232,12 @@ async fn run_job(
         None => {
             let msg = format!("unknown task: {task_name}");
             let _ = set_job_status(pool, &job_id, "FAILED", None, Some(&msg)).await;
-            if let Some(app) = app.as_ref() {
-                progress::emit_job_event(
-                    app,
-                    "job_failed",
-                    &progress::JobProgressEvent::new(
-                        job_id.clone(),
-                        100,
-                        "FAILED",
-                        file_name.clone(),
-                        Some(msg),
-                    ),
-                );
-            }
+            emit_job_failed(app.as_ref(), &job, &msg);
             return;
         }
     };
 
-    let params: serde_json::Value = job
-        .task_params
-        .as_deref()
-        .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or(serde_json::Value::Null);
+    let params = job_params(&job);
 
     if let Some(app) = app.as_ref() {
         progress::emit_job_event(
@@ -301,12 +269,18 @@ async fn run_job(
     // flipped to CANCELLED by `cancel_job`, so the task's real outcome must
     // not overwrite it.
     if cancel.is_cancelled() || result.as_ref().err().is_some_and(is_job_cancelled) {
+        // The stale-job reclaim cancels the token after marking the row
+        // FAILED and cleaning up; keep that outcome.
+        if job_row_status(pool, &job_id).await.as_deref() == Some("FAILED") {
+            return;
+        }
         finish_cancelled_job(pool, app.as_ref(), &job_id, &task_name, &file_name, &params).await;
         return;
     }
 
     match result {
         Ok(msg) => {
+            info!("worker: job {job_id} finished: {msg}");
             if let Err(e) = update_job_progress(pool, &job_id, 100, None).await {
                 error!("final progress update failed for {job_id}: {e:#}");
             }
@@ -330,23 +304,9 @@ async fn run_job(
         }
         Err(e) => {
             let msg = format!("{e:#}");
-            if let Some(app) = app.as_ref() {
-                progress::emit_job_event(
-                    app,
-                    "job_failed",
-                    &progress::JobProgressEvent::new(
-                        job_id.clone(),
-                        100,
-                        "FAILED",
-                        file_name.clone(),
-                        Some(msg.clone()),
-                    ),
-                );
-            }
+            error!("worker: job {job_id} failed: {msg}");
             let _ = set_job_status(pool, &job_id, "FAILED", None, Some(&msg)).await;
-            if let Err(e) = post_process_file_status(pool, &params, "failed", Some(&msg)).await {
-                error!("file_metadata status update failed for {job_id}: {e:#}");
-            }
+            finish_failed_job(pool, app.as_ref(), &job, &params, &msg).await;
         }
     }
 }
@@ -357,13 +317,71 @@ async fn run_job(
 /// cancel that landed between the claim and the registration is only visible
 /// in the database, so the job cancels itself instead of running to the end.
 async fn job_row_is_cancelled(pool: &SqlitePool, job_id: &str) -> bool {
+    job_row_status(pool, job_id).await.as_deref() == Some("CANCELLED")
+}
+
+async fn job_row_status(pool: &SqlitePool, job_id: &str) -> Option<String> {
     sqlx::query_scalar::<_, String>("SELECT status FROM job_status WHERE job_id = ?")
         .bind(job_id)
         .fetch_optional(pool)
         .await
         .ok()
         .flatten()
-        .is_some_and(|status| status == "CANCELLED")
+}
+
+fn qdrant_from_app(app: Option<&AppHandle>) -> Option<QdrantService> {
+    app.and_then(|app| app.try_state::<crate::qdrant::QdrantState>())
+        .map(|state| QdrantService::new(state.client.clone()))
+}
+
+/// The job's `task_params` JSON, or `Null` when absent or unparsable.
+fn job_params(job: &JobStatus) -> serde_json::Value {
+    job.task_params
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or(serde_json::Value::Null)
+}
+
+fn emit_job_failed(app: Option<&AppHandle>, job: &JobStatus, message: &str) {
+    if let Some(app) = app {
+        progress::emit_job_event(
+            app,
+            "job_failed",
+            &progress::JobProgressEvent::new(
+                job.job_id.clone(),
+                100,
+                "FAILED",
+                job.file_name.clone(),
+                Some(message.to_string()),
+            ),
+        );
+    }
+}
+
+/// Terminal handling for a failed job whose row is already `FAILED`: mark
+/// its `file_metadata` failed, tell the UI, and delete the vectors and
+/// uploads it wrote so a partial index is not left searchable.
+async fn finish_failed_job(
+    pool: &SqlitePool,
+    app: Option<&AppHandle>,
+    job: &JobStatus,
+    params: &serde_json::Value,
+    message: &str,
+) {
+    let job_id = &job.job_id;
+    if let Err(e) = post_process_file_status(pool, params, "failed", Some(message)).await {
+        error!("file_metadata status update failed for {job_id}: {e:#}");
+    }
+    emit_job_failed(app, job, message);
+    let Some(task_name) = job.task_name.as_deref() else {
+        return;
+    };
+    let qdrant = qdrant_from_app(app);
+    match crate::services::job_cleanup::cleanup_failed_job(qdrant.as_ref(), task_name, params).await
+    {
+        Ok(()) => info!("worker: removed partial output of failed job {job_id}"),
+        Err(e) => error!("failed-job cleanup failed for {job_id}: {e:#}"),
+    }
 }
 
 /// Terminal handling for a cancelled job.
@@ -382,12 +400,14 @@ async fn finish_cancelled_job(
 ) {
     let _ = set_job_status(pool, job_id, "CANCELLED", None, Some(CANCELLED_MESSAGE)).await;
 
-    let qdrant = app
-        .and_then(|app| app.try_state::<crate::qdrant::QdrantState>())
-        .map(|state| QdrantService::new(state.client.clone()));
-    if let Err(e) =
-        crate::services::job_cleanup::cleanup_cancelled_job(qdrant.as_ref(), pool, task_name, params)
-            .await
+    let qdrant = qdrant_from_app(app);
+    if let Err(e) = crate::services::job_cleanup::cleanup_cancelled_job(
+        qdrant.as_ref(),
+        pool,
+        task_name,
+        params,
+    )
+    .await
     {
         error!("cancel cleanup failed for {job_id}: {e:#}");
     }
@@ -425,8 +445,8 @@ async fn post_process_file_status(
         sqlx::query("UPDATE file_metadata SET status = ? WHERE storage_object_id = ?")
             .bind(status)
             .bind(storage_object_id)
-        .execute(pool)
-        .await?;
+            .execute(pool)
+            .await?;
     }
     Ok(())
 }
@@ -459,23 +479,25 @@ async fn claim_jobs(pool: &SqlitePool, limit: usize) -> Result<Vec<JobStatus>> {
 }
 
 /// Mark RUNNING jobs whose `updated_at` is older than `STALE_TIMEOUT_MINUTES`
-/// as FAILED. Mirrors the Python `reclaim_stale_jobs`.
-async fn reclaim_stale_jobs(pool: &SqlitePool) -> Result<usize> {
+/// as FAILED and return them. Mirrors the Python `reclaim_stale_jobs`.
+async fn reclaim_stale_jobs(pool: &SqlitePool) -> Result<Vec<JobStatus>> {
     let cutoff = chrono::Utc::now() - chrono::Duration::minutes(STALE_TIMEOUT_MINUTES);
     let cutoff_iso = cutoff.format("%Y-%m-%dT%H:%M:%SZ").to_string();
     // SQLite stores datetimes as text in our ISO format; string comparison
     // works because the format is lexicographically ordered.
     let now = progress::now_iso();
-    let result = sqlx::query(
+    let rows = sqlx::query_as::<_, JobStatus>(
         "UPDATE job_status \
-         SET status = 'FAILED', error_message = 'Timed out: no progress update for 15 minutes', updated_at = ? \
-         WHERE status = 'RUNNING' AND updated_at < ?",
+         SET status = 'FAILED', error_message = ?, updated_at = ? \
+         WHERE status = 'RUNNING' AND updated_at < ? \
+         RETURNING *",
     )
+    .bind(STALE_MESSAGE)
     .bind(&now)
     .bind(&cutoff_iso)
-    .execute(pool)
+    .fetch_all(pool)
     .await?;
-    Ok(result.rows_affected() as usize)
+    Ok(rows)
 }
 
 /// On shutdown, reset any RUNNING jobs back to PENDING so the next launch
@@ -498,22 +520,8 @@ mod tests {
     use super::*;
     use sqlx::Row;
 
-    /// Open a SqlitePool against a fresh tempdir + run migrations.
     async fn open_pool(dir: &tempfile::TempDir) -> SqlitePool {
-        let path = dir.path().join("app.db");
-        let options = sqlx::sqlite::SqliteConnectOptions::new()
-            .filename(&path)
-            .create_if_missing(true)
-            .foreign_keys(true);
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .connect_with(options)
-            .await
-            .expect("connect pool");
-        sqlx::migrate!("./migrations")
-            .run(&pool)
-            .await
-            .expect("run migrations");
-        pool
+        crate::controllers::debug::open_sqlite_pool(dir.path()).await
     }
 
     async fn insert_pending_job(pool: &SqlitePool, task_name: &str, params: &str) -> String {
@@ -549,6 +557,48 @@ mod tests {
         )
     }
 
+    /// Poll `job_id` every 100 ms, up to `polls` times, until `done` accepts
+    /// its status. Returns that status, or an empty string on timeout.
+    async fn wait_for_status(
+        pool: &SqlitePool,
+        job_id: &str,
+        polls: usize,
+        done: impl Fn(&str) -> bool,
+    ) -> String {
+        for _ in 0..polls {
+            let (status, _, _) = fetch_job_status(pool, job_id).await;
+            if done(&status) {
+                return status;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        String::new()
+    }
+
+    async fn insert_running_job(pool: &SqlitePool, updated_at: &str) -> String {
+        let job_id = format!("job-{}", uuid::Uuid::new_v4());
+        sqlx::query(
+            "INSERT INTO job_status (job_id, status, created_at, updated_at, progress_percentage, task_name) \
+             VALUES (?, 'RUNNING', ?, ?, 50, 'noop')",
+        )
+        .bind(&job_id)
+        .bind(updated_at)
+        .bind(updated_at)
+        .execute(pool)
+        .await
+        .unwrap();
+        job_id
+    }
+
+    async fn set_row_status(pool: &SqlitePool, job_id: &str, status: &str) {
+        sqlx::query("UPDATE job_status SET status = ? WHERE job_id = ?")
+            .bind(status)
+            .bind(job_id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn worker_claims_pending_job_and_runs_to_finished() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -556,36 +606,21 @@ mod tests {
 
         // Register a noop task that reports progress 0 -> 50 -> 100.
         let mut reg = TaskRegistry::new();
-        reg.register("noop", |_params, progress, _cancel| {
-            async move {
-                progress(0, Some("starting".to_string())).await;
-                progress(50, Some("halfway".to_string())).await;
-                progress(100, Some("done".to_string())).await;
-                Ok("noop completed".to_string())
-            }
+        reg.register("noop", |_params, progress, _cancel| async move {
+            progress(0, Some("starting".to_string())).await;
+            progress(50, Some("halfway".to_string())).await;
+            progress(100, Some("done".to_string())).await;
+            Ok("noop completed".to_string())
         });
 
         let job_id = insert_pending_job(&pool, "noop", "{}").await;
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
-        let handle = start(
-            pool.clone(),
-            reg,
-            cancel,
-            None,
-            JobCancellation::new(),
-        );
+        let handle = start(pool.clone(), reg, cancel, None, JobCancellation::new());
 
         // Wait for the job to reach FINISHED (poll up to 5s).
-        let mut final_status = String::new();
-        for _ in 0..50 {
-            let (status, _pct, _result) = fetch_job_status(&pool, &job_id).await;
-            if status == "FINISHED" || status == "FAILED" {
-                final_status = status;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
+        let final_status =
+            wait_for_status(&pool, &job_id, 50, |s| s == "FINISHED" || s == "FAILED").await;
         cancel_clone.cancel();
         let _ = handle.await;
 
@@ -605,27 +640,46 @@ mod tests {
         let job_id = insert_pending_job(&pool, "unknown_task", "{}").await;
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
-        let handle = start(
-            pool.clone(),
-            reg,
-            cancel,
-            None,
-            JobCancellation::new(),
-        );
+        let handle = start(pool.clone(), reg, cancel, None, JobCancellation::new());
 
-        let mut final_status = String::new();
-        for _ in 0..50 {
-            let (status, _, _) = fetch_job_status(&pool, &job_id).await;
-            if status == "FAILED" || status == "FINISHED" {
-                final_status = status;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
+        let final_status =
+            wait_for_status(&pool, &job_id, 50, |s| s == "FAILED" || s == "FINISHED").await;
         cancel_clone.cancel();
         let _ = handle.await;
 
         assert_eq!(final_status, "FAILED");
+    }
+
+    #[tokio::test]
+    async fn failed_job_removes_its_upload() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pool = open_pool(&dir).await;
+        let upload = dir.path().join("abc_main.rs");
+        std::fs::write(&upload, b"fn main() {}").unwrap();
+
+        let mut reg = TaskRegistry::new();
+        reg.register(
+            "process_code_file_upload",
+            |_params, _progress, _cancel| async move { Err(anyhow::anyhow!("boom")) },
+        );
+        let params = serde_json::json!({ "path": upload.to_string_lossy() }).to_string();
+        let job_id = insert_pending_job(&pool, "process_code_file_upload", &params).await;
+        let cancel = CancellationToken::new();
+        let handle = start(
+            pool.clone(),
+            reg,
+            cancel.clone(),
+            None,
+            JobCancellation::new(),
+        );
+
+        let final_status =
+            wait_for_status(&pool, &job_id, 50, |s| s == "FAILED" && !upload.exists()).await;
+        cancel.cancel();
+        let _ = handle.await;
+
+        assert_eq!(final_status, "FAILED");
+        assert!(!upload.exists(), "failed job's upload should be removed");
     }
 
     #[tokio::test]
@@ -634,18 +688,7 @@ mod tests {
         let pool = open_pool(&dir).await;
 
         // Insert a job that is "RUNNING" but never gets claimed (registry empty).
-        let job_id = format!("job-{}", uuid::Uuid::new_v4());
-        let now = progress::now_iso();
-        sqlx::query(
-            "INSERT INTO job_status (job_id, status, created_at, updated_at, progress_percentage, task_name) \
-             VALUES (?, 'RUNNING', ?, ?, 50, 'noop')",
-        )
-        .bind(&job_id)
-        .bind(&now)
-        .bind(&now)
-        .execute(&pool)
-        .await
-        .unwrap();
+        let job_id = insert_running_job(&pool, &progress::now_iso()).await;
 
         let n = reset_running_to_pending(&pool).await.unwrap();
         assert_eq!(n, 1);
@@ -675,54 +718,37 @@ mod tests {
         let pool = open_pool(&dir).await;
 
         // Insert a RUNNING job with an old updated_at (20 minutes ago).
-        let job_id = format!("job-{}", uuid::Uuid::new_v4());
         let old = chrono::Utc::now() - chrono::Duration::minutes(20);
-        let old_iso = old.format("%Y-%m-%dT%H:%M:%SZ").to_string();
-        sqlx::query(
-            "INSERT INTO job_status (job_id, status, created_at, updated_at, progress_percentage, task_name) \
-             VALUES (?, 'RUNNING', ?, ?, 50, 'noop')",
-        )
-        .bind(&job_id)
-        .bind(&old_iso)
-        .bind(&old_iso)
-        .execute(&pool)
-        .await
-        .unwrap();
+        let job_id = insert_running_job(&pool, &old.format("%Y-%m-%dT%H:%M:%SZ").to_string()).await;
 
-        let n = reclaim_stale_jobs(&pool).await.unwrap();
-        assert_eq!(n, 1, "one stale job should be reclaimed");
+        let stale = reclaim_stale_jobs(&pool).await.unwrap();
+        assert_eq!(stale.len(), 1, "one stale job should be reclaimed");
+        assert_eq!(stale[0].job_id, job_id);
 
-        use sqlx::Row;
-        let row =
-            sqlx::query("SELECT status, error_message FROM job_status WHERE job_id = ?")
-                .bind(&job_id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let row = sqlx::query("SELECT status, error_message FROM job_status WHERE job_id = ?")
+            .bind(&job_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(row.get::<String, _>(0), "FAILED");
         let err: String = row.get(1);
-        assert!(err.contains("Timed out"), "error should mention timeout: {err}");
+        assert!(
+            err.contains("Timed out"),
+            "error should mention timeout: {err}"
+        );
     }
 
     #[tokio::test]
     async fn reclaim_stale_jobs_skips_fresh_running() {
         let dir = tempfile::tempdir().expect("tempdir");
         let pool = open_pool(&dir).await;
-        let job_id = format!("job-{}", uuid::Uuid::new_v4());
-        let now = progress::now_iso();
-        sqlx::query(
-            "INSERT INTO job_status (job_id, status, created_at, updated_at, progress_percentage, task_name) \
-             VALUES (?, 'RUNNING', ?, ?, 50, 'noop')",
-        )
-        .bind(&job_id)
-        .bind(&now)
-        .bind(&now)
-        .execute(&pool)
-        .await
-        .unwrap();
+        insert_running_job(&pool, &progress::now_iso()).await;
 
-        let n = reclaim_stale_jobs(&pool).await.unwrap();
-        assert_eq!(n, 0, "fresh RUNNING job should not be reclaimed");
+        let stale = reclaim_stale_jobs(&pool).await.unwrap();
+        assert!(
+            stale.is_empty(),
+            "fresh RUNNING job should not be reclaimed"
+        );
     }
 
     #[tokio::test]
@@ -738,11 +764,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let pool = open_pool(&dir).await;
         let job_id = insert_pending_job(&pool, "noop", "{}").await;
-        sqlx::query("UPDATE job_status SET status = 'CANCELLED' WHERE job_id = ?")
-            .bind(&job_id)
-            .execute(&pool)
-            .await
-            .unwrap();
+        set_row_status(&pool, &job_id, "CANCELLED").await;
 
         let claimed = claim_jobs(&pool, 5).await.unwrap();
         assert!(claimed.is_empty(), "a CANCELLED row must never be claimed");
@@ -754,16 +776,8 @@ mod tests {
         let pool = open_pool(&dir).await;
         let cancelled = insert_pending_job(&pool, "noop", "{}").await;
         let running = insert_pending_job(&pool, "noop", "{}").await;
-        sqlx::query("UPDATE job_status SET status = 'CANCELLED' WHERE job_id = ?")
-            .bind(&cancelled)
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query("UPDATE job_status SET status = 'RUNNING' WHERE job_id = ?")
-            .bind(&running)
-            .execute(&pool)
-            .await
-            .unwrap();
+        set_row_status(&pool, &cancelled, "CANCELLED").await;
+        set_row_status(&pool, &running, "RUNNING").await;
 
         reset_running_to_pending(&pool).await.unwrap();
         let (cancelled_status, _, _) = fetch_job_status(&pool, &cancelled).await;
@@ -789,43 +803,18 @@ mod tests {
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
         let cancellations = JobCancellation::new();
-        let handle = start(
-            pool.clone(),
-            reg,
-            cancel_clone,
-            None,
-            cancellations.clone(),
-        );
+        let handle = start(pool.clone(), reg, cancel_clone, None, cancellations.clone());
 
         // Wait for the worker to claim the job and register its token.
-        let mut running = false;
-        for _ in 0..80 {
-            let (status, _, _) = fetch_job_status(&pool, &job_id).await;
-            if status == "RUNNING" {
-                running = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        assert!(running, "job should be claimed");
+        let running = wait_for_status(&pool, &job_id, 80, |s| s == "RUNNING").await;
+        assert_eq!(running, "RUNNING", "job should be claimed");
 
         // Mirror `cancel_job`: mark the row, then fire the token.
-        sqlx::query("UPDATE job_status SET status = 'CANCELLED' WHERE job_id = ?")
-            .bind(&job_id)
-            .execute(&pool)
-            .await
-            .unwrap();
+        set_row_status(&pool, &job_id, "CANCELLED").await;
         assert!(cancellations.cancel(&job_id), "token should be registered");
 
-        let mut final_status = String::new();
-        for _ in 0..80 {
-            let (status, _, _) = fetch_job_status(&pool, &job_id).await;
-            if status != "RUNNING" && status != "PENDING" {
-                final_status = status;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
+        let final_status =
+            wait_for_status(&pool, &job_id, 80, |s| s != "RUNNING" && s != "PENDING").await;
         cancel.cancel();
         let _ = handle.await;
 

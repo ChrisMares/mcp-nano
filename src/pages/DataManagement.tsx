@@ -12,7 +12,7 @@ import {
 } from "@/utils/apicalls";
 import { Trash } from "@/icons";
 import PageHead from "@/components/shared/PageHead";
-import type { UserFiles, DocItem, WebsiteItem } from "@/types/embed";
+import type { UserFiles, WebsiteItem } from "@/types/embed";
 import {
   btnDelete,
   btnDeleteSmall,
@@ -24,7 +24,9 @@ import {
   confirmInput,
   cellBase,
   thCell,
+  alertError,
 } from "@/styles/classes";
+import { formatBytes } from "@/utils/format-bytes";
 
 interface ItemDeleteTarget {
   type: "repo" | "document" | "website";
@@ -49,21 +51,17 @@ const sortGroupsDefaultFirst = (names: string[]) =>
     return a.localeCompare(b);
   });
 
-const formatBytes = (bytes: number | null) => {
-  if (!bytes) return "—";
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+const groupByName = <T extends { group: string }>(items: T[]) => {
+  const groups: Record<string, T[]> = {};
+  for (const item of items) (groups[item.group || "default"] ??= []).push(item);
+  return groups;
 };
 
 const formatDate = (iso: string) => {
   if (!iso) return "—";
-  try {
-    const d = new Date(iso);
-    return d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
-  } catch {
-    return iso.slice(0, 10);
-  }
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso.slice(0, 10);
+  return d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
 };
 
 const DataManagement: React.FC = () => {
@@ -75,13 +73,14 @@ const DataManagement: React.FC = () => {
   const [typeConfirmTarget, setTypeConfirmTarget] = useState<TypeConfirmTarget | null>(null);
   const [typeConfirmText, setTypeConfirmText] = useState("");
   const [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>({});
+  const [error, setError] = useState<string | null>(null);
 
   const fetchFiles = useCallback(async () => {
     try {
       const res = await getFiles();
       setUserFiles(res);
     } catch (err) {
-      console.error("Failed to fetch files:", err);
+      setError(`Failed to load files: ${String(err)}`);
     } finally {
       setLoading(false);
     }
@@ -92,7 +91,7 @@ const DataManagement: React.FC = () => {
       const res = await getWebsites();
       setWebsites(res.websites ?? []);
     } catch (err) {
-      console.error("Failed to fetch websites:", err);
+      setError(`Failed to load websites: ${String(err)}`);
     }
   }, []);
 
@@ -101,56 +100,48 @@ const DataManagement: React.FC = () => {
     fetchWebsites();
   }, [fetchFiles, fetchWebsites]);
 
+  const runDelete = async (key: string, action: () => Promise<void>, close: () => void) => {
+    setDeletingKey(key);
+    setError(null);
+    try {
+      await action();
+    } catch (err) {
+      setError(`Delete failed: ${String(err)}`);
+    } finally {
+      setDeletingKey(null);
+      close();
+    }
+  };
+
   const handleDeleteItem = async () => {
     if (!itemDeleteTarget) return;
     const { type, id } = itemDeleteTarget;
-    setDeletingKey(`${type}:${id}`);
-    try {
+    await runDelete(`${type}:${id}`, async () => {
       if (type === "website") {
         await deleteWebsite(id);
         await fetchWebsites();
-      } else {
-        if (type === "repo") {
-          await deleteRepo(id);
-        } else {
-          await deleteDocument(id);
-        }
-        await fetchFiles();
+        return;
       }
-    } catch (err) {
-      console.error("Delete failed:", err);
-    } finally {
-      setDeletingKey(null);
-      setItemDeleteTarget(null);
-    }
+      await (type === "repo" ? deleteRepo(id) : deleteDocument(id));
+      await fetchFiles();
+    }, () => setItemDeleteTarget(null));
   };
 
   const handleTypeConfirmDelete = async () => {
     if (!typeConfirmTarget) return;
     const { kind, key } = typeConfirmTarget;
-    setDeletingKey(`${kind}:${key}`);
-    try {
+    await runDelete(`${kind}:${key}`, async () => {
       if (kind === "website-group") {
-        if (key === "__all__") {
-          await clearWebsites();
-        } else {
-          await deleteWebsiteGroup(key);
-        }
+        await (key === "__all__" ? clearWebsites() : deleteWebsiteGroup(key));
         await fetchWebsites();
-      } else if (kind === "collection") {
-        await clearUserCollection(key);
-        await fetchFiles();
-      } else {
-        await deleteGroup(key);
-        await fetchFiles();
+        return;
       }
-    } catch (err) {
-      console.error(`Delete ${kind} failed:`, err);
-    } finally {
-      setDeletingKey(null);
+      await (kind === "collection" ? clearUserCollection(key) : deleteGroup(key));
+      await fetchFiles();
+    }, () => {
       setTypeConfirmTarget(null);
       setTypeConfirmText("");
-    }
+    });
   };
 
   const openCollectionClear = (collection: "codebase" | "general", label: string) =>
@@ -177,28 +168,23 @@ const DataManagement: React.FC = () => {
       message: `You are about to delete all website embeddings in group '${groupName}'. Documents in this group will NOT be affected.`,
     });
 
-  const documentsByGroup = useMemo(() => {
-    return (userFiles?.documents ?? []).reduce<Record<string, DocItem[]>>((acc, doc) => {
-      const groupName = doc.group || "default";
-      const typeParts = doc.file_type?.split("/");
-      const t = typeParts ? typeParts[typeParts.length - 1] : doc.file_type;
-      (acc[groupName] ??= []).push({ ...doc, file_type: t });
-      return acc;
-    }, {});
-  }, [userFiles?.documents]);
+  const documentsByGroup = useMemo(
+    () =>
+      groupByName(
+        (userFiles?.documents ?? []).map((doc) => ({
+          ...doc,
+          file_type: doc.file_type && doc.file_type.slice(doc.file_type.lastIndexOf("/") + 1),
+        })),
+      ),
+    [userFiles?.documents],
+  );
 
   const sortedGroupNames = useMemo(
     () => sortGroupsDefaultFirst(Object.keys(documentsByGroup)),
     [documentsByGroup],
   );
 
-  const websitesByGroup = useMemo(() => {
-    return websites.reduce<Record<string, WebsiteItem[]>>((acc, w) => {
-      const g = w.group || "default";
-      (acc[g] ??= []).push(w);
-      return acc;
-    }, {});
-  }, [websites]);
+  const websitesByGroup = useMemo(() => groupByName(websites), [websites]);
 
   const sortedWebsiteGroups = useMemo(
     () => sortGroupsDefaultFirst(Object.keys(websitesByGroup)),
@@ -215,6 +201,12 @@ const DataManagement: React.FC = () => {
         <h1 className="text-2xl font-bold text-foreground mb-1">Data Management</h1>
         <p className="text-sm text-muted-foreground">View and delete your embedded data.</p>
       </div>
+
+      {error && (
+        <div className={alertError} role="alert">
+          {error}
+        </div>
+      )}
 
       {loading ? (
         <div className="rounded-lg border border-border bg-card p-12 text-center text-muted-foreground">
@@ -310,19 +302,24 @@ const DataManagement: React.FC = () => {
                             <tbody>
                               {documentsByGroup[groupName].map((doc) => {
                                 const name = stripGuidPrefix(doc.filename);
+                                const docId = doc.storage_object_id ?? doc.filename;
                                 return (
-                                  <tr key={doc.filename} className="border-b border-border last:border-0">
+                                  <tr key={docId} className="border-b border-border last:border-0">
                                     <td className={`${cellBase} text-foreground truncate max-w-[120px]`} title={name}>{name}</td>
                                     <td className={`${cellBase} text-muted-foreground`}>{doc.file_type ?? "—"}</td>
                                     <td className={`${cellBase} text-muted-foreground`}>{formatBytes(doc.size_bytes)}</td>
                                     <td className={`${cellBase} text-muted-foreground whitespace-nowrap`}>{formatDate(doc.created_at ?? "")}</td>
                                     <td className={`${cellBase} text-right`}>
                                       <button
-                                        onClick={() => setItemDeleteTarget({ type: "document", id: doc.filename, displayName: name })}
-                                        disabled={deletingKey === `document:${doc.filename}`}
+                                        onClick={() => {
+                                          if (doc.storage_object_id) {
+                                            setItemDeleteTarget({ type: "document", id: doc.storage_object_id, displayName: name });
+                                          }
+                                        }}
+                                        disabled={!doc.storage_object_id || deletingKey === `document:${docId}`}
                                         className={btnIconDelete}
                                       >
-                                        {deletingKey === `document:${doc.filename}` ? "..." : <Trash />}
+                                        {deletingKey === `document:${docId}` ? "..." : <Trash />}
                                       </button>
                                     </td>
                                   </tr>

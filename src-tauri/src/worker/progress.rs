@@ -21,8 +21,7 @@ pub type ProgressFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 /// races with the terminal status update in `run_job`.
 ///
 /// Held inside an `Arc` so it's cheap to clone per task invocation.
-pub type ProgressCallback =
-    Arc<dyn Fn(i32, Option<String>) -> ProgressFuture + Send + Sync>;
+pub type ProgressCallback = Arc<dyn Fn(i32, Option<String>) -> ProgressFuture + Send + Sync>;
 
 /// Event payload emitted alongside each row update when an `AppHandle` is
 /// attached. The UI subscribes to `job_progress` / `job_queued` /
@@ -157,13 +156,7 @@ pub fn progress_for_job_with_app(
                     error!("progress update failed for job {job_id}: {e:#}");
                 }
             }
-            let event = JobProgressEvent::new(
-                job_id.clone(),
-                pct,
-                "RUNNING",
-                file_name,
-                msg,
-            );
+            let event = JobProgressEvent::new(job_id.clone(), pct, "RUNNING", file_name, msg);
             emit_job_event(&app, "job_progress", &event);
         })
     })
@@ -180,14 +173,12 @@ pub async fn update_job_progress(
 ) -> Result<()> {
     let clamped = pct.clamp(0, 100);
     let now = now_iso();
-    sqlx::query(
-        "UPDATE job_status SET progress_percentage = ?, updated_at = ? WHERE job_id = ?",
-    )
-    .bind(clamped)
-    .bind(&now)
-    .bind(job_id)
-    .execute(pool)
-    .await?;
+    sqlx::query("UPDATE job_status SET progress_percentage = ?, updated_at = ? WHERE job_id = ?")
+        .bind(clamped)
+        .bind(&now)
+        .bind(job_id)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 

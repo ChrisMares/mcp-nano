@@ -34,7 +34,10 @@ mod tests {
         let r = VecDbResult {
             ids: vec![vec!["a".into(), "b".into()]],
             documents: vec![vec!["doc a".into(), "doc b".into()]],
-            metadatas: vec![vec![serde_json::json!({"k": 1}), serde_json::json!({"k": 2})]],
+            metadatas: vec![vec![
+                serde_json::json!({"k": 1}),
+                serde_json::json!({"k": 2}),
+            ]],
             distances: vec![vec![0.9, 0.7]],
             count: Some(2),
         };

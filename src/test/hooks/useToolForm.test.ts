@@ -12,7 +12,7 @@ describe('useToolForm', () => {
   })
 
   it('initializes with provided data', () => {
-    const initial = { name: 'test', description: 'desc', selectedRepos: new Set(['r1']), selectedGroups: new Set(['g1']) }
+    const initial = { name: 'test', description: 'desc', selectedRepos: new Set(['r1']), selectedGroups: new Set(['g1']), selectedWebsites: new Set<string>(), maxChunkLimit: 5 }
     const { result } = renderHook(() => useToolForm(initial))
     expect(result.current.form.name).toBe('test')
     expect(result.current.form.selectedRepos.has('r1')).toBe(true)

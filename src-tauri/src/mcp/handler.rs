@@ -10,9 +10,9 @@ use sqlx::SqlitePool;
 
 use super::format::format_rag_response;
 use super::server_id::{server_id_from_uri, ServerId};
-use crate::models::request::RagQueryRequest;
+use crate::models::request::{RagQueryRequest, SymbolRelation};
 use crate::services::mcp_config;
-use crate::services::rag_service::RagService;
+use crate::services::rag::RagService;
 
 /// Fallback result count when the caller doesn't request a limit, and the
 /// ceiling used if the tool itself has no configured `max_chunk_limit`.
@@ -40,10 +40,7 @@ impl McpHandler {
 impl ServerHandler for McpHandler {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new(
-                "VectorFlow RAG Server",
-                env!("CARGO_PKG_VERSION"),
-            ))
+            .with_server_info(Implementation::new("MCP Nano", env!("CARGO_PKG_VERSION")))
             .with_instructions("Local RAG search tools scoped by MCP server configuration.")
             .with_protocol_version(ProtocolVersion::V_2025_03_26)
     }
@@ -102,11 +99,12 @@ impl ServerHandler for McpHandler {
         };
 
         let args = request.arguments.unwrap_or_default();
-        let query = args
-            .get("query")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
+        let call = match parse_search_args(&args) {
+            Ok(call) => call,
+            Err(message) => {
+                return Ok(CallToolResult::error(vec![ContentBlock::text(message)]));
+            }
+        };
 
         let requested_limit = args.get("limit").and_then(|v| v.as_i64());
         let limit = effective_limit(requested_limit, tool.max_chunk_limit);
@@ -121,16 +119,21 @@ impl ServerHandler for McpHandler {
             let where_clause = req.get("where").cloned();
             requests.push(RagQueryRequest {
                 collection,
-                query: query.clone(),
+                query: call.query.clone(),
                 limit: Some(limit),
                 show_documents: Some(false),
                 where_clause,
+                symbol: call.symbol.clone(),
+                relation: call.relation,
+                expand: Some(call.expand),
             });
         }
 
+        let display_query = call.display();
         match self.state.rag.run_rag_query(&requests).await {
             Ok(result) => {
-                let text = format_rag_response(&result, &query, limit as usize);
+                let ranked = call.symbol.is_none() || !call.query.is_empty();
+                let text = format_rag_response(&result, &display_query, limit as usize, ranked);
                 Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
             }
             Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
@@ -158,17 +161,100 @@ fn search_input_schema() -> serde_json::Map<String, serde_json::Value> {
         "properties": {
             "query": {
                 "type": "string",
-                "description": "Natural language search query"
+                "description": "Natural language search query. Required unless 'symbol' is given; with 'symbol' it ranks the lookup results."
             },
             "limit": {
                 "type": "integer",
                 "description": "Maximum number of results to return",
                 "default": 5
+            },
+            "symbol": {
+                "type": "string",
+                "description": "Function, method, or type name to look up in indexed code instead of a text search, e.g. 'run_rag_query' or 'RagService::run_rag_query'. Matching is by name, not by type."
+            },
+            "relation": {
+                "type": "string",
+                "enum": ["definition", "references", "callees", "members"],
+                "default": "definition",
+                "description": "With 'symbol': 'definition' returns the code that defines it, 'references' returns code that calls it (find references), 'callees' returns the definitions of the functions it calls, 'members' returns a class or interface and the methods defined in it."
+            },
+            "expand": {
+                "type": "boolean",
+                "default": false,
+                "description": "For text searches: also return definitions of the functions called by the code results, listed under 'Related definitions'."
             }
-        },
-        "required": ["query"]
+        }
     });
     schema.as_object().cloned().unwrap_or_default()
+}
+
+/// Validated arguments of a search tool call.
+#[derive(Debug, PartialEq)]
+struct SearchCall {
+    query: String,
+    symbol: Option<String>,
+    relation: Option<SymbolRelation>,
+    expand: bool,
+}
+
+impl SearchCall {
+    /// Short description of the request for the response header.
+    fn display(&self) -> String {
+        match &self.symbol {
+            Some(symbol) => {
+                let relation = match self.relation.unwrap_or_default() {
+                    SymbolRelation::Definition => "definition",
+                    SymbolRelation::References => "references",
+                    SymbolRelation::Callees => "callees",
+                    SymbolRelation::Members => "members",
+                };
+                format!("{relation} of {symbol}")
+            }
+            None => self.query.clone(),
+        }
+    }
+}
+
+fn parse_search_args(
+    args: &serde_json::Map<String, serde_json::Value>,
+) -> Result<SearchCall, String> {
+    let text_arg = |key: &str| -> String {
+        args.get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
+    let query = text_arg("query");
+    let symbol = text_arg("symbol");
+    let relation_text = text_arg("relation");
+
+    if query.is_empty() && symbol.is_empty() {
+        return Err("Provide a non-empty 'query', or a 'symbol' to look up.".into());
+    }
+    let relation = if relation_text.is_empty() {
+        None
+    } else {
+        let parsed = serde_json::from_value(serde_json::Value::String(relation_text.clone()));
+        Some(parsed.map_err(|_| {
+            format!(
+                "Unknown relation '{relation_text}'. Use definition, references, callees, or members."
+            )
+        })?)
+    };
+    if relation.is_some() && symbol.is_empty() {
+        return Err("'relation' requires a 'symbol'.".into());
+    }
+
+    Ok(SearchCall {
+        query,
+        symbol: (!symbol.is_empty()).then_some(symbol),
+        relation,
+        expand: args
+            .get("expand")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+    })
 }
 
 /// Resolves the effective result limit for a tool call.
@@ -196,6 +282,60 @@ fn effective_limit(requested: Option<i64>, tool_max: Option<i32>) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn args(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+        value.as_object().cloned().unwrap()
+    }
+
+    #[test]
+    fn search_args_require_query_or_symbol() {
+        assert!(parse_search_args(&args(serde_json::json!({}))).is_err());
+        assert!(parse_search_args(&args(serde_json::json!({"query": "  "}))).is_err());
+    }
+
+    #[test]
+    fn search_args_accept_symbol_lookup_without_query() {
+        let call = parse_search_args(&args(serde_json::json!({
+            "symbol": "run_rag_query",
+            "relation": "references"
+        })))
+        .unwrap();
+        assert_eq!(call.symbol.as_deref(), Some("run_rag_query"));
+        assert_eq!(call.relation, Some(SymbolRelation::References));
+        assert!(!call.expand);
+        assert_eq!(call.display(), "references of run_rag_query");
+    }
+
+    #[test]
+    fn search_args_reject_unknown_relation_and_relation_without_symbol() {
+        assert!(parse_search_args(&args(serde_json::json!({
+            "symbol": "x", "relation": "callers"
+        })))
+        .is_err());
+        assert!(parse_search_args(&args(serde_json::json!({
+            "query": "x", "relation": "references"
+        })))
+        .is_err());
+    }
+
+    #[test]
+    fn search_args_accept_members_relation() {
+        let call = parse_search_args(&args(serde_json::json!({
+            "symbol": "CustomerController",
+            "relation": "members"
+        })))
+        .unwrap();
+        assert_eq!(call.relation, Some(SymbolRelation::Members));
+        assert_eq!(call.display(), "members of CustomerController");
+    }
+
+    #[test]
+    fn search_args_read_expand_flag() {
+        let call =
+            parse_search_args(&args(serde_json::json!({"query": "q", "expand": true}))).unwrap();
+        assert!(call.expand);
+        assert_eq!(call.display(), "q");
+    }
 
     #[test]
     fn default_is_five_when_nothing_requested_and_no_tool_max() {

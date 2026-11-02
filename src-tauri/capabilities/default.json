@@ -5,7 +5,6 @@
   "windows": ["main", "splashscreen"],
   "permissions": [
     "core:default",
-    "opener:default",
     "dialog:default"
   ]
 }

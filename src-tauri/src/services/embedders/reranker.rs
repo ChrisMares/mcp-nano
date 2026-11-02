@@ -3,8 +3,8 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
-use ort::session::Session;
 use ort::inputs;
+use ort::session::Session;
 use tokenizers::Tokenizer;
 use tracing::info;
 
@@ -57,12 +57,7 @@ impl Reranker {
     /// Score each (query, document) pair. Returns one f32 per document,
     /// higher = more relevant. `batch_size` controls how many pairs are
     /// forwarded through the encoder at once.
-    pub fn rerank(
-        &self,
-        query: &str,
-        documents: &[&str],
-        batch_size: usize,
-    ) -> Result<Vec<f32>> {
+    pub fn rerank(&self, query: &str, documents: &[&str], batch_size: usize) -> Result<Vec<f32>> {
         if documents.is_empty() {
             return Ok(Vec::new());
         }

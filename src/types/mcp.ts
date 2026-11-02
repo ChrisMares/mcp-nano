@@ -3,8 +3,8 @@ export interface McpServer {
   name: string;
   description: string | null;
   active: boolean;
-  created_at: string;
-  updated_at: string;
+  created_at: string | null;
+  updated_at: string | null;
   tools?: ToolDefinition[];
 }
 
@@ -14,8 +14,8 @@ export interface ToolDefinition {
   name: string;
   description: string | null;
   active: boolean;
-  created_at: string;
-  updated_at: string;
+  created_at: string | null;
+  updated_at: string | null;
   max_chunk_limit: number | null;
   code_search_scopes: ToolCodeSearchScope[];
   document_search_scopes: ToolDocumentSearchScope[];
@@ -35,6 +35,7 @@ export interface ToolDocumentSearchScope {
   group_ids: string[];
 }
 
+/** Mirrors the Rust `ToolPayload` request struct. */
 export interface ToolPayload {
   name: string;
   description: string;
@@ -109,10 +110,11 @@ export interface ConnectionInfo {
   server_id: string;
   server_name: string;
   full_url: string;
+  /** JSON config objects for each client, except `codex` which is TOML text. */
   config_snippets: {
-    claude_desktop: object;
-    opencode: object;
-    vscode: object;
+    claude_desktop: Record<string, unknown>;
+    opencode: Record<string, unknown>;
+    vscode: Record<string, unknown>;
     codex: string;
   };
 }

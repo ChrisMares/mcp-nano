@@ -60,7 +60,7 @@ async fn end_to_end_upsert_and_hybrid_query() {
     let ids: Vec<Uuid> = (0..docs.len()).map(|_| Uuid::new_v4()).collect();
     let metadatas: Vec<serde_json::Value> = docs
         .iter()
-        .map(|d| serde_json::json!({"source": "test", "preview": d.chars().take(20).collect::<String>()}))
+        .map(|d| serde_json::json!({"source": "test", "content": d}))
         .collect();
 
     svc.upsert_items(
@@ -207,17 +207,14 @@ async fn end_to_end_job_pipeline_upserts_to_qdrant() {
     let _ = handle.await;
 
     if final_status != "FINISHED" {
-        let row =
-            sqlx::query("SELECT error_message, result FROM job_status WHERE job_id = ?")
-                .bind(&job_id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let row = sqlx::query("SELECT error_message, result FROM job_status WHERE job_id = ?")
+            .bind(&job_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         let err: Option<String> = row.get(0);
         let res: Option<String> = row.get(1);
-        panic!(
-            "job should reach FINISHED, got {final_status}\nerror: {err:?}\nresult: {res:?}"
-        );
+        panic!("job should reach FINISHED, got {final_status}\nerror: {err:?}\nresult: {res:?}");
     }
     assert_eq!(final_status, "FINISHED");
 
@@ -231,7 +228,10 @@ async fn end_to_end_job_pipeline_upserts_to_qdrant() {
     );
 
     // Query to verify the content is searchable, filtered to our test group.
-    let q_emb = embedders.dense.encode_query("systems programming language").expect("encode query");
+    let q_emb = embedders
+        .dense
+        .encode_query("systems programming language")
+        .expect("encode query");
     let filter = Filter::must([Condition::matches("group", test_group.clone())]);
     let result = svc
         .query_items(
@@ -254,5 +254,7 @@ async fn end_to_end_job_pipeline_upserts_to_qdrant() {
 
     // Cleanup: delete all points tagged with our test group.
     let cleanup_filter = Filter::must([Condition::matches("group", test_group)]);
-    let _ = svc.delete_items(collection, None, Some(cleanup_filter)).await;
+    let _ = svc
+        .delete_items(collection, None, Some(cleanup_filter))
+        .await;
 }

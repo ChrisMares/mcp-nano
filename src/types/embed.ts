@@ -30,7 +30,7 @@ export interface EmbeddingOptions {
   group?: string;
   filter_test_files?: boolean;
   code_files_only?: boolean;
-  metadata: Record<string, unknown>;
+  metadata?: Record<string, unknown>;
 }
 
 export interface UploadJobEntry {
@@ -46,16 +46,19 @@ export interface UploadResponse {
   errors: string[];
 }
 
-interface RepoItem {
+export interface RepoItem {
   repo_name: string;
   created_at: string | null;
+  storage_object_id: string | null;
 }
 
+/** Mirrors `FileMetadataDto`. `storage_object_id` identifies the upload for deletion. */
 export interface DocItem {
   filename: string;
   file_type: string | null;
   size_bytes: number | null;
   created_at: string | null;
+  storage_object_id: string | null;
   group: string;
 }
 

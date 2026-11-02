@@ -28,6 +28,7 @@ const DEFAULT_AVG_LEN: f32 = 256.0;
 const TOKEN_MAX_LENGTH: usize = 40;
 
 /// NLTK-style English stopwords (used when stemming is enabled, like fastembed).
+#[rustfmt::skip]
 const ENGLISH_STOPWORDS: &[&str] = &[
     "a", "about", "above", "after", "again", "against", "ain", "all", "am", "an", "and", "any",
     "are", "aren", "aren't", "as", "at", "be", "because", "been", "before", "being", "below",
@@ -348,9 +349,7 @@ mod tests {
     fn embed_sparse_batch_preserves_order() {
         let bm = Bm25Embedder::new();
         let texts = ["rust programming language", "machine learning models"];
-        let vs = bm
-            .embed_sparse(&texts.iter().copied().collect::<Vec<_>>())
-            .unwrap();
+        let vs = bm.embed_sparse(&texts).unwrap();
         assert_eq!(vs.len(), 2);
         assert!(!vs[0].is_empty());
         assert!(!vs[1].is_empty());

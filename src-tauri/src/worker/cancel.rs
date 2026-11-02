@@ -47,11 +47,7 @@ impl JobCancellation {
     /// Fire the token for `job_id`. Returns `false` when no token is
     /// registered, i.e. the job is not running (or has not registered yet).
     pub fn cancel(&self, job_id: &str) -> bool {
-        let token = self
-            .0
-            .lock()
-            .ok()
-            .and_then(|map| map.get(job_id).cloned());
+        let token = self.0.lock().ok().and_then(|map| map.get(job_id).cloned());
         match token {
             Some(token) => {
                 token.cancel();

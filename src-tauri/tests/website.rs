@@ -516,8 +516,8 @@ async fn process_website_with_progress_aborts_on_cancellation() {
 }
 
 #[tokio::test]
+#[ignore = "requires network access to gojs.net"]
 async fn crawl_website_gojs_api_discovers_symbol_pages() {
-    std::env::set_var("WEBSITE_CRAWL_MAX_PAGES", "500");
     let start = "https://gojs.net/latest/api/";
     let urls = match website::crawl_website(start, 1, true, None).await {
         Ok(u) => u,
@@ -555,6 +555,7 @@ async fn crawl_website_gojs_api_discovers_symbol_pages() {
 }
 
 #[tokio::test]
+#[ignore = "requires network access to gojs.net"]
 async fn scrape_website_gojs_diagram_has_content() {
     let url = "https://gojs.net/latest/api/symbols/Diagram.html";
     let (title, sections) = match website::scrape_website(url).await {
@@ -577,6 +578,7 @@ async fn scrape_website_gojs_diagram_has_content() {
 }
 
 #[tokio::test]
+#[ignore = "requires network access to gojs.net"]
 async fn process_website_gojs_produces_chunks() {
     let urls = vec![
         "https://gojs.net/latest/api/".to_string(),
@@ -609,6 +611,7 @@ async fn process_website_gojs_produces_chunks() {
 
 /// Full crawl of GoJS API index (depth=1) then scrape+chunk+embed+upsert.
 #[tokio::test]
+#[ignore = "requires network access to gojs.net"]
 async fn gojs_api_crawl_and_embed_e2e() {
     use common::{create_test_collection, load_embedders, models_dir, spawn_qdrant};
     use mcp_nano_lib::services::embedders::EncodeQuery;
@@ -616,8 +619,6 @@ async fn gojs_api_crawl_and_embed_e2e() {
     use mcp_nano_lib::services::qdrant_service::{Include, QdrantService};
     use mcp_nano_lib::worker::noop_progress;
     use qdrant_client::qdrant::{Condition, Filter};
-
-    std::env::set_var("WEBSITE_CRAWL_MAX_PAGES", "500");
 
     let Some((qdrant_client, _guard)) = spawn_qdrant().await else {
         eprintln!("skipping: could not spawn qdrant");

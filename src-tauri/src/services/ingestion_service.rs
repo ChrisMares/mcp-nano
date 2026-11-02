@@ -5,8 +5,9 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use futures_util::{stream, FutureExt, StreamExt};
-use rayon::prelude::*;
 use qdrant_client::qdrant::{Condition, Filter};
+use rayon::prelude::*;
+use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use text_splitter::{ChunkConfig, MarkdownSplitter, TextSplitter};
 use tokenizers::Tokenizer;
@@ -20,16 +21,12 @@ use crate::services::embedder_state::EmbedderState;
 use crate::services::embedders::EncodeDocuments;
 use crate::services::file_filters::{self, IngestFilter};
 use crate::services::ingestion;
+use crate::services::ingestion::{
+    CODE_CHUNK_OVERLAP, CODE_CHUNK_SIZE, DOC_CHUNK_OVERLAP, DOC_CHUNK_SIZE,
+};
 use crate::services::qdrant_service::QdrantService;
-use crate::worker::{JobCancelled, TaskRegistry};
+use crate::worker::{JobCancelled, ProgressCallback, TaskRegistry};
 
-/// Default chunk size in tokens (matches the Python `DOC_CHUNK_SIZE = 768`).
-const DEFAULT_CHUNK_SIZE: usize = 768;
-/// Default overlap between chunks (matches the Python `DOC_CHUNK_OVERLAP = 50`).
-const DEFAULT_CHUNK_OVERLAP: usize = 50;
-/// Default chunk size in tokens for code chunks before splitting oversized
-/// chunks (matches Python `CODE_CHUNK_SIZE = 768`).
-const CODE_CHUNK_SIZE: usize = 768;
 /// Hard ceiling on stored chunk text. Token splitters can still emit huge
 /// pieces for single-line minified blobs; we force-split by characters after.
 const MAX_CHUNK_CHARS: usize = 6_000;
@@ -93,6 +90,79 @@ where
     }
 }
 
+/// Convert a `spawn_blocking` join failure into an error, recording panics.
+fn join_error(task: &str, path_display: &str, e: tokio::task::JoinError) -> anyhow::Error {
+    if e.is_panic() {
+        let msg = panic_payload_to_string(&e.into_panic());
+        record_caught_panic(&format!("{task} task {path_display}"), &msg);
+        anyhow!("{task} task panicked for {path_display}: {msg}")
+    } else {
+        anyhow!("{task} task join error for {path_display}: {e}")
+    }
+}
+
+fn parse_params<T: DeserializeOwned>(params: serde_json::Value, task: &str) -> Result<T> {
+    serde_json::from_value(params)
+        .map_err(|e| {
+            error!("{task}: invalid params: {e:#}");
+            anyhow!("invalid params: {e:#}")
+        })
+        .with_context(|| format!("deserializing {task} params"))
+}
+
+/// Token-sized chunk config backed by the tokenizer at `tokenizer_path`.
+fn chunk_config(
+    tokenizer_path: &Path,
+    size: usize,
+    overlap: usize,
+    what: &str,
+) -> Result<ChunkConfig<Tokenizer>> {
+    let tokenizer = Tokenizer::from_file(tokenizer_path)
+        .map_err(|e| anyhow!("loading {what} tokenizer: {e}"))?;
+    ChunkConfig::new(size)
+        .with_sizer(tokenizer)
+        .with_overlap(overlap)
+        .with_context(|| format!("building {what} chunk config"))
+}
+
+fn file_name_or<'a>(path: &'a Path, fallback: &'a str) -> &'a str {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(fallback)
+}
+
+/// Report that an uploaded file is loading, failing when it no longer exists.
+async fn start_upload(
+    task: &str,
+    path: &str,
+    fallback_name: &str,
+    progress: &ProgressCallback,
+    cancel: &CancellationToken,
+) -> Result<()> {
+    ensure_not_cancelled(cancel)?;
+    let display = file_name_or(Path::new(path), fallback_name);
+    progress(5, Some(format!("Loading {display}"))).await;
+    if !Path::new(path).exists() {
+        error!("{task}: path does not exist: {path}");
+        return Err(anyhow!("Path {path} does not exist"));
+    }
+    Ok(())
+}
+
+/// Remove an ingested upload and report completion.
+async fn finish_upload(
+    path: &str,
+    chunks: usize,
+    message: &str,
+    progress: &ProgressCallback,
+    cancel: &CancellationToken,
+) -> Result<String> {
+    ensure_not_cancelled(cancel)?;
+    let _ = std::fs::remove_file(path);
+    progress(100, Some(message.to_string())).await;
+    Ok(format!("Processed {chunks} chunk(s)."))
+}
+
 /// Bail out of a task as soon as its job is cancelled.
 fn ensure_not_cancelled(cancel: &CancellationToken) -> Result<()> {
     if cancel.is_cancelled() {
@@ -133,13 +203,45 @@ pub struct IngestionService {
     embedders: Arc<EmbedderState>,
     qdrant: QdrantService,
     splitter: Arc<TextSplitter<Tokenizer>>,
-    /// Second splitter used by `split_oversized_code_chunks`; mirrors the
-    /// Python `CODE_CHUNK_SIZE=768, chunk_overlap=64` config.
+    /// Second splitter used by `split_oversized_code_chunks`.
     code_splitter: Arc<TextSplitter<Tokenizer>>,
     /// Markdown-aware splitter used for `md`/`mdx` documents (CommonMark
     /// structure: headings, paragraphs, code blocks). Same size/overlap
     /// config as the plain text splitter.
     markdown_splitter: Arc<MarkdownSplitter<Tokenizer>>,
+}
+
+/// A file to ingest and where its chunks are stored.
+struct FileTarget<'a> {
+    path: &'a Path,
+    /// Repo-relative path stored as the payload `path`; the file name when
+    /// `None`.
+    repo_path: Option<&'a str>,
+    collection: &'a str,
+    repo_name: Option<&'a str>,
+    options: &'a EmbeddingOptions,
+}
+
+/// The `[start, end]` percent band a step reports progress into, and the
+/// token that cancels it.
+#[derive(Clone, Copy)]
+struct ProgressBand<'a> {
+    progress: &'a ProgressCallback,
+    start: i32,
+    end: i32,
+    cancel: &'a CancellationToken,
+}
+
+impl<'a> ProgressBand<'a> {
+    /// The band a single-file upload ingests in, after its loading step.
+    fn upload(progress: &'a ProgressCallback, cancel: &'a CancellationToken) -> Self {
+        Self {
+            progress,
+            start: 10,
+            end: 95,
+            cancel,
+        }
+    }
 }
 
 impl IngestionService {
@@ -148,34 +250,28 @@ impl IngestionService {
         qdrant: QdrantService,
         models_dir: &Path,
     ) -> Result<Self> {
-        let tokenizer = Tokenizer::from_file(models_dir.join("arctic-embed-xs/tokenizer.json"))
-            .map_err(|e| anyhow!("loading chunk tokenizer: {e}"))?;
-        let config = ChunkConfig::new(DEFAULT_CHUNK_SIZE)
-            .with_sizer(tokenizer)
-            .with_overlap(DEFAULT_CHUNK_OVERLAP)
-            .context("building chunk config")?;
-        let splitter = TextSplitter::new(config);
-
-        // Code-splitter: separate `Tokenizer` instance (TextSplitter borrows
-        // it via `Arc<Tokenizer>`); use a fresh clone of the same file.
-        let code_tokenizer =
-            Tokenizer::from_file(models_dir.join("arctic-embed-xs/tokenizer.json"))
-                .map_err(|e| anyhow!("loading code tokenizer: {e}"))?;
-        let code_config = ChunkConfig::new(CODE_CHUNK_SIZE)
-            .with_sizer(code_tokenizer)
-            .with_overlap(64)
-            .context("building code chunk config")?;
-        let code_splitter = TextSplitter::new(code_config);
-
-        // Markdown splitter: separate `Tokenizer` instance; same size and
-        // overlap as the doc splitter so chunk budgets stay consistent.
-        let md_tokenizer = Tokenizer::from_file(models_dir.join("arctic-embed-xs/tokenizer.json"))
-            .map_err(|e| anyhow!("loading markdown tokenizer: {e}"))?;
-        let md_config = ChunkConfig::new(DEFAULT_CHUNK_SIZE)
-            .with_sizer(md_tokenizer)
-            .with_overlap(DEFAULT_CHUNK_OVERLAP)
-            .context("building markdown chunk config")?;
-        let markdown_splitter = MarkdownSplitter::new(md_config);
+        // Each splitter owns its own `Tokenizer` instance loaded from the
+        // same file. The markdown splitter shares the doc size and overlap so
+        // chunk budgets stay consistent.
+        let tokenizer = models_dir.join("arctic-embed-xs/tokenizer.json");
+        let splitter = TextSplitter::new(chunk_config(
+            &tokenizer,
+            DOC_CHUNK_SIZE,
+            DOC_CHUNK_OVERLAP,
+            "chunk",
+        )?);
+        let code_splitter = TextSplitter::new(chunk_config(
+            &tokenizer,
+            CODE_CHUNK_SIZE,
+            CODE_CHUNK_OVERLAP,
+            "code",
+        )?);
+        let markdown_splitter = MarkdownSplitter::new(chunk_config(
+            &tokenizer,
+            DOC_CHUNK_SIZE,
+            DOC_CHUNK_OVERLAP,
+            "markdown",
+        )?);
 
         Ok(Self {
             embedders,
@@ -191,15 +287,10 @@ impl IngestionService {
     pub async fn process_zip_upload(
         &self,
         params: serde_json::Value,
-        progress: crate::worker::ProgressCallback,
+        progress: ProgressCallback,
         cancel: CancellationToken,
     ) -> Result<String> {
-        let p: ProcessZipParams = serde_json::from_value(params)
-            .map_err(|e| {
-                error!("process_zip_upload: invalid params: {e:#}");
-                anyhow!("invalid params: {e:#}")
-            })
-            .context("deserializing process_zip_upload params")?;
+        let p: ProcessZipParams = parse_params(params, "process_zip_upload")?;
         info!(
             "process_zip_upload: zip={} collection={:?}",
             p.zip_path, p.embedding_options.collection
@@ -236,61 +327,37 @@ impl IngestionService {
                 );
             }
         }
-        if collection == "codebase" {
-            let needs_default = embedding_options
-                .repo_name
-                .as_ref()
-                .map(|s| s.trim().is_empty())
-                .unwrap_or(true);
-            if needs_default {
-                if let Some(zf) = p.zip_filename.as_deref().filter(|s| !s.is_empty()) {
-                    let default_name = repo_name_from_zip_filename(zf);
-                    if !default_name.is_empty() {
-                        info!(
-                            "process_zip_upload: defaulting repo_name to {default_name} from zip"
-                        );
-                        embedding_options.repo_name = Some(default_name);
-                    }
+        let is_codebase = collection == "codebase";
+        let needs_default = embedding_options
+            .repo_name
+            .as_ref()
+            .is_none_or(|s| s.trim().is_empty());
+        if is_codebase && needs_default {
+            if let Some(zf) = p.zip_filename.as_deref().filter(|s| !s.is_empty()) {
+                let default_name = repo_name_from_zip_filename(zf);
+                if !default_name.is_empty() {
+                    info!("process_zip_upload: defaulting repo_name to {default_name} from zip");
+                    embedding_options.repo_name = Some(default_name);
                 }
             }
         }
-        if collection == "codebase" {
-            if let Some(repo_name) = embedding_options
-                .repo_name
-                .as_deref()
-                .filter(|name| !name.is_empty())
-            {
-                self.qdrant
-                    .delete_items(
-                        &collection,
-                        None,
-                        Some(Filter::must([Condition::matches(
-                            "repo_name",
-                            repo_name.to_string(),
-                        )])),
-                    )
-                    .await
-                    .context("deleting prior codebase vectors for zip")?;
-            }
-        } else if let Some(zip_filename) = p.zip_filename.as_deref().filter(|name| !name.is_empty())
-        {
-            self.qdrant
-                .delete_items(
-                    &collection,
-                    None,
-                    Some(Filter::must([Condition::matches(
-                        "zip_filename",
-                        zip_filename.to_string(),
-                    )])),
-                )
-                .await
-                .context("deleting prior document vectors for zip")?;
-        }
-        let repo_name_for_dispatch = if collection == "codebase" {
+        let repo_name_for_dispatch = if is_codebase {
             embedding_options.repo_name.as_deref()
         } else {
             None
         };
+        let (prior_key, prior_value, prior_kind) = if is_codebase {
+            ("repo_name", repo_name_for_dispatch, "codebase")
+        } else {
+            ("zip_filename", p.zip_filename.as_deref(), "document")
+        };
+        if let Some(value) = prior_value.filter(|name| !name.is_empty()) {
+            let filter = Filter::must([Condition::matches(prior_key, value.to_string())]);
+            self.qdrant
+                .delete_items(&collection, None, Some(filter))
+                .await
+                .with_context(|| format!("deleting prior {prior_kind} vectors for zip"))?;
+        }
 
         let filter = IngestFilter::new(
             embedding_options.code_files_only.unwrap_or(true),
@@ -304,6 +371,7 @@ impl IngestionService {
             .filter(|p| filter.allows(p, p.strip_prefix(&extract_dir).unwrap_or(p)))
             .collect();
         file_paths.sort();
+        let strip_root = single_root_dir(&extract_dir);
 
         let total_files = file_paths.len().max(1);
         info!(
@@ -332,7 +400,7 @@ impl IngestionService {
         // backwards, but still forward every update so the current stage
         // message is always shown.
         let max_pct = AtomicI32::new(19);
-        let file_progress: crate::worker::ProgressCallback = {
+        let file_progress: ProgressCallback = {
             let outer = progress.clone();
             Arc::new(move |pct, msg| -> crate::worker::progress::ProgressFuture {
                 let high = max_pct.fetch_max(pct, Ordering::SeqCst);
@@ -356,22 +424,20 @@ impl IngestionService {
                 let extract_dir = &extract_dir;
                 let repo_name = repo_name_for_dispatch;
                 let cancel = cancel.clone();
+                let strip_root = strip_root.as_deref();
                 async move {
                     // A cancelled zip stops before the next file starts; the
                     // worker deletes the partially written data afterwards.
                     if cancel.is_cancelled() {
                         return;
                     }
-                    let file_name = path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("unknown")
-                        .to_string();
+                    let file_name = file_name_or(path, "unknown");
                     let rel = path
                         .strip_prefix(extract_dir.as_path())
                         .unwrap_or(path.as_path())
                         .display()
                         .to_string();
+                    let repo_path = repo_relative_path(path, extract_dir, strip_root);
                     let (file_start, file_end) = zip_file_progress_bounds(idx, total_files);
                     debug!(
                         "process_zip_upload: file {}/{} pct={}-{} path={}",
@@ -394,18 +460,22 @@ impl IngestionService {
 
                     let file_t0 = std::time::Instant::now();
                     // One bad file must not abort the whole zip job.
+                    let target = FileTarget {
+                        path,
+                        repo_path: Some(&repo_path),
+                        collection,
+                        repo_name,
+                        options: embedding_options,
+                    };
+                    let band = ProgressBand {
+                        progress: &file_progress,
+                        start: file_start,
+                        end: file_end,
+                        cancel: &cancel,
+                    };
                     let result = catch_async_panic(
                         &format!("ingest {rel}"),
-                        ingest.ingest_text_file_with_range(
-                            path,
-                            collection,
-                            repo_name,
-                            embedding_options,
-                            &file_progress,
-                            file_start,
-                            file_end,
-                            &cancel,
-                        ),
+                        ingest.ingest_file(target, &band),
                     )
                     .await;
                     let file_ms = file_t0.elapsed().as_millis();
@@ -473,10 +543,10 @@ impl IngestionService {
         let _ = std::fs::remove_file(&p.zip_path);
 
         if errors.is_empty() {
-            Ok(format!("Processed {processed} file(s) from zip."))
+            Ok(format!("Processed {processed} chunk(s) from zip."))
         } else {
             Ok(format!(
-                "Processed {processed} file(s); {} error(s): {}",
+                "Processed {processed} chunk(s); {} error(s): {}",
                 errors.len(),
                 errors.join("; ")
             ))
@@ -487,135 +557,105 @@ impl IngestionService {
     pub async fn process_documents_upload(
         &self,
         params: serde_json::Value,
-        progress: crate::worker::ProgressCallback,
+        progress: ProgressCallback,
         cancel: CancellationToken,
     ) -> Result<String> {
-        let p: ProcessDocParams = serde_json::from_value(params)
-            .map_err(|e| {
-                error!("process_documents_upload: invalid params: {e:#}");
-                anyhow!("invalid params: {e:#}")
-            })
-            .context("deserializing process_documents_upload params")?;
-        info!(
-            "process_documents_upload: path={} group={:?}",
-            p.path, p.group
-        );
-        let display = Path::new(&p.path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("document");
-        ensure_not_cancelled(&cancel)?;
-        progress(5, Some(format!("Loading {display}"))).await;
-
-        if !Path::new(&p.path).exists() {
-            error!("process_documents_upload: path does not exist: {}", p.path);
-            return Err(anyhow!("Path {} does not exist", p.path));
-        }
+        let task = "process_documents_upload";
+        let p: ProcessDocParams = parse_params(params, task)?;
+        info!("{task}: path={} group={:?}", p.path, p.group);
+        start_upload(task, &p.path, "document", &progress, &cancel).await?;
         let collection = p.collection.unwrap_or_else(|| "general".to_string());
         self.qdrant.ensure_collection(&collection).await?;
-        let display = strip_job_prefix(display).unwrap_or_else(|| display.to_string());
-        let mut delete_conditions = vec![Condition::matches("file_name", display.clone())];
-        if let Some(group) = p.group.as_deref().filter(|group| !group.is_empty()) {
-            delete_conditions.push(Condition::matches("group", group.to_string()));
-        }
-        if let Some(user_id) = p
-            .metadata
-            .as_ref()
-            .and_then(|metadata| metadata.pointer("/user_id"))
-            .and_then(|value| value.as_str())
-        {
-            delete_conditions.push(Condition::matches("user_id", user_id.to_string()));
-        }
+        let delete_conditions = upload_conditions(
+            &p.path,
+            UploadScope::Group(p.group.as_deref()),
+            metadata_user_id(p.metadata.as_ref()),
+        );
         self.qdrant
             .delete_items(&collection, None, Some(Filter::must(delete_conditions)))
             .await
             .context("deleting prior document vectors")?;
 
+        let options = EmbeddingOptions {
+            collection: Some(collection.clone()),
+            repo_name: None,
+            group: p.group,
+            filter_test_files: None,
+            code_files_only: None,
+            metadata: p.metadata,
+        };
+        let target = FileTarget {
+            path: Path::new(&p.path),
+            repo_path: None,
+            collection: &collection,
+            repo_name: None,
+            options: &options,
+        };
         let n = catch_async_panic(
             &format!("document {}", p.path),
-            self.ingest_text_file_with_range(
-                Path::new(&p.path),
-                &collection,
-                None,
-                &EmbeddingOptions {
-                    collection: Some(collection.clone()),
-                    repo_name: None,
-                    group: p.group.clone(),
-                    filter_test_files: None,
-                    code_files_only: None,
-                    metadata: p.metadata.clone(),
-                },
-                &progress,
-                10,
-                95,
-                &cancel,
-            ),
+            self.ingest_file(target, &ProgressBand::upload(&progress, &cancel)),
         )
         .await?;
-
-        ensure_not_cancelled(&cancel)?;
-        let _ = std::fs::remove_file(&p.path);
-
-        progress(100, Some("Document processing complete".to_string())).await;
-        Ok(format!("Processed {n} chunk(s)."))
+        finish_upload(
+            &p.path,
+            n,
+            "Document processing complete",
+            &progress,
+            &cancel,
+        )
+        .await
     }
 
     /// Process a single code file upload: read, chunk, embed, upsert.
     pub async fn process_code_file_upload(
         &self,
         params: serde_json::Value,
-        progress: crate::worker::ProgressCallback,
+        progress: ProgressCallback,
         cancel: CancellationToken,
     ) -> Result<String> {
-        let p: ProcessCodeFileParams = serde_json::from_value(params)
-            .map_err(|e| {
-                error!("process_code_file_upload: invalid params: {e:#}");
-                anyhow!("invalid params: {e:#}")
-            })
-            .context("deserializing process_code_file_upload params")?;
-        info!(
-            "process_code_file_upload: path={} collection={}",
-            p.path, p.collection
-        );
-        let display = Path::new(&p.path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("code");
-        ensure_not_cancelled(&cancel)?;
-        progress(5, Some(format!("Loading {display}"))).await;
-
-        if !Path::new(&p.path).exists() {
-            error!("process_code_file_upload: path does not exist: {}", p.path);
-            return Err(anyhow!("Path {} does not exist", p.path));
-        }
+        let task = "process_code_file_upload";
+        let p: ProcessCodeFileParams = parse_params(params, task)?;
+        info!("{task}: path={} collection={}", p.path, p.collection);
+        start_upload(task, &p.path, "code", &progress, &cancel).await?;
         self.qdrant.ensure_collection(&p.collection).await?;
+        let delete_conditions = upload_conditions(
+            &p.path,
+            UploadScope::Repo(p.repo_name.as_deref()),
+            metadata_user_id(p.metadata.as_ref()),
+        );
+        self.qdrant
+            .delete_items(&p.collection, None, Some(Filter::must(delete_conditions)))
+            .await
+            .context("deleting prior code file vectors")?;
 
+        let options = EmbeddingOptions {
+            collection: Some(p.collection.clone()),
+            repo_name: p.repo_name.clone(),
+            group: None,
+            filter_test_files: None,
+            code_files_only: None,
+            metadata: p.metadata,
+        };
+        let target = FileTarget {
+            path: Path::new(&p.path),
+            repo_path: None,
+            collection: &p.collection,
+            repo_name: p.repo_name.as_deref(),
+            options: &options,
+        };
         let n = catch_async_panic(
             &format!("code file {}", p.path),
-            self.ingest_text_file_with_range(
-                Path::new(&p.path),
-                &p.collection,
-                p.repo_name.as_deref(),
-                &EmbeddingOptions {
-                    collection: Some(p.collection.clone()),
-                    repo_name: p.repo_name.clone(),
-                    group: None,
-                    filter_test_files: None,
-                    code_files_only: None,
-                    metadata: p.metadata.clone(),
-                },
-                &progress,
-                10,
-                95,
-                &cancel,
-            ),
+            self.ingest_file(target, &ProgressBand::upload(&progress, &cancel)),
         )
         .await?;
-
-        ensure_not_cancelled(&cancel)?;
-        let _ = std::fs::remove_file(&p.path);
-        progress(100, Some("Code file processing complete".to_string())).await;
-        Ok(format!("Processed {n} chunk(s)."))
+        finish_upload(
+            &p.path,
+            n,
+            "Code file processing complete",
+            &progress,
+            &cancel,
+        )
+        .await
     }
 
     /// Website embedding: scrape + chunk + embed + upsert. Mirrors the
@@ -623,15 +663,10 @@ impl IngestionService {
     pub async fn process_website_embed(
         &self,
         params: serde_json::Value,
-        progress: crate::worker::ProgressCallback,
+        progress: ProgressCallback,
         cancel: CancellationToken,
     ) -> Result<String> {
-        let p: ProcessWebsiteParams = serde_json::from_value(params)
-            .map_err(|e| {
-                error!("process_website_embed: invalid params: {e:#}");
-                anyhow!("invalid params: {e:#}")
-            })
-            .context("deserializing process_website_embed params")?;
+        let p: ProcessWebsiteParams = parse_params(params, "process_website_embed")?;
         info!(
             "process_website_embed: {} urls, group={}",
             p.urls.len(),
@@ -659,11 +694,7 @@ impl IngestionService {
         let _cache_guard = HtmlCacheClearGuard;
 
         ensure_not_cancelled(&cancel)?;
-        progress(
-            5,
-            Some(format!("Scraping {} page(s)", p.urls.len())),
-        )
-        .await;
+        progress(5, Some(format!("Scraping {} page(s)", p.urls.len()))).await;
         let chunks = catch_async_panic("website scrape", async {
             ingestion::website::process_website_with_progress(
                 &p.urls,
@@ -683,17 +714,15 @@ impl IngestionService {
         }
         self.qdrant.ensure_collection("general").await?;
         progress(30, Some(format!("Embedding {} chunks", chunks.len()))).await;
+        let band = ProgressBand {
+            progress: &progress,
+            start: 30,
+            end: 100,
+            cancel: &cancel,
+        };
         let n = catch_async_panic(
             "website embed",
-            self.embed_and_upsert_documents(
-                &chunks,
-                "general",
-                serde_json::Value::Object(serde_json::Map::new()),
-                &progress,
-                30,
-                100,
-                &cancel,
-            ),
+            self.embed_and_upsert_documents(&chunks, "general", serde_json::Map::new(), &band),
         )
         .await?;
         progress(100, Some("Website embedding complete".to_string())).await;
@@ -714,23 +743,29 @@ impl IngestionService {
             async move { ingest.process_zip_upload(params, progress, cancel).await }
         });
         let ingest = self.clone();
-        reg.register("process_documents_upload", move |params, progress, cancel| {
-            let ingest = ingest.clone();
-            async move {
-                ingest
-                    .process_documents_upload(params, progress, cancel)
-                    .await
-            }
-        });
+        reg.register(
+            "process_documents_upload",
+            move |params, progress, cancel| {
+                let ingest = ingest.clone();
+                async move {
+                    ingest
+                        .process_documents_upload(params, progress, cancel)
+                        .await
+                }
+            },
+        );
         let ingest = self.clone();
-        reg.register("process_code_file_upload", move |params, progress, cancel| {
-            let ingest = ingest.clone();
-            async move {
-                ingest
-                    .process_code_file_upload(params, progress, cancel)
-                    .await
-            }
-        });
+        reg.register(
+            "process_code_file_upload",
+            move |params, progress, cancel| {
+                let ingest = ingest.clone();
+                async move {
+                    ingest
+                        .process_code_file_upload(params, progress, cancel)
+                        .await
+                }
+            },
+        );
         let ingest = self.clone();
         reg.register("process_website_scrape", move |params, progress, cancel| {
             let ingest = ingest.clone();
@@ -743,27 +778,25 @@ impl IngestionService {
     /// upserted. Dispatches code files (by extension) through the language-
     /// specific chunkers; everything else goes through `document_loaders`
     /// then the text-splitter.
-    async fn ingest_text_file_with_range(
-        &self,
-        path: &Path,
-        collection: &str,
-        repo_name: Option<&str>,
-        options: &EmbeddingOptions,
-        progress: &crate::worker::ProgressCallback,
-        range_start: i32,
-        range_end: i32,
-        cancel: &CancellationToken,
-    ) -> Result<usize> {
+    async fn ingest_file(&self, target: FileTarget<'_>, band: &ProgressBand<'_>) -> Result<usize> {
+        let FileTarget {
+            path,
+            repo_path,
+            collection,
+            repo_name,
+            options,
+        } = target;
+        let ProgressBand {
+            progress,
+            start: range_start,
+            cancel,
+            ..
+        } = *band;
         if file_filters::is_junk(path) {
             return Ok(0);
         }
         ensure_not_cancelled(cancel)?;
-        let raw_file_name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown")
-            .to_string();
-        let file_name = strip_job_prefix(&raw_file_name).unwrap_or(raw_file_name);
+        let file_name = strip_job_prefix(file_name_or(path, "unknown"));
         let display = file_name.clone();
         let doc_type = path
             .extension()
@@ -823,15 +856,7 @@ impl IngestionService {
                 })
             })
             .await
-            .map_err(|e| {
-                if e.is_panic() {
-                    let msg = panic_payload_to_string(&e.into_panic());
-                    record_caught_panic(&format!("load task {path_display}"), &msg);
-                    anyhow!("load task panicked for {path_display}: {msg}")
-                } else {
-                    anyhow!("load task join error for {path_display}: {e}")
-                }
-            })??;
+            .map_err(|e| join_error("load", &path_display, e))??;
             for chunk in &mut loaded {
                 chunk.file_name = file_name.clone();
                 chunk.metadata.insert(
@@ -840,10 +865,7 @@ impl IngestionService {
                 );
             }
             let load_ms = load_t0.elapsed().as_millis();
-            debug!(
-                "ingest: loaded document path={} ms={load_ms}",
-                path_display
-            );
+            debug!("ingest: loaded document path={} ms={load_ms}", path_display);
 
             let source_pages = loaded.len();
             let source_chars: usize = loaded.iter().map(|chunk| chunk.content.len()).sum();
@@ -892,15 +914,9 @@ impl IngestionService {
                 )
                 .await;
             }
-            let split_chunks = split_task.await.map_err(|e| {
-                if e.is_panic() {
-                    let msg = panic_payload_to_string(&e.into_panic());
-                    record_caught_panic(&format!("split task {path_display}"), &msg);
-                    anyhow!("split task panicked for {path_display}: {msg}")
-                } else {
-                    anyhow!("split task join error for {path_display}: {e}")
-                }
-            })??;
+            let split_chunks = split_task
+                .await
+                .map_err(|e| join_error("split", &path_display, e))??;
             let split_ms = split_t0.elapsed().as_millis();
             debug!(
                 "ingest: split document path={} source_documents={} source_chars={} chunks={} elapsed_ms={split_ms}",
@@ -922,35 +938,35 @@ impl IngestionService {
             )),
         )
         .await;
-        let extra_meta = build_base_metadata(&file_name, &doc_type, repo_name, options);
-        let n = self
-            .embed_and_upsert_documents(
-                &chunks,
-                collection,
-                extra_meta,
-                progress,
-                range_start,
-                range_end,
-                cancel,
-            )
+        let extra_meta = build_base_metadata(
+            &file_name,
+            repo_path.unwrap_or(&file_name),
+            &doc_type,
+            repo_name,
+            options,
+            file_filters::data_file_stats(path),
+        );
+        self.embed_and_upsert_documents(&chunks, collection, extra_meta, band)
             .await
-            .with_context(|| format!("embed/upsert failed for {path_display}"))?;
-        Ok(n)
+            .with_context(|| format!("embed/upsert failed for {path_display}"))
     }
 
     /// Embed a list of prebuilt `DocumentChunk`s into Qdrant, merging
-    /// `extra_meta` into every chunk's metadata. The progress range is
-    /// mapped onto `[range_start, range_end]` percent.
+    /// `extra_meta` into every chunk's metadata. Progress is mapped onto
+    /// `band`.
     async fn embed_and_upsert_documents(
         &self,
         chunks: &[ingestion::DocumentChunk],
         collection: &str,
-        extra_meta: serde_json::Value,
-        progress: &crate::worker::ProgressCallback,
-        range_start: i32,
-        range_end: i32,
-        cancel: &CancellationToken,
+        extra_meta: serde_json::Map<String, serde_json::Value>,
+        band: &ProgressBand<'_>,
     ) -> Result<usize> {
+        let ProgressBand {
+            progress,
+            start: range_start,
+            end: range_end,
+            cancel,
+        } = *band;
         if chunks.is_empty() {
             return Ok(0);
         }
@@ -961,16 +977,23 @@ impl IngestionService {
 
         let texts: Vec<String> = chunks.iter().map(|c| c.chunk_embedding_text()).collect();
         let documents: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
-        let chunk_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
 
-        let total_batches =
-            (((chunks.len() + EMBED_BATCH_SIZE - 1) / EMBED_BATCH_SIZE) as i32).max(1);
-        let mut embeddings_list: Vec<Vec<f32>> = Vec::with_capacity(chunks.len());
+        // Each forward pass pads to its longest input, so batching texts of
+        // similar length avoids wasting compute on padding tokens. Results are
+        // written back to their original positions.
+        let order = order_by_length(&texts);
+
+        let total_batches = (chunks.len().div_ceil(EMBED_BATCH_SIZE) as i32).max(1);
+        let mut embeddings_list: Vec<Vec<f32>> = vec![Vec::new(); chunks.len()];
         for batch_index in 0..total_batches {
             ensure_not_cancelled(cancel)?;
             let batch_start = (batch_index as usize) * EMBED_BATCH_SIZE;
             let batch_end = (batch_start + EMBED_BATCH_SIZE).min(chunks.len());
-            let batch_texts: Vec<&str> = chunk_refs[batch_start..batch_end].to_vec();
+            let batch_positions = &order[batch_start..batch_end];
+            let mut batch_texts: Vec<&str> = Vec::with_capacity(batch_positions.len());
+            for &position in batch_positions {
+                batch_texts.push(texts[position].as_str());
+            }
             let batch_embeddings = tokio::task::block_in_place(|| {
                 catch_sync_panic(
                     &format!("dense encode batch {}/{}", batch_index + 1, total_batches),
@@ -991,7 +1014,9 @@ impl IngestionService {
                     batch_texts.len()
                 ));
             }
-            embeddings_list.extend(batch_embeddings);
+            for (&position, embedding) in batch_positions.iter().zip(batch_embeddings) {
+                embeddings_list[position] = embedding;
+            }
             let pct = map_batch_progress(range_start, range_end, batch_index, total_batches);
             progress(
                 pct,
@@ -1009,10 +1034,8 @@ impl IngestionService {
             .enumerate()
             .map(|(i, c)| {
                 let mut meta = c.chunk_metadata();
-                if let serde_json::Value::Object(extra_map) = &extra_meta {
-                    for (k, v) in extra_map {
-                        meta.insert(k.clone(), v.clone());
-                    }
+                for (k, v) in &extra_meta {
+                    meta.insert(k.clone(), v.clone());
                 }
                 if !meta.contains_key("chunk_index") {
                     meta.insert("chunk_index".into(), serde_json::Value::from(i as i64));
@@ -1051,7 +1074,7 @@ impl IngestionService {
 /// Re-tokenize a list of `DocumentChunk`s. Each input chunk whose `content`
 /// exceeds the splitter's chunk size becomes a sequence of smaller chunks
 /// inheriting the same metadata. Used by
-/// `IngestionService::ingest_text_file` for non-code uploads. `md`/`mdx`
+/// `IngestionService::ingest_file` for non-code uploads. `md`/`mdx`
 /// chunks are split by the markdown-aware splitter (structure-aligned);
 /// everything else uses the plain text splitter.
 ///
@@ -1125,7 +1148,7 @@ fn split_document_chunks_with_progress(
             // Avoid one database/event write per PDF page while preserving
             // useful visibility for very large documents.
             let done = completed.fetch_add(1, Ordering::SeqCst) + 1;
-            if done == total || done % 100 == 0 {
+            if done == total || done.is_multiple_of(100) {
                 report(ChunkingProgress {
                     completed: done,
                     total,
@@ -1154,53 +1177,126 @@ fn split_document_chunks_with_progress(
     out
 }
 
-/// Strip the job-id UUID prefix from a temp filename (mirrors the Python
-/// `embedding_utils.strip_job_prefix`).
-pub fn strip_job_prefix(name: &str) -> Option<String> {
-    let re = regex::Regex::new(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}_")
-        .ok()?;
-    let stripped = re.replace(name, "").to_string();
-    Some(stripped)
+/// Indices of `texts` ordered from shortest to longest (stable for ties).
+fn order_by_length(texts: &[String]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..texts.len()).collect();
+    order.sort_by_key(|&i| texts[i].len());
+    order
 }
 
-/// Build the base metadata payload (file_name, doc_type, repo_name, group,
-/// + user-provided metadata). Chunk-specific fields (chunk_index, content)
-/// are added by the caller.
+/// Strip the `<job uuid>_` prefix that uploads receive in the temp
+/// directory. Accepts both hyphenated and simple (32 hex) UUID forms, since
+/// older builds wrote the simple form. Names without a UUID prefix are
+/// returned unchanged.
+pub fn strip_job_prefix(name: &str) -> String {
+    if let Some((prefix, rest)) = name.split_once('_') {
+        if !rest.is_empty() && Uuid::try_parse(prefix).is_ok() {
+            return rest.to_string();
+        }
+    }
+    name.to_string()
+}
+
+/// The directory GitHub-style archives wrap everything in (`repo-main/`),
+/// when `extract_dir` holds exactly one entry and it is a directory.
+fn single_root_dir(extract_dir: &Path) -> Option<PathBuf> {
+    let mut entries = std::fs::read_dir(extract_dir).ok()?;
+    let first = entries.next()?.ok()?;
+    if entries.next().is_some() || !first.file_type().ok()?.is_dir() {
+        return None;
+    }
+    Some(first.path())
+}
+
+/// Path of `file` inside the uploaded repository, with `/` separators and
+/// without the archive's wrapping directory, e.g. `src/Fl_Button.cxx`.
+fn repo_relative_path(file: &Path, extract_dir: &Path, root: Option<&Path>) -> String {
+    let base = root.unwrap_or(extract_dir);
+    let relative = file
+        .strip_prefix(base)
+        .or_else(|_| file.strip_prefix(extract_dir))
+        .unwrap_or(file);
+    let mut parts: Vec<String> = Vec::new();
+    for component in relative.components() {
+        parts.push(component.as_os_str().to_string_lossy().into_owned());
+    }
+    parts.join("/")
+}
+
+/// What a single-file upload is scoped by besides its file name: documents
+/// by `group`, code files by `repo_name`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum UploadScope<'a> {
+    Group(Option<&'a str>),
+    Repo(Option<&'a str>),
+}
+
+/// `user_id` from an upload's user metadata.
+pub(crate) fn metadata_user_id(metadata: Option<&serde_json::Value>) -> Option<&str> {
+    metadata
+        .and_then(|m| m.pointer("/user_id"))
+        .and_then(|v| v.as_str())
+}
+
+/// Qdrant conditions matching the chunks of a single uploaded file: its
+/// `file_name` (job prefix stripped), plus its non-empty [`UploadScope`]
+/// value and `user_id` when given. A re-upload replaces exactly these chunks.
+pub(crate) fn upload_conditions(
+    path: &str,
+    scope: UploadScope<'_>,
+    user_id: Option<&str>,
+) -> Vec<Condition> {
+    let file_name = strip_job_prefix(file_name_or(Path::new(path), "unknown"));
+    let mut conditions = vec![Condition::matches("file_name", file_name)];
+    let (key, value) = match scope {
+        UploadScope::Group(group) => ("group", group),
+        UploadScope::Repo(repo_name) => ("repo_name", repo_name),
+    };
+    if let Some(value) = value.filter(|v| !v.is_empty()) {
+        conditions.push(Condition::matches(key, value.to_string()));
+    }
+    if let Some(user_id) = user_id {
+        conditions.push(Condition::matches("user_id", user_id.to_string()));
+    }
+    conditions
+}
+
+/// Build the base metadata payload: file_name, path, doc_type, repo_name,
+/// group, user-provided metadata, and `file_lines`/`file_bytes` for data
+/// files. Chunk-specific fields (chunk_index, content) are added by the
+/// caller.
 fn build_base_metadata(
     file_name: &str,
+    repo_path: &str,
     doc_type: &str,
     repo_name: Option<&str>,
     options: &EmbeddingOptions,
-) -> serde_json::Value {
+    data_stats: Option<file_filters::DataFileStats>,
+) -> serde_json::Map<String, serde_json::Value> {
     let mut map = serde_json::Map::new();
-    map.insert(
-        "file_name".to_string(),
-        serde_json::Value::String(file_name.to_string()),
-    );
-    map.insert(
-        "doc_type".to_string(),
-        serde_json::Value::String(doc_type.to_string()),
-    );
+    map.insert("file_name".into(), file_name.into());
+    map.insert("path".into(), repo_path.into());
+    map.insert("doc_type".into(), doc_type.into());
     if let Some(rn) = repo_name {
-        map.insert(
-            "repo_name".to_string(),
-            serde_json::Value::String(rn.to_string()),
-        );
+        map.insert("repo_name".into(), rn.into());
     }
     if let Some(group) = &options.group {
-        map.insert(
-            "group".to_string(),
-            serde_json::Value::String(group.clone()),
-        );
+        map.insert("group".into(), group.as_str().into());
     }
     if let Some(serde_json::Value::Object(user_meta)) = &options.metadata {
         for (k, v) in user_meta {
             map.insert(k.clone(), v.clone());
         }
     }
-    let now = crate::worker::progress::now_iso();
-    map.insert("created_at".to_string(), serde_json::Value::String(now));
-    serde_json::Value::Object(map)
+    if let Some(stats) = data_stats {
+        map.insert("file_lines".into(), stats.lines.into());
+        map.insert("file_bytes".into(), stats.bytes.into());
+    }
+    map.insert(
+        "created_at".into(),
+        crate::worker::progress::now_iso().into(),
+    );
+    map
 }
 
 pub(crate) fn strip_zip_ext(zip_path: &str) -> String {
@@ -1322,6 +1418,26 @@ mod tests {
     }
 
     #[test]
+    fn strip_job_prefix_accepts_both_uuid_forms() {
+        assert_eq!(
+            strip_job_prefix("123e4567-e89b-12d3-a456-426614174000_report.pdf"),
+            "report.pdf"
+        );
+        assert_eq!(
+            strip_job_prefix("123e4567e89b12d3a456426614174000_report.pdf"),
+            "report.pdf"
+        );
+        assert_eq!(strip_job_prefix("my_report.pdf"), "my_report.pdf");
+        assert_eq!(strip_job_prefix("report.pdf"), "report.pdf");
+    }
+
+    #[test]
+    fn order_by_length_sorts_shortest_first_and_keeps_every_index() {
+        let texts = vec!["ccc".to_string(), "a".to_string(), "bb".to_string()];
+        assert_eq!(order_by_length(&texts), vec![1, 2, 0]);
+    }
+
+    #[test]
     fn repo_name_from_zip_filename_strips_extension() {
         assert_eq!(
             repo_name_from_zip_filename("OptionsPricing-main.zip"),
@@ -1330,6 +1446,36 @@ mod tests {
         assert_eq!(repo_name_from_zip_filename("MyRepo.ZIP"), "MyRepo");
         assert_eq!(repo_name_from_zip_filename("/path/to/repo.zip"), "repo");
         assert_eq!(repo_name_from_zip_filename("noext"), "noext");
+    }
+
+    #[test]
+    fn repo_relative_path_strips_the_archive_wrapping_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("fltk-master");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/Fl.cxx"), "").unwrap();
+
+        let wrapper = single_root_dir(dir.path());
+        assert_eq!(wrapper.as_deref(), Some(root.as_path()));
+        assert_eq!(
+            repo_relative_path(&root.join("src/Fl.cxx"), dir.path(), wrapper.as_deref()),
+            "src/Fl.cxx"
+        );
+    }
+
+    #[test]
+    fn repo_relative_path_keeps_top_level_when_archive_has_several_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("README.md"), "").unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "").unwrap();
+
+        let wrapper = single_root_dir(dir.path());
+        assert!(wrapper.is_none());
+        assert_eq!(
+            repo_relative_path(&dir.path().join("src/main.rs"), dir.path(), None),
+            "src/main.rs"
+        );
     }
 
     #[test]
@@ -1342,8 +1488,7 @@ mod tests {
             code_files_only: None,
             metadata: Some(serde_json::json!({"source": "manual"})),
         };
-        let meta = build_base_metadata("notes.txt", "txt", None, &opts);
-        let map = meta.as_object().expect("metadata is object");
+        let map = build_base_metadata("notes.txt", "notes.txt", "txt", None, &opts, None);
         assert_eq!(map.get("file_name").unwrap().as_str().unwrap(), "notes.txt");
         assert_eq!(map.get("doc_type").unwrap().as_str().unwrap(), "txt");
         assert_eq!(map.get("group").unwrap().as_str().unwrap(), "docs");
@@ -1362,9 +1507,9 @@ mod tests {
             code_files_only: None,
             metadata: None,
         };
-        let meta = build_base_metadata("main.py", "py", Some("my_repo"), &opts);
-        let map = meta.as_object().unwrap();
+        let map = build_base_metadata("main.py", "src/main.py", "py", Some("my_repo"), &opts, None);
         assert_eq!(map.get("repo_name").unwrap().as_str().unwrap(), "my_repo");
+        assert_eq!(map.get("path").unwrap().as_str().unwrap(), "src/main.py");
     }
 
     #[test]
@@ -1460,36 +1605,17 @@ mod tests {
         assert!(s3 < e3);
     }
 
-    fn test_doc_splitter() -> Option<TextSplitter<Tokenizer>> {
-        let tok_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("resources/models/arctic-embed-xs/tokenizer.json");
-        if !tok_path.exists() {
-            return None;
-        }
-        let tokenizer = Tokenizer::from_file(&tok_path).ok()?;
-        let config = ChunkConfig::new(DEFAULT_CHUNK_SIZE)
-            .with_sizer(tokenizer)
-            .with_overlap(DEFAULT_CHUNK_OVERLAP)
-            .ok()?;
-        Some(TextSplitter::new(config))
-    }
-
-    fn test_markdown_splitter() -> Option<MarkdownSplitter<Tokenizer>> {
-        let tok_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("resources/models/arctic-embed-xs/tokenizer.json");
-        if !tok_path.exists() {
-            return None;
-        }
-        let tokenizer = Tokenizer::from_file(&tok_path).ok()?;
-        let config = ChunkConfig::new(DEFAULT_CHUNK_SIZE)
-            .with_sizer(tokenizer)
-            .with_overlap(DEFAULT_CHUNK_OVERLAP)
-            .ok()?;
-        Some(MarkdownSplitter::new(config))
-    }
-
     fn test_splitters() -> Option<(TextSplitter<Tokenizer>, MarkdownSplitter<Tokenizer>)> {
-        Some((test_doc_splitter()?, test_markdown_splitter()?))
+        let tok_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("resources/models/arctic-embed-xs/tokenizer.json");
+        if !tok_path.exists() {
+            return None;
+        }
+        let config = || chunk_config(&tok_path, DOC_CHUNK_SIZE, DOC_CHUNK_OVERLAP, "test").ok();
+        Some((
+            TextSplitter::new(config()?),
+            MarkdownSplitter::new(config()?),
+        ))
     }
 
     fn assert_valid_split(split: &[ingestion::DocumentChunk]) {

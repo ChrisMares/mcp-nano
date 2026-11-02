@@ -682,7 +682,6 @@ installation is required. A REST-only client via `reqwest` remains a fallback.
 | `libchm` | CHM document extraction |
 | `quick-xml` + `csv` | ODT/XML and CSV document loading primitives |
 | `url` | URL resolution and normalization for crawling |
-| `dotenvy` | Development environment loading |
 | `anyhow` + `thiserror` | Application and typed error handling |
 | `tracing` + `tracing-subscriber` | Structured application logging |
 | `tempfile` (dev) | Isolated filesystem fixtures for Rust tests |

@@ -13,8 +13,8 @@
 mod common;
 
 use common::{cosine, dense_ready, reranker_ready};
-use mcp_nano_lib::services::embedders::{EncodeDocuments, EncodeQuery};
 use mcp_nano_lib::services::embedder_state::EmbedderState;
+use mcp_nano_lib::services::embedders::{EncodeDocuments, EncodeQuery};
 
 #[test]
 fn encode_query_returns_expected_dimension_vector() {
@@ -23,7 +23,11 @@ fn encode_query_returns_expected_dimension_vector() {
         return;
     };
     let v = emb.encode_query("hello world").expect("encode_query");
-    assert_eq!(v.len(), emb.dim(), "vector dimension must match model hidden_size");
+    assert_eq!(
+        v.len(),
+        emb.dim(),
+        "vector dimension must match model hidden_size"
+    );
     assert_eq!(v.len(), 384, "arctic-embed-xs is 384-dim");
     assert!(v.iter().all(|x| x.is_finite()), "no NaN/inf in embedding");
     assert!(
@@ -43,9 +47,7 @@ fn encode_documents_batch_preserves_count_and_dimension() {
         "Python is great for machine learning.",
         "Vector databases enable semantic search.",
     ];
-    let vecs = emb
-        .encode_documents(&docs, 2)
-        .expect("encode_documents");
+    let vecs = emb.encode_documents(&docs, 2).expect("encode_documents");
     assert_eq!(vecs.len(), docs.len());
     for v in &vecs {
         assert_eq!(v.len(), emb.dim());
@@ -65,7 +67,10 @@ fn similar_texts_produce_higher_similarity_than_unrelated() {
 
     let sim_same = cosine(&a, &b);
     let sim_diff = cosine(&a, &c);
-    assert!(sim_same > 0.95, "same text should be near-identical: {sim_same}");
+    assert!(
+        sim_same > 0.95,
+        "same text should be near-identical: {sim_same}"
+    );
     assert!(
         sim_same > sim_diff,
         "same text should be more similar than unrelated text: same={sim_same}, diff={sim_diff}"
@@ -152,6 +157,9 @@ fn embedder_state_reports_selected_device() {
         "unexpected device_mode: {}",
         state.device_mode()
     );
-    let embedding = state.dense.encode_query("GPU device selection test").expect("encode query");
+    let embedding = state
+        .dense
+        .encode_query("GPU device selection test")
+        .expect("encode query");
     assert_eq!(embedding.len(), state.dense.dim());
 }

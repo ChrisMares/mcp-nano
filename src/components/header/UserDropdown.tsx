@@ -16,7 +16,7 @@ export default function UserDropdown() {
         aria-label="Account menu"
         aria-haspopup="menu"
         aria-expanded={isOpen}
-        className="flex items-center gap-2 text-foreground hover:text-foreground/80 transition-colors focus:outline-none shadow-none"
+        className="dropdown-toggle flex items-center gap-2 text-foreground hover:text-foreground/80 transition-colors focus:outline-none shadow-none"
       >
         <span className="w-9 h-9 rounded-full bg-primary/10 flex items-center justify-center">
           <UserCircleIcon className="w-6 h-6 text-primary" />

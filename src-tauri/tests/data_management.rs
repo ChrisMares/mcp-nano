@@ -4,7 +4,6 @@
 //! Qdrant-backed tests (get_files facet, get_websites facet) are marked
 //! `#[ignore]` and require the bundled Qdrant binary.
 
-
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
@@ -109,12 +108,11 @@ async fn delete_file_metadata_by_storage_object_id() {
     let pool = test_pool().await;
     seed_file_metadata(&pool).await;
 
-    let rows = sqlx::query_as::<_, FileMetadata>(
-        "SELECT * FROM file_metadata WHERE status = 'completed'",
-    )
-    .fetch_all(&pool)
-    .await
-    .expect("list before delete");
+    let rows =
+        sqlx::query_as::<_, FileMetadata>("SELECT * FROM file_metadata WHERE status = 'completed'")
+            .fetch_all(&pool)
+            .await
+            .expect("list before delete");
 
     let id = rows[0].storage_object_id.clone();
     sqlx::query("DELETE FROM file_metadata WHERE storage_object_id = ?")
@@ -123,18 +121,13 @@ async fn delete_file_metadata_by_storage_object_id() {
         .await
         .expect("delete");
 
-    let remaining = sqlx::query_as::<_, FileMetadata>(
-        "SELECT * FROM file_metadata WHERE status = 'completed'",
-    )
-    .fetch_all(&pool)
-    .await
-    .expect("list after delete");
+    let remaining =
+        sqlx::query_as::<_, FileMetadata>("SELECT * FROM file_metadata WHERE status = 'completed'")
+            .fetch_all(&pool)
+            .await
+            .expect("list after delete");
 
-    assert_eq!(
-        remaining.len(),
-        rows.len() - 1,
-        "should have one fewer row"
-    );
+    assert_eq!(remaining.len(), rows.len() - 1, "should have one fewer row");
 }
 
 #[test]

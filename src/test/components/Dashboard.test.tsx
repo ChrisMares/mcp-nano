@@ -1,7 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { screen, waitFor } from '@testing-library/react'
 import { invoke } from '@tauri-apps/api/core'
-import React from 'react'
 import { renderWithProviders } from '../helpers'
 
 const { useBackendStatus } = vi.hoisted(() => ({ useBackendStatus: vi.fn() }))
@@ -54,9 +53,7 @@ describe('Dashboard', () => {
             documents: [{ filename: 'a.pdf' }, { filename: 'b.md' }],
           }
         case 'get_mcp_servers':
-          return { servers: [{ id: 'srv1' }] }
-        case 'get_mcp_server':
-          return { server: { tools: [{ id: 't1' }, { id: 't2' }] } }
+          return { servers: [{ id: 'srv1', tools: [{ id: 't1' }, { id: 't2' }] }] }
         case 'get_websites':
           return { websites: [{ url: 'https://example.com' }] }
         default:
@@ -68,9 +65,7 @@ describe('Dashboard', () => {
 
     expect(await screen.findByText('Repositories')).toBeInTheDocument()
     await waitFor(() => {
-      expect(vi.mocked(invoke)).toHaveBeenCalledWith('get_mcp_servers')
-      expect(vi.mocked(invoke)).toHaveBeenCalledWith('get_mcp_server', { serverId: 'srv1' })
-      expect(vi.mocked(invoke)).toHaveBeenCalledWith('get_websites')
+      expect(screen.queryByText('Loading stats...')).not.toBeInTheDocument()
     })
 
     const cardValue = (label: string) =>

@@ -1,7 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import React from 'react'
 import ToolDetailsStep from '@/components/mcp/ToolDetailsStep'
 
 const baseProps = {
@@ -16,6 +15,8 @@ const baseProps = {
   onSave: vi.fn(),
   saving: false,
   saveLabel: 'Create Tool',
+  maxChunkLimit: 5,
+  onMaxChunkLimitChange: vi.fn(),
 }
 
 describe('ToolDetailsStep', () => {
@@ -109,4 +110,19 @@ describe('ToolDetailsStep', () => {
     expect(screen.getByText('Save Changes')).toBeInTheDocument()
   })
 
+  it('lists every selected repo, group, and website in the summary', () => {
+    render(
+      <ToolDetailsStep
+        {...baseProps}
+        name="t"
+        selectedRepos={new Set(['my-repo'])}
+        selectedGroups={new Set(['my-group'])}
+        selectedWebsites={new Set(['example.com'])}
+      />,
+    )
+    expect(screen.getByText('Selected Data')).toBeInTheDocument()
+    expect(screen.getByText('my-repo')).toBeInTheDocument()
+    expect(screen.getByText('my-group')).toBeInTheDocument()
+    expect(screen.getByText('example.com')).toBeInTheDocument()
+  })
 })

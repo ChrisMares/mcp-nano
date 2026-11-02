@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from "react";
 import { Link } from "react-router-dom";
-import { getFiles, getMcpServers, getMcpServer, getWebsites } from "@/utils/apicalls";
+import { getFiles, getMcpServers, getWebsites } from "@/utils/apicalls";
 import { Database, Search, Plug, Code2, FileText, Server, Wrench, Loader2, ArrowRight } from "lucide-react";
 import PageHead from "@/components/shared/PageHead";
 import { card, cardInner, btnPrimary } from "@/styles/classes";
@@ -68,15 +68,9 @@ const Dashboard: React.FC = () => {
       getFiles().catch(() => ({ repos: [], documents: [] })),
       getMcpServers().catch(() => ({ servers: [] })),
       getWebsites().catch(() => ({ websites: [] })),
-    ]).then(async ([filesRes, serversRes, websitesRes]) => {
+    ]).then(([filesRes, serversRes, websitesRes]) => {
       const servers = serversRes.servers || [];
-      const serverDetails = await Promise.all(
-        servers.map((s) => getMcpServer(s.id).catch(() => null))
-      );
-      const toolCount = serverDetails.reduce((sum, item) => {
-        if (!item) return sum;
-        return sum + (item.server?.tools?.length ?? 0);
-      }, 0);
+      const toolCount = servers.reduce((sum, server) => sum + (server.tools?.length ?? 0), 0);
       const websiteCount = websitesRes.websites?.length ?? 0;
 
       if (!cancelled) {

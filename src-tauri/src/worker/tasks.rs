@@ -10,8 +10,7 @@ use super::progress::ProgressCallback;
 
 /// A boxed future returned by task functions. `'static` so it owns all
 /// captured state (the closure can clone an `Arc<IngestionService>` into it).
-pub type BoxedTaskFuture =
-    Pin<Box<dyn Future<Output = Result<String>> + Send + 'static>>;
+pub type BoxedTaskFuture = Pin<Box<dyn Future<Output = Result<String>> + Send + 'static>>;
 
 /// A task function: given the deserialized `task_params` JSON, a progress
 /// callback and the job's cancellation token, run the task to completion.
@@ -22,9 +21,7 @@ pub type BoxedTaskFuture =
 /// Held inside an `Arc` so the registry can call it repeatedly without
 /// moving the captured services (e.g. `Arc<IngestionService>`).
 pub type TaskFn = Arc<
-    dyn Fn(serde_json::Value, ProgressCallback, CancellationToken) -> BoxedTaskFuture
-        + Send
-        + Sync,
+    dyn Fn(serde_json::Value, ProgressCallback, CancellationToken) -> BoxedTaskFuture + Send + Sync,
 >;
 
 /// Maps `job_status.task_name` -> callable. Built once at startup and

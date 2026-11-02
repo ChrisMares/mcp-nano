@@ -1,5 +1,5 @@
 import { useBackendStatus } from "@/hooks/use-backend-status";
-import type { BackendStatus } from "@/utils/apicalls";
+import type { BackendStatus } from "@/types/api";
 
 const ready = (s: BackendStatus) =>
   s.qdrant_ready && s.db_ready && s.embedders_ready && s.worker_ready;

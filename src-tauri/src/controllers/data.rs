@@ -23,6 +23,22 @@ fn pool(app: &AppHandle) -> Result<sqlx::SqlitePool, String> {
         .ok_or_else(|| "Database not ready".to_string())
 }
 
+fn is_website() -> Condition {
+    Condition::matches("doc_type", "website".to_string())
+}
+
+async fn delete_vectors(
+    app: &AppHandle,
+    collection: &str,
+    filter: Filter,
+    what: &str,
+) -> Result<(), String> {
+    qdrant_svc(app)?
+        .delete_items(collection, None, Some(filter))
+        .await
+        .map_err(|e| format!("{what}: {e:#}"))
+}
+
 #[tauri::command]
 pub async fn get_files(app: AppHandle) -> Result<UserFilesResponse, String> {
     let svc = qdrant_svc(&app)?;
@@ -97,13 +113,13 @@ pub async fn get_files(app: AppHandle) -> Result<UserFilesResponse, String> {
     let mut documents: Vec<FileMetadataDto> = completed_docs
         .iter()
         .filter(|f| f.filename().is_some())
-        .map(|f| FileMetadataDto::from_entity(f))
+        .map(FileMetadataDto::from_entity)
         .collect();
     documents.sort_by(|a, b| {
         b.created_at
             .as_deref()
             .unwrap_or("")
-            .cmp(&a.created_at.as_deref().unwrap_or(""))
+            .cmp(a.created_at.as_deref().unwrap_or(""))
     });
 
     Ok(UserFilesResponse {
@@ -114,11 +130,8 @@ pub async fn get_files(app: AppHandle) -> Result<UserFilesResponse, String> {
 
 #[tauri::command]
 pub async fn delete_repo(app: AppHandle, repo_name: String) -> Result<DeleteResponse, String> {
-    let svc = qdrant_svc(&app)?;
     let filter = Filter::must([Condition::matches("repo_name", repo_name.clone())]);
-    svc.delete_items("codebase", None, Some(filter))
-        .await
-        .map_err(|e| format!("delete repo vectors: {e:#}"))?;
+    delete_vectors(&app, "codebase", filter, "delete repo vectors").await?;
 
     let pool = pool(&app)?;
     sqlx::query("DELETE FROM file_metadata WHERE repo_name = ? AND status = 'completed'")
@@ -130,44 +143,68 @@ pub async fn delete_repo(app: AppHandle, repo_name: String) -> Result<DeleteResp
     Ok(DeleteResponse { deleted: true })
 }
 
+/// Delete one uploaded document (its vectors and its `file_metadata` row),
+/// identified by the row's `storage_object_id`.
+///
+/// Vectors are matched by file name within the document's group, because a
+/// re-upload of the same name into the same group replaces prior vectors.
+/// The legacy `<simple uuid>_<name>` file name written by older builds is
+/// matched as well so those vectors are not orphaned.
 #[tauri::command]
-pub async fn delete_document(app: AppHandle, filename: String) -> Result<DeleteResponse, String> {
-    let svc = qdrant_svc(&app)?;
-    let filter = Filter::must([Condition::matches("file_name", filename.clone())]);
-    svc.delete_items("general", None, Some(filter))
-        .await
-        .map_err(|e| format!("delete document vectors: {e:#}"))?;
-
+pub async fn delete_document(
+    app: AppHandle,
+    storage_object_id: String,
+) -> Result<DeleteResponse, String> {
     let pool = pool(&app)?;
-    let rows = sqlx::query_as::<_, FileMetadata>(
-        "SELECT * FROM file_metadata WHERE status = 'completed'",
+    let row = sqlx::query_as::<_, FileMetadata>(
+        "SELECT * FROM file_metadata WHERE storage_object_id = ?",
     )
-    .fetch_all(&pool)
+    .bind(&storage_object_id)
+    .fetch_optional(&pool)
     .await
     .map_err(|e| format!("querying file_metadata: {e}"))?;
 
-    if let Some(row) = rows.iter().find(|f| f.filename() == Some(filename.as_str())) {
-        sqlx::query("DELETE FROM file_metadata WHERE storage_object_id = ?")
-            .bind(&row.storage_object_id)
-            .execute(&pool)
-            .await
-            .map_err(|e| format!("deleting file_metadata: {e}"))?;
+    let Some(row) = row else {
+        return Ok(DeleteResponse { deleted: false });
+    };
+
+    if let Some(file_name) = row.filename() {
+        let mut name_matches = vec![Condition::matches("file_name", file_name.to_string())];
+        if let Ok(job_id) = uuid::Uuid::parse_str(&row.storage_object_id) {
+            let legacy_name = format!("{}_{file_name}", job_id.simple());
+            name_matches.push(Condition::matches("file_name", legacy_name));
+        }
+        let mut must = vec![Condition::from(Filter::should(name_matches))];
+        if let Some(group) = row.group_id.as_deref().filter(|g| !g.is_empty()) {
+            must.push(Condition::matches("group", group.to_string()));
+        }
+        let collection = row.collection.as_deref().unwrap_or("general");
+        delete_vectors(
+            &app,
+            collection,
+            Filter::must(must),
+            "delete document vectors",
+        )
+        .await?;
     }
+
+    sqlx::query("DELETE FROM file_metadata WHERE storage_object_id = ?")
+        .bind(&row.storage_object_id)
+        .execute(&pool)
+        .await
+        .map_err(|e| format!("deleting file_metadata: {e}"))?;
 
     Ok(DeleteResponse { deleted: true })
 }
 
 #[tauri::command]
 pub async fn delete_group(app: AppHandle, group_name: String) -> Result<DeleteResponse, String> {
-    let svc = qdrant_svc(&app)?;
-    let filter = qdrant_client::qdrant::Filter {
+    let filter = Filter {
         must: vec![Condition::matches("group", group_name.clone())],
-        must_not: vec![Condition::matches("doc_type", "website".to_string())],
+        must_not: vec![is_website()],
         ..Default::default()
     };
-    svc.delete_items("general", None, Some(filter))
-        .await
-        .map_err(|e| format!("delete group vectors: {e:#}"))?;
+    delete_vectors(&app, "general", filter, "delete group vectors").await?;
 
     let pool = pool(&app)?;
     sqlx::query(
@@ -191,23 +228,11 @@ pub async fn clear_user_collection(
         return Err(format!("collection_name must be one of {:?}", allowed));
     }
 
-    let svc = qdrant_svc(&app)?;
+    let mut filter = Filter::default();
     if collection_name == "general" {
-        let filter = Filter {
-            must_not: vec![Condition::matches(
-                "doc_type",
-                "website".to_string(),
-            )],
-            ..Default::default()
-        };
-        svc.delete_items(&collection_name, None, Some(filter))
-            .await
-            .map_err(|e| format!("clear collection vectors: {e:#}"))?;
-    } else {
-        svc.delete_items(&collection_name, None, Some(Filter::default()))
-            .await
-            .map_err(|e| format!("clear collection vectors: {e:#}"))?;
+        filter.must_not.push(is_website());
     }
+    delete_vectors(&app, &collection_name, filter, "clear collection vectors").await?;
 
     let pool = pool(&app)?;
     sqlx::query("DELETE FROM file_metadata WHERE collection = ?")
@@ -227,10 +252,7 @@ pub async fn get_websites(app: AppHandle) -> Result<WebsitesResponse, String> {
         .try_state::<QdrantState>()
         .ok_or_else(|| "Qdrant not ready".to_string())?;
 
-    let facet_filter = Filter::must([Condition::matches(
-        "doc_type",
-        "website".to_string(),
-    )]);
+    let facet_filter = Filter::must([is_website()]);
     let resp = state
         .client
         .facet(
@@ -285,15 +307,8 @@ pub async fn get_websites(app: AppHandle) -> Result<WebsitesResponse, String> {
 
 #[tauri::command]
 pub async fn delete_website(app: AppHandle, url: String) -> Result<DeleteResponse, String> {
-    let svc = qdrant_svc(&app)?;
-    let filter = Filter::must([
-        Condition::matches("doc_type", "website".to_string()),
-        Condition::matches("url", url),
-    ]);
-    svc.delete_items("general", None, Some(filter))
-        .await
-        .map_err(|e| format!("delete website vectors: {e:#}"))?;
-
+    let filter = Filter::must([is_website(), Condition::matches("url", url)]);
+    delete_vectors(&app, "general", filter, "delete website vectors").await?;
     Ok(DeleteResponse { deleted: true })
 }
 
@@ -302,28 +317,14 @@ pub async fn delete_website_group(
     app: AppHandle,
     group_name: String,
 ) -> Result<DeleteResponse, String> {
-    let svc = qdrant_svc(&app)?;
-    let filter = Filter::must([
-        Condition::matches("doc_type", "website".to_string()),
-        Condition::matches("group", group_name),
-    ]);
-    svc.delete_items("general", None, Some(filter))
-        .await
-        .map_err(|e| format!("delete website group vectors: {e:#}"))?;
-
+    let filter = Filter::must([is_website(), Condition::matches("group", group_name)]);
+    delete_vectors(&app, "general", filter, "delete website group vectors").await?;
     Ok(DeleteResponse { deleted: true })
 }
 
 #[tauri::command]
 pub async fn clear_websites(app: AppHandle) -> Result<DeleteResponse, String> {
-    let svc = qdrant_svc(&app)?;
-    let filter = Filter::must([Condition::matches(
-        "doc_type",
-        "website".to_string(),
-    )]);
-    svc.delete_items("general", None, Some(filter))
-        .await
-        .map_err(|e| format!("clear website vectors: {e:#}"))?;
-
+    let filter = Filter::must([is_website()]);
+    delete_vectors(&app, "general", filter, "clear website vectors").await?;
     Ok(DeleteResponse { deleted: true })
 }

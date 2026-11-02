@@ -134,93 +134,37 @@ const LEAF_TEXT_TAGS: &[&str] = &[
 ];
 
 /// Maximum pages fetched in a single crawl. Sitemap discovery is not limited
-/// by this value; [`max_result_urls`] caps how many URLs are handed to the UI.
-fn max_pages() -> usize {
-    std::env::var("WEBSITE_CRAWL_MAX_PAGES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .map(|value| if value == 0 { usize::MAX } else { value })
-        .unwrap_or(1000)
-}
+/// by this value; [`MAX_RESULT_URLS`] caps how many URLs are handed to the UI.
+const MAX_PAGES: usize = 1000;
+const MAX_RESULT_URLS: usize = 5000;
+const MAX_PENDING_URLS: usize = 20_000;
+/// Max sitemap files followed per crawl (sitemap indexes count too).
+const MAX_SITEMAPS: usize = 512;
+const MAX_SITEMAP_URLS: usize = 250_000;
+/// Headless browser virtual time budget and hard per-page timeout.
+const RENDER_VIRTUAL_TIME_MS: u64 = 3000;
+const RENDER_TIMEOUT_MS: u64 = 15_000;
+/// In-memory HTML cache shared from crawl to embed so crawled pages are not
+/// fetched/rendered a second time.
+const HTML_CACHE_MAX_BYTES: usize = 128 * 1024 * 1024;
 
-fn max_result_urls() -> usize {
-    std::env::var("WEBSITE_CRAWL_MAX_RESULTS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .map(|value| value.max(1))
-        .unwrap_or(5000)
-}
-
-fn max_pending_urls() -> usize {
-    std::env::var("WEBSITE_CRAWL_MAX_PENDING")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .map(|value| value.max(1))
-        .unwrap_or(20_000)
-}
-
-fn max_sitemaps() -> usize {
-    std::env::var("WEBSITE_CRAWL_MAX_SITEMAPS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(512)
-}
-
-fn max_sitemap_urls() -> usize {
-    std::env::var("WEBSITE_CRAWL_MAX_SITEMAP_URLS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(250_000)
-}
-
-fn crawl_concurrency(render_javascript: bool) -> usize {
-    std::env::var("WEBSITE_CRAWL_CONCURRENCY")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(if render_javascript { 4 } else { 16 })
-}
-
-fn crawl_delay_ms() -> u64 {
-    std::env::var("WEBSITE_CRAWL_DELAY_MS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0)
-}
-
-fn render_virtual_time_budget_ms() -> u64 {
-    std::env::var("WEBSITE_RENDER_VIRTUAL_TIME_MS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(3000)
-}
-
-fn render_timeout_ms() -> u64 {
-    std::env::var("WEBSITE_RENDER_TIMEOUT_MS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(15000)
-}
-
-fn html_cache_max_bytes() -> usize {
-    std::env::var("WEBSITE_HTML_CACHE_MB")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(128)
-        .saturating_mul(1024 * 1024)
-}
-
-/// Concurrent page scrapes during embedding. Browser renders dominate
-/// CPU/memory, so they default lower than plain HTTP fetches.
-/// `WEBSITE_SCRAPE_CONCURRENCY` overrides.
+/// Concurrent page scrapes while embedding a website. Browser renders are
+/// CPU-heavy, so JavaScript sites use fewer workers.
 fn scrape_concurrency(render_javascript: bool) -> usize {
-    std::env::var("WEBSITE_SCRAPE_CONCURRENCY")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(if render_javascript { 4 } else { 8 })
+    if render_javascript {
+        4
+    } else {
+        8
+    }
+}
+
+/// Concurrent page fetches during a crawl, lower for JavaScript crawls.
+fn crawl_concurrency(render_javascript: bool) -> usize {
+    if render_javascript {
+        4
+    } else {
+        16
+    }
 }
 
 #[derive(Clone)]
@@ -283,8 +227,7 @@ fn schedule_html_cache_ttl(expected_generation: u64) {
 }
 
 fn store_cached_page(url_str: &str, content_type: &str, response_url: &Url, body: &str) {
-    let max_bytes = html_cache_max_bytes();
-    if max_bytes == 0 || body.is_empty() || body.len() > MAX_CACHED_PAGE_BYTES {
+    if body.is_empty() || body.len() > MAX_CACHED_PAGE_BYTES {
         if body.len() > MAX_CACHED_PAGE_BYTES {
             tracing::warn!(
                 "crawl: cache skip url={url_str} bytes={} reason=too_large",
@@ -300,13 +243,13 @@ fn store_cached_page(url_str: &str, content_type: &str, response_url: &Url, body
         return;
     };
     let entry_bytes = body.len() + key.len();
-    if entry_bytes > max_bytes {
+    if entry_bytes > HTML_CACHE_MAX_BYTES {
         return;
     }
     if let Some(old) = cache.entries.remove(&key) {
         cache.total_bytes = cache.total_bytes.saturating_sub(old.body.len() + key.len());
     }
-    while cache.total_bytes + entry_bytes > max_bytes {
+    while cache.total_bytes + entry_bytes > HTML_CACHE_MAX_BYTES {
         let Some(oldest_key) = cache.order.pop_front() else {
             break;
         };
@@ -343,7 +286,9 @@ fn take_cached_page(url_str: &str) -> Option<(String, Url, String)> {
     let key = cache_key(url_str)?;
     let mut cache = html_cache().lock().ok()?;
     let page = cache.entries.remove(&key)?;
-    cache.total_bytes = cache.total_bytes.saturating_sub(page.body.len() + key.len());
+    cache.total_bytes = cache
+        .total_bytes
+        .saturating_sub(page.body.len() + key.len());
     if cache.entries.is_empty() {
         cache.entries.shrink_to_fit();
         cache.order.clear();
@@ -469,10 +414,8 @@ fn windows_browser_candidates(
 
 async fn render_page(url: &str, browser: &PathBuf) -> anyhow::Result<String> {
     let profile = tempfile::tempdir().context("creating browser profile")?;
-    let timeout_ms = render_timeout_ms();
-    let budget_ms = render_virtual_time_budget_ms();
     let output = tokio::time::timeout(
-        Duration::from_millis(timeout_ms),
+        Duration::from_millis(RENDER_TIMEOUT_MS),
         tokio::process::Command::new(browser)
             .args([
                 "--headless=new",
@@ -488,14 +431,14 @@ async fn render_page(url: &str, browser: &PathBuf) -> anyhow::Result<String> {
                 "--blink-settings=imagesEnabled=false",
                 "--dump-dom",
             ])
-            .arg(format!("--virtual-time-budget={budget_ms}"))
+            .arg(format!("--virtual-time-budget={RENDER_VIRTUAL_TIME_MS}"))
             .arg(format!("--user-data-dir={}", profile.path().display()))
             .arg(url)
             .kill_on_drop(true)
             .output(),
     )
     .await
-    .map_err(|_| anyhow::anyhow!("browser timed out after {timeout_ms}ms"))??;
+    .map_err(|_| anyhow::anyhow!("browser timed out after {RENDER_TIMEOUT_MS}ms"))??;
     if !output.status.success() {
         anyhow::bail!("browser exited with status {}", output.status);
     }
@@ -924,8 +867,6 @@ async fn discover_sitemap_urls(
 
     let mut seen_sitemaps = HashSet::new();
     let mut urls = Vec::new();
-    let sitemaps_cap = max_sitemaps();
-    let urls_cap = max_sitemap_urls();
 
     while !pending.is_empty() {
         if cancellation
@@ -940,7 +881,7 @@ async fn discover_sitemap_urls(
                 break;
             };
             let sitemap_key = canonical_url(&sitemap);
-            if seen_sitemaps.len() >= sitemaps_cap || !seen_sitemaps.insert(sitemap_key) {
+            if seen_sitemaps.len() >= MAX_SITEMAPS || !seen_sitemaps.insert(sitemap_key) {
                 continue;
             }
             if let Some(cb) = on_progress {
@@ -974,7 +915,7 @@ async fn discover_sitemap_urls(
                         };
                         if is_index {
                             pending.push_back(url);
-                        } else if urls.len() < urls_cap {
+                        } else if urls.len() < MAX_SITEMAP_URLS {
                             let canonical = canonical_url(&url);
                             urls.push(canonical.clone());
                             if let Some(cb) = on_progress {
@@ -989,7 +930,7 @@ async fn discover_sitemap_urls(
                 }
                 None => {
                     for url in plain_text_sitemap_urls(&body, &response_url) {
-                        if urls.len() >= urls_cap {
+                        if urls.len() >= MAX_SITEMAP_URLS {
                             break;
                         }
                         urls.push(url.clone());
@@ -1004,7 +945,7 @@ async fn discover_sitemap_urls(
                 }
             }
         }
-        if urls.len() >= urls_cap {
+        if urls.len() >= MAX_SITEMAP_URLS {
             break;
         }
     }
@@ -1016,11 +957,11 @@ async fn discover_sitemap_urls(
         urls.len(),
         seen_sitemaps.len()
     );
-    if urls.len() >= urls_cap {
-        tracing::warn!("sitemap: url cap reached cap={urls_cap}");
+    if urls.len() >= MAX_SITEMAP_URLS {
+        tracing::warn!("sitemap: url cap reached cap={MAX_SITEMAP_URLS}");
     }
-    if seen_sitemaps.len() >= sitemaps_cap {
-        tracing::warn!("sitemap: sitemap cap reached cap={sitemaps_cap}");
+    if seen_sitemaps.len() >= MAX_SITEMAPS {
+        tracing::warn!("sitemap: sitemap cap reached cap={MAX_SITEMAPS}");
     }
     urls
 }
@@ -1227,9 +1168,9 @@ pub async fn crawl_website_with_options_and_cancellation(
         on_progress,
         depth,
         same_domain_only,
-        max_pages: max_pages(),
-        max_results: max_result_urls(),
-        max_pending: max_pending_urls(),
+        max_pages: MAX_PAGES,
+        max_results: MAX_RESULT_URLS,
+        max_pending: MAX_PENDING_URLS,
         bfs_in_flight: AtomicUsize::new(0),
         notify: tokio::sync::Notify::new(),
         visited: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
@@ -1244,9 +1185,8 @@ pub async fn crawl_website_with_options_and_cancellation(
     enqueue_sitemap_urls(&run, sitemap_urls).await;
 
     let concurrency = crawl_concurrency(render_javascript);
-    let delay_ms = crawl_delay_ms();
     tracing::info!(
-        "crawl: queue start url={} concurrency={concurrency} delay_ms={delay_ms} max_pages={}",
+        "crawl: queue start url={} concurrency={concurrency} max_pages={}",
         start,
         run.max_pages
     );
@@ -1297,10 +1237,6 @@ pub async fn crawl_website_with_options_and_cancellation(
                 break;
             }
             visited.insert(visit_key);
-        }
-
-        if delay_ms > 0 {
-            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         }
 
         if from_bfs {
@@ -1919,15 +1855,6 @@ pub async fn process_website_with_progress(
         return Err(crate::worker::JobCancelled.into());
     }
 
-    let chunk_size: usize = std::env::var("DOC_CHUNK_SIZE")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(768);
-    let chunk_overlap: usize = std::env::var("DOC_CHUNK_OVERLAP")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(50);
-
     let embedded_at = super::types::now_iso();
 
     let client = http_client()?;
@@ -1995,7 +1922,11 @@ pub async fn process_website_with_progress(
                 uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, url.as_bytes()).to_string();
 
             let mut link_map: HashMap<String, String> = HashMap::new();
-            for link in sections.iter().flat_map(|s| &s.links).chain(&navigation_links) {
+            for link in sections
+                .iter()
+                .flat_map(|s| &s.links)
+                .chain(&navigation_links)
+            {
                 link_map
                     .entry(link.anchor_text.clone())
                     .or_insert_with(|| link.href.clone());
@@ -2052,7 +1983,13 @@ pub async fn process_website_with_progress(
                         .map(str::to_string)
                         .collect()
                 })
-                .unwrap_or_else(|| simple_chunk(&full_page_text, chunk_size, chunk_overlap));
+                .unwrap_or_else(|| {
+                    simple_chunk(
+                        &full_page_text,
+                        super::DOC_CHUNK_SIZE,
+                        super::DOC_CHUNK_OVERLAP,
+                    )
+                });
             let prose_docs = if prose_docs.len() > 1 {
                 merge_small_chunks(prose_docs, MERGE_MIN_TOKENS)
             } else {
@@ -2074,6 +2011,7 @@ pub async fn process_website_with_progress(
                     page: None,
                     metadata: md,
                     created_at: created_at.clone(),
+                    code_header: None,
                 });
             }
 
@@ -2100,6 +2038,7 @@ pub async fn process_website_with_progress(
                     page: None,
                     metadata: md,
                     created_at: created_at.clone(),
+                    code_header: None,
                 });
             }
 

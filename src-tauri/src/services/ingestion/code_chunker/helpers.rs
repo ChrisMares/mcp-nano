@@ -1,170 +1,24 @@
 //! Shared helpers used by all per-language code chunkers. Direct port of
 //! `src/embedding/code_embedder/chunk_helpers.py`.
 //!
-//! - [`strip_comments`] / [`strip_sql_comments`] / [`strip_sql_boilerplate`]
-//!   normalize source text before it's parsed by tree-sitter so comment
-//!   syntax doesn't trip up the grammar.
+//! - [`strip_sql_comments`] / [`strip_sql_boilerplate`] normalize SQL text
+//!   before it's parsed by tree-sitter so comment syntax doesn't trip up the
+//!   grammar.
 //! - [`merge_spans`] / [`build_remainder_code`] / [`make_remainder_chunk`]
 //!   emit the trailing "file_remainder" chunk after every named declaration
 //!   has been extracted.
 //! - [`generate_chunk_id`] mirrors the Python `<basename>-<id>-<8hex>` id
 //!   scheme so chunk ids stay readable in Qdrant payloads.
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use regex::Regex;
 use tree_sitter::Node;
 
-use crate::services::ingestion::types::normalize_code;
-use crate::services::ingestion::types::{CodeChunk, CodeChunkKind};
-
-// Re-export so per-language chunkers can `use super::helpers::Parameter` if
-// needed (kept here so the dependency graph remains a flat tree).
-pub use crate::services::ingestion::types::Parameter;
-
-/// Strip all comment styles (`//`, `/* */`, `--`, `#`, `(* *)`) while
-/// preserving single/double/backtick-quoted string literals. Direct port of
-/// `chunk_helpers.strip_comments`.
-pub fn strip_comments(text: &str) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    let mut out: Vec<char> = Vec::with_capacity(chars.len());
-    let mut i = 0usize;
-    while i < chars.len() {
-        let c = chars[i];
-
-        // Single-quoted strings: copy verbatim (handle `''` escape).
-        if c == '\'' {
-            let mut j = i + 1;
-            while j < chars.len() {
-                if chars[j] == '\'' && j + 1 < chars.len() && chars[j + 1] == '\'' {
-                    j += 2;
-                    continue;
-                }
-                if chars[j] == '\\' && j + 1 < chars.len() {
-                    j += 2;
-                    continue;
-                }
-                if chars[j] == '\'' {
-                    j += 1;
-                    break;
-                }
-                j += 1;
-            }
-            out.extend_from_slice(&chars[i..j]);
-            i = j;
-            continue;
-        }
-
-        // Double-quoted strings.
-        if c == '"' {
-            let mut j = i + 1;
-            while j < chars.len() {
-                if chars[j] == '\\' && j + 1 < chars.len() {
-                    j += 2;
-                    continue;
-                }
-                if chars[j] == '"' {
-                    j += 1;
-                    break;
-                }
-                j += 1;
-            }
-            out.extend_from_slice(&chars[i..j]);
-            i = j;
-            continue;
-        }
-
-        // Backtick strings.
-        if c == '`' {
-            let mut j = i + 1;
-            while j < chars.len() {
-                if chars[j] == '\\' && j + 1 < chars.len() {
-                    j += 2;
-                    continue;
-                }
-                if chars[j] == '`' {
-                    j += 1;
-                    break;
-                }
-                j += 1;
-            }
-            out.extend_from_slice(&chars[i..j]);
-            i = j;
-            continue;
-        }
-
-        // Block comments: /* ... */ (nestable).
-        if c == '/' && i + 1 < chars.len() && chars[i + 1] == '*' {
-            let mut depth = 1;
-            i += 2;
-            while i < chars.len() && depth > 0 {
-                if chars[i] == '/' && i + 1 < chars.len() && chars[i + 1] == '*' {
-                    depth += 1;
-                    i += 2;
-                } else if chars[i] == '*' && i + 1 < chars.len() && chars[i + 1] == '/' {
-                    depth -= 1;
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-            out.push('\n');
-            continue;
-        }
-
-        // Block comments: (* ... *) (nestable).
-        if c == '(' && i + 1 < chars.len() && chars[i + 1] == '*' {
-            let mut depth = 1;
-            i += 2;
-            while i < chars.len() && depth > 0 {
-                if chars[i] == '(' && i + 1 < chars.len() && chars[i + 1] == '*' {
-                    depth += 1;
-                    i += 2;
-                } else if chars[i] == '*' && i + 1 < chars.len() && chars[i + 1] == ')' {
-                    depth -= 1;
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-            out.push('\n');
-            continue;
-        }
-
-        // Line comments: //
-        if c == '/' && i + 1 < chars.len() && chars[i + 1] == '/' {
-            i += 2;
-            while i < chars.len() && chars[i] != '\n' {
-                i += 1;
-            }
-            continue;
-        }
-
-        // Line comments: --
-        if c == '-' && i + 1 < chars.len() && chars[i + 1] == '-' {
-            i += 2;
-            while i < chars.len() && chars[i] != '\n' {
-                i += 1;
-            }
-            continue;
-        }
-
-        // Line comments: #
-        if c == '#' {
-            i += 1;
-            while i < chars.len() && chars[i] != '\n' {
-                i += 1;
-            }
-            continue;
-        }
-
-        out.push(c);
-        i += 1;
-    }
-
-    let result: String = out.into_iter().collect();
-    collapse_blank_runs(&result)
-}
+use crate::services::ingestion::types::{
+    normalize_code, now_iso, CodeChunk, CodeChunkKind, MemberFields,
+};
 
 /// Strip only the SQL comment styles (`--` line, `/* */` block) while
 /// preserving dollar-quoted (`$$ ... $$`, `$tag$ ... $tag$`) and
@@ -179,11 +33,8 @@ pub fn strip_sql_comments(text: &str) -> String {
         // Dollar-quoted strings: $$ or $tag$ ... matching close tag.
         if c == '$' && i + 1 < chars.len() {
             if let Some(tag_len) = match_dollar_tag(&chars, i) {
-                let tag: String = chars[i..i + tag_len].iter().collect();
-                let body_start = i + tag_len;
-                // Find the next occurrence of tag.
-                if let Some(close) = find_subseq(&chars, &tag.chars().collect::<Vec<_>>(), body_start)
-                {
+                let tag = &chars[i..i + tag_len];
+                if let Some(close) = find_subseq(&chars, tag, i + tag_len) {
                     out.extend_from_slice(&chars[i..close + tag_len]);
                     i = close + tag_len;
                     continue;
@@ -195,39 +46,9 @@ pub fn strip_sql_comments(text: &str) -> String {
             }
         }
 
-        // Single-quoted strings.
-        if c == '\'' {
-            let mut j = i + 1;
-            while j < chars.len() {
-                if chars[j] == '\'' && j + 1 < chars.len() && chars[j + 1] == '\'' {
-                    j += 2;
-                    continue;
-                }
-                if chars[j] == '\'' {
-                    j += 1;
-                    break;
-                }
-                j += 1;
-            }
-            out.extend_from_slice(&chars[i..j]);
-            i = j;
-            continue;
-        }
-
-        // Double-quoted identifiers.
-        if c == '"' {
-            let mut j = i + 1;
-            while j < chars.len() {
-                if chars[j] == '"' && j + 1 < chars.len() && chars[j + 1] == '"' {
-                    j += 2;
-                    continue;
-                }
-                if chars[j] == '"' {
-                    j += 1;
-                    break;
-                }
-                j += 1;
-            }
+        // Single-quoted strings and double-quoted identifiers.
+        if c == '\'' || c == '"' {
+            let j = quoted_end(&chars, i);
             out.extend_from_slice(&chars[i..j]);
             i = j;
             continue;
@@ -266,6 +87,24 @@ pub fn strip_sql_comments(text: &str) -> String {
     }
 
     collapse_blank_runs(&out.into_iter().collect::<String>())
+}
+
+/// Index just past the quoted run opened by `chars[start]`, where a doubled
+/// quote (`''` or `""`) is an escaped quote. Unterminated runs end at EOF.
+fn quoted_end(chars: &[char], start: usize) -> usize {
+    let quote = chars[start];
+    let mut j = start + 1;
+    while j < chars.len() {
+        if chars[j] == quote {
+            if j + 1 < chars.len() && chars[j + 1] == quote {
+                j += 2;
+                continue;
+            }
+            return j + 1;
+        }
+        j += 1;
+    }
+    j
 }
 
 /// Matches an opening dollar-quote tag starting at `i`.
@@ -315,9 +154,8 @@ pub fn strip_sql_boilerplate(text: &str) -> (String, Option<String>) {
     let mut cleaned: Vec<String> = Vec::new();
     let mut database: Option<String> = None;
     static USE_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    let use_re = USE_RE.get_or_init(|| {
-        Regex::new(r"(?i)^\ufeff?\s*USE\s+\[?([^\]\s;]+)\]?\s*;?\s*$").unwrap()
-    });
+    let use_re = USE_RE
+        .get_or_init(|| Regex::new(r"(?i)^\ufeff?\s*USE\s+\[?([^\]\s;]+)\]?\s*;?\s*$").unwrap());
 
     for line in text.split('\n') {
         let stripped = line.trim().trim_start_matches('\u{feff}').to_uppercase();
@@ -351,10 +189,7 @@ pub fn strip_sql_boilerplate(text: &str) -> (String, Option<String>) {
 /// UUID v4 (alphanumeric ASCII) as the suffix — same uniqueness guarantees
 /// as the Python `random.choices` 8-char pool, without pulling a new dep.
 pub fn generate_chunk_id(file_path: &str, identifier: &str) -> String {
-    let basename = Path::new(file_path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(file_path);
+    let basename = file_basename(file_path);
     let suffix = uuid::Uuid::new_v4()
         .simple()
         .to_string()
@@ -362,6 +197,75 @@ pub fn generate_chunk_id(file_path: &str, identifier: &str) -> String {
         .take(8)
         .collect::<String>();
     format!("{basename}-{identifier}-{suffix}")
+}
+
+/// Final component of `file_path`, or the whole string when it has none.
+pub fn file_basename(file_path: &str) -> String {
+    Path::new(file_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(file_path)
+        .to_string()
+}
+
+/// Build a chunk of `file_path` with an id derived from `identifier`
+/// (see [`generate_chunk_id`]), an empty repo name, and the current time.
+pub fn new_chunk(
+    file_path: &str,
+    identifier: &str,
+    code: String,
+    chunk_type: &str,
+    deps: &[String],
+    kind: CodeChunkKind,
+) -> CodeChunk {
+    CodeChunk {
+        id: generate_chunk_id(file_path, identifier),
+        repo_name: String::new(),
+        file_name: file_basename(file_path),
+        code,
+        r#type: chunk_type.to_string(),
+        dependencies: deps.to_vec(),
+        created_at: now_iso(),
+        kind,
+    }
+}
+
+/// Chunk for the C++/Java/Rust member layout, identified by its function
+/// name, else its class name, else `Unknown`.
+pub fn member_chunk(
+    file_path: &str,
+    fields: MemberFields,
+    code: String,
+    chunk_type: &str,
+    deps: &[String],
+    kind: fn(MemberFields) -> CodeChunkKind,
+) -> CodeChunk {
+    let identifier = fields
+        .function_name
+        .clone()
+        .or_else(|| fields.class_name.clone())
+        .unwrap_or_else(|| "Unknown".to_string());
+    new_chunk(file_path, &identifier, code, chunk_type, deps, kind(fields))
+}
+
+/// Run `extract` to collect chunks and the byte spans they cover, then
+/// append the [`make_remainder_chunk`] for everything left over.
+pub fn chunks_with_remainder<F>(
+    source: &[u8],
+    file_path: &str,
+    deps: &[String],
+    extract: F,
+) -> Vec<CodeChunk>
+where
+    F: FnOnce(&mut Vec<CodeChunk>, &mut Vec<(usize, usize)>),
+{
+    let mut chunks = Vec::new();
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    extract(&mut chunks, &mut spans);
+    if let Some(r) = make_remainder_chunk(source, &spans, file_path, deps) {
+        chunks.push(r);
+    }
+    chunks
 }
 
 /// Pre-order DFS over a tree-sitter node, left-to-right. Used by dependency
@@ -378,6 +282,82 @@ where
         for child in children.into_iter().rev() {
             stack.push(child);
         }
+    }
+}
+
+/// Walk `root` in pre-order, letting `visit` push the dependencies each node
+/// declares, and return them de-duplicated in first-seen order.
+pub fn collect_dependencies<'a, F>(root: Node<'a>, mut visit: F) -> Vec<String>
+where
+    F: FnMut(Node<'a>, &mut Vec<String>),
+{
+    let mut found: Vec<String> = Vec::new();
+    walk_preorder(root, |node| visit(node, &mut found));
+    let mut seen = HashSet::new();
+    let mut deps = Vec::new();
+    for dep in found {
+        if seen.insert(dep.clone()) {
+            deps.push(dep);
+        }
+    }
+    deps
+}
+
+/// Text of `node`'s `field` child, untrimmed.
+pub fn field_text<'a>(node: &Node<'a>, field: &str, source: &[u8]) -> Option<String> {
+    node.child_by_field_name(field)
+        .map(|n| node_text(&n, source))
+}
+
+/// First direct child of `node` whose kind is `kind`.
+pub fn find_child_of_kind<'a>(node: &Node<'a>, kind: &str) -> Option<Node<'a>> {
+    let mut cursor = node.walk();
+    let found = node.children(&mut cursor).find(|c| c.kind() == kind);
+    found
+}
+
+/// True if any direct child of `node` has a kind in `kinds`.
+pub fn has_child_of_kind<'a>(node: &Node<'a>, kinds: &[&str]) -> bool {
+    let mut cursor = node.walk();
+    let found = node
+        .children(&mut cursor)
+        .any(|c| kinds.contains(&c.kind()));
+    found
+}
+
+/// Name of the nearest ancestor whose kind is in `kinds`: its `name` field,
+/// else its first named child whose kind is in `fallback_kinds`. Ancestors
+/// that match but carry neither are skipped.
+pub fn nearest_ancestor_name<'a>(
+    node: &Node<'a>,
+    source: &[u8],
+    kinds: &[&str],
+    fallback_kinds: &[&str],
+) -> Option<String> {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if kinds.contains(&parent.kind()) {
+            if let Some(name) = parent.child_by_field_name("name") {
+                return Some(node_text(&name, source));
+            }
+            let mut cursor = parent.walk();
+            for child in parent.named_children(&mut cursor) {
+                if fallback_kinds.contains(&child.kind()) {
+                    return Some(node_text(&child, source));
+                }
+            }
+        }
+        current = parent.parent();
+    }
+    None
+}
+
+/// Trim a type annotation and drop its leading `:` (`": u32"` -> `"u32"`).
+pub fn normalize_type_text(text: &str) -> String {
+    let s = text.trim();
+    match s.strip_prefix(':') {
+        Some(stripped) => stripped.trim().to_string(),
+        None => s.to_string(),
     }
 }
 
@@ -442,22 +422,16 @@ pub fn make_remainder_chunk(
     if code.trim().is_empty() {
         return None;
     }
-    let basename = Path::new(file_path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(file_path)
-        .to_string();
-    let chunk = CodeChunk {
+    Some(CodeChunk {
         id: uuid::Uuid::new_v4().to_string(),
         repo_name: String::new(),
-        file_name: basename,
+        file_name: file_basename(file_path),
         code: normalize_code(&code),
         r#type: "file_remainder".to_string(),
         dependencies: dependencies.to_vec(),
-        created_at: crate::services::ingestion::types::now_iso(),
+        created_at: now_iso(),
         kind: CodeChunkKind::Generic,
-    };
-    Some(chunk)
+    })
 }
 
 /// Lossy UTF-8 decode of `source[start..end]`. Returns empty string when the
@@ -540,27 +514,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn strip_comments_drops_block_and_line_comments() {
-        let src = "// line\n/* block */\nfn main() {}\n# hash\n-- dash\n";
-        let out = strip_comments(src);
-        assert!(!out.contains("block"));
-        assert!(!out.contains("line"));
-        assert!(!out.contains("hash"));
-        assert!(!out.contains("dash"));
-        assert!(out.contains("fn main() {}"));
-    }
-
-    #[test]
-    fn strip_comments_preserves_string_literals() {
-        let src = "let s = \"// not a comment\";\nlet c = '#';\n";
-        let out = strip_comments(src);
-        assert!(out.contains("\"// not a comment\""));
-        assert!(out.contains("'#'"));
-    }
-
-    #[test]
     fn strip_sql_comments_keeps_dollar_quoted() {
-        let src = "CREATE FUNCTION f() RETURNS int AS $$\n-- inner comment\nSELECT 1\n$$ LANGUAGE sql;";
+        let src =
+            "CREATE FUNCTION f() RETURNS int AS $$\n-- inner comment\nSELECT 1\n$$ LANGUAGE sql;";
         let out = strip_sql_comments(src);
         assert!(out.contains("$$"));
         assert!(out.contains("SELECT 1"));
@@ -571,7 +527,8 @@ mod tests {
 
     #[test]
     fn strip_sql_comments_strips_outside_dollar_quotes() {
-        let src = "-- header comment\nSELECT 1;\nCREATE FUNCTION f() RETURNS int AS $$$x$$ LANGUAGE sql;";
+        let src =
+            "-- header comment\nSELECT 1;\nCREATE FUNCTION f() RETURNS int AS $$$x$$ LANGUAGE sql;";
         let out = strip_sql_comments(src);
         assert!(!out.contains("header comment"));
     }

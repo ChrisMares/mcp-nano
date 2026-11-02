@@ -145,5 +145,8 @@ fn loads_odt_via_unzip_and_quick_xml() {
     assert!(!chunks.is_empty());
     let combined: String = chunks.iter().map(|c| c.content.as_str()).collect();
     assert!(combined.contains("first paragraph of the sample ODT"));
-    assert!(combined.contains("second paragraph"), "combined: {combined}");
+    assert!(
+        combined.contains("second paragraph"),
+        "combined: {combined}"
+    );
 }

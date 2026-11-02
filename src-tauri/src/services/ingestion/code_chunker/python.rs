@@ -1,10 +1,10 @@
 //! Python chunker. Direct port of `chunk_code_python.py`.
 
-use std::path::Path;
-
 use tree_sitter::Node;
 
-use super::helpers::{build_remainder_code, generate_chunk_id, node_text, walk_preorder};
+use super::helpers::{
+    build_remainder_code, collect_dependencies, has_child_of_kind, new_chunk, node_text,
+};
 use crate::services::ingestion::types::{CodeChunk, CodeChunkKind, Parameter, PythonFields};
 
 const FUNCTION_NODE_TYPE: &str = "function_definition";
@@ -19,28 +19,24 @@ const DECLARATION_NODE_TYPES: &[&str] = &[
 ];
 
 pub fn extract_dependencies<'a>(root: Node<'a>, source: &[u8]) -> Vec<String> {
-    let mut deps: Vec<String> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    let add = |dep: String, deps: &mut Vec<String>, seen: &mut std::collections::HashSet<String>| {
-        if !dep.is_empty() && seen.insert(dep.clone()) {
-            deps.push(dep);
-        }
-    };
-    walk_preorder(root, |node| {
+    let deps = collect_dependencies(root, |node, deps| {
         if node.kind() == "import_statement" {
             let mut cursor = node.walk();
             for name_node in node.children_by_field_name("name", &mut cursor) {
-                add(import_name(&name_node, source), &mut deps, &mut seen);
+                deps.push(import_name(&name_node, source));
             }
-        } else if matches!(node.kind(), "import_from_statement" | "future_import_statement") {
+        } else if matches!(
+            node.kind(),
+            "import_from_statement" | "future_import_statement"
+        ) {
             if let Some(mn) = node.child_by_field_name("module_name") {
-                add(node_text(&mn, source).trim().to_string(), &mut deps, &mut seen);
+                deps.push(node_text(&mn, source).trim().to_string());
             } else if node.kind() == "future_import_statement" {
-                add("__future__".to_string(), &mut deps, &mut seen);
+                deps.push("__future__".to_string());
             }
         }
     });
-    deps
+    deps.into_iter().filter(|dep| !dep.is_empty()).collect()
 }
 
 fn import_name<'a>(node: &Node<'a>, source: &[u8]) -> String {
@@ -58,27 +54,20 @@ pub fn extract_chunks<'a>(
     file_path: &str,
     deps: &[String],
 ) -> Vec<CodeChunk> {
-    let mut chunks: Vec<CodeChunk> = Vec::new();
-    let mut spans: Vec<(usize, usize)> = Vec::new();
-    extract_scope(&node, source, file_path, deps, None, false, &mut chunks, &mut spans);
-    let remainder = build_remainder_code(source, &spans);
+    let mut extractor = Extractor {
+        source,
+        file_path,
+        deps,
+        chunks: Vec::new(),
+        spans: Vec::new(),
+    };
+    extractor.extract_scope(&node, None, false);
+    let mut chunks = extractor.chunks;
+    let remainder = build_remainder_code(source, &extractor.spans);
     if !remainder.trim().is_empty() {
         chunks.push(make_chunk(
             file_path,
-            None,
-            None,
-            Vec::new(),
-            None,
-            Vec::new(),
-            Vec::new(),
-            false,
-            false,
-            false,
-            false,
-            None,
-            None,
-            None,
-            None,
+            PythonFields::default(),
             remainder,
             "file_remainder",
             deps,
@@ -87,91 +76,73 @@ pub fn extract_chunks<'a>(
     chunks
 }
 
-fn extract_scope<'a>(
-    node: &Node<'a>,
-    source: &[u8],
-    file_path: &str,
-    deps: &[String],
-    class_name: Option<&str>,
-    is_class_body: bool,
-    chunks: &mut Vec<CodeChunk>,
-    spans: &mut Vec<(usize, usize)>,
-) {
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        let Some((declaration, decorators, span_node)) = unwrap_declaration(&child, source) else {
-            continue;
-        };
+struct Extractor<'s> {
+    source: &'s [u8],
+    file_path: &'s str,
+    deps: &'s [String],
+    chunks: Vec<CodeChunk>,
+    spans: Vec<(usize, usize)>,
+}
 
-        if declaration.kind() == FUNCTION_NODE_TYPE {
-            append_function_chunk(
-                &declaration,
-                &span_node,
-                &decorators,
-                source,
-                file_path,
-                deps,
-                class_name,
-                is_class_body,
-                chunks,
-            );
-            spans.push((span_node.start_byte(), span_node.end_byte()));
-            if let Some(body) = declaration.child_by_field_name("body") {
-                extract_scope(&body, source, file_path, deps, class_name, false, chunks, spans);
+impl Extractor<'_> {
+    fn push_chunk(&mut self, fields: Option<PythonFields>, code: String, chunk_type: &str) {
+        if let Some(fields) = fields {
+            let chunk = make_chunk(self.file_path, fields, code, chunk_type, self.deps);
+            self.chunks.push(chunk);
+        }
+    }
+
+    fn push_span<'a>(&mut self, node: &Node<'a>) {
+        self.spans.push((node.start_byte(), node.end_byte()));
+    }
+
+    fn extract_scope<'a>(
+        &mut self,
+        node: &Node<'a>,
+        class_name: Option<&str>,
+        is_class_body: bool,
+    ) {
+        let source = self.source;
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            let Some((declaration, decorators, span_node)) = unwrap_declaration(&child, source)
+            else {
+                continue;
+            };
+            let kind = declaration.kind();
+            if kind == FUNCTION_NODE_TYPE {
+                let fields =
+                    function_fields(&declaration, &decorators, source, class_name, is_class_body);
+                self.push_chunk(fields, node_text(&span_node, source), kind);
+                self.push_span(&span_node);
+                if let Some(body) = declaration.child_by_field_name("body") {
+                    self.extract_scope(&body, class_name, false);
+                }
+            } else if kind == CLASS_NODE_TYPE {
+                let fields = class_fields(&declaration, &decorators, source);
+                let code = class_header_and_properties(&declaration, &span_node, source);
+                self.push_chunk(fields, code, kind);
+                self.push_span(&span_node);
+                let new_class_name = field_text(&declaration, "name", source);
+                if let Some(body) = declaration.child_by_field_name("body") {
+                    self.extract_scope(&body, new_class_name.as_deref(), true);
+                }
+            } else if kind == TYPE_ALIAS_NODE_TYPE {
+                let fields = type_alias_fields(&declaration, &decorators, source, class_name);
+                self.push_chunk(fields, node_text(&span_node, source), kind);
+                self.push_span(&span_node);
+            } else if is_pep_613_alias(&declaration, source) {
+                let fields = pep_613_alias_fields(&declaration, source, class_name);
+                let code = node_text(&declaration, source);
+                self.push_chunk(fields, code, "type_alias_assignment");
+                self.push_span(&child);
+            } else if is_named_lambda_assignment(&declaration) {
+                let fields = lambda_fields(&declaration, source, class_name);
+                self.push_chunk(fields, node_text(&declaration, source), "lambda");
+                self.push_span(&child);
+            } else {
+                self.extract_scope(&declaration, class_name, is_class_body);
             }
-        } else if declaration.kind() == CLASS_NODE_TYPE {
-            append_class_chunk(
-                &declaration,
-                &span_node,
-                &decorators,
-                source,
-                file_path,
-                deps,
-                chunks,
-            );
-            spans.push((span_node.start_byte(), span_node.end_byte()));
-            let new_class_name = field_text(&declaration, "name", source);
-            if let Some(body) = declaration.child_by_field_name("body") {
-                extract_scope(
-                    &body,
-                    source,
-                    file_path,
-                    deps,
-                    new_class_name.as_deref(),
-                    true,
-                    chunks,
-                    spans,
-                );
-            }
-        } else if declaration.kind() == TYPE_ALIAS_NODE_TYPE {
-            append_type_alias_chunk(
-                &declaration,
-                &span_node,
-                &decorators,
-                source,
-                file_path,
-                deps,
-                class_name,
-                chunks,
-            );
-            spans.push((span_node.start_byte(), span_node.end_byte()));
-        } else if is_pep_613_alias(&declaration, source) {
-            append_pep_613_alias_chunk(&declaration, source, file_path, deps, class_name, chunks);
-            spans.push((child.start_byte(), child.end_byte()));
-        } else if is_named_lambda_assignment(&declaration, source) {
-            append_lambda_chunk(&declaration, source, file_path, deps, class_name, chunks);
-            spans.push((child.start_byte(), child.end_byte()));
-        } else {
-            extract_scope(
-                &declaration,
-                source,
-                file_path,
-                deps,
-                class_name,
-                is_class_body,
-                chunks,
-                spans,
-            );
         }
     }
 }
@@ -193,211 +164,112 @@ fn unwrap_declaration<'a>(
     Some((definition, decorators, *node))
 }
 
-fn append_function_chunk<'a>(
+fn function_fields<'a>(
     node: &Node<'a>,
-    span_node: &Node<'a>,
     decorators: &[String],
     source: &[u8],
-    file_path: &str,
-    deps: &[String],
     class_name: Option<&str>,
     is_method: bool,
-    chunks: &mut Vec<CodeChunk>,
-) {
-    let Some(name_node) = node.child_by_field_name("name") else { return };
-    let function_name = node_text(&name_node, source);
+) -> Option<PythonFields> {
+    let name_node = node.child_by_field_name("name")?;
     let parameters_node = node.child_by_field_name("parameters");
-    let parameters = extract_parameters(parameters_node.as_ref(), source);
-    let return_type = field_text(node, "return_type", source);
-    let is_async = {
-        let mut cursor = node.walk();
-        let v = node.children(&mut cursor).any(|c| c.kind() == "async");
-        v
-    };
-    let is_generator = node
-        .child_by_field_name("body")
-        .map(|b| contains_yield(&b))
-        .unwrap_or(false);
-    let type_parameters = field_text(node, "type_parameters", source);
-    let code = source_text(span_node, source);
-    chunks.push(make_chunk(
-        file_path,
-        Some(function_name),
-        class_name.map(|s| s.to_string()),
-        parameters,
-        return_type,
-        Vec::new(),
-        decorators.to_vec(),
+    Some(PythonFields {
+        function_name: Some(node_text(&name_node, source)),
+        class_name: class_name.map(str::to_string),
+        parameters: extract_parameters(parameters_node.as_ref(), source),
+        return_type: field_text(node, "return_type", source),
+        decorators: decorators.to_vec(),
         is_method,
-        is_async,
-        is_generator,
-        false,
-        None,
-        None,
-        type_parameters,
-        None,
-        code,
-        node.kind(),
-        deps,
-    ));
+        is_async: has_child_of_kind(node, &["async"]),
+        is_generator: node
+            .child_by_field_name("body")
+            .map(|b| contains_yield(&b))
+            .unwrap_or(false),
+        type_parameters: field_text(node, "type_parameters", source),
+        ..Default::default()
+    })
 }
 
-fn append_class_chunk<'a>(
-    node: &Node<'a>,
-    span_node: &Node<'a>,
-    decorators: &[String],
-    source: &[u8],
-    file_path: &str,
-    deps: &[String],
-    chunks: &mut Vec<CodeChunk>,
-) {
-    let Some(class_name) = field_text(node, "name", source) else { return };
-    let properties = extract_class_properties(node, source);
-    let code = class_header_and_properties(node, span_node, source);
-    let type_parameters = field_text(node, "type_parameters", source);
-    let bases = class_bases(node, source);
-    chunks.push(make_chunk(
-        file_path,
-        None,
-        Some(class_name),
-        Vec::new(),
-        None,
-        properties,
-        decorators.to_vec(),
-        false,
-        false,
-        false,
-        false,
-        None,
-        None,
-        type_parameters,
-        bases,
-        code,
-        node.kind(),
-        deps,
-    ));
+fn class_fields<'a>(node: &Node<'a>, decorators: &[String], source: &[u8]) -> Option<PythonFields> {
+    Some(PythonFields {
+        class_name: Some(field_text(node, "name", source)?),
+        properties: extract_class_properties(node, source),
+        decorators: decorators.to_vec(),
+        type_parameters: field_text(node, "type_parameters", source),
+        bases: class_bases(node, source),
+        ..Default::default()
+    })
 }
 
-fn append_type_alias_chunk<'a>(
+fn type_alias_fields<'a>(
     node: &Node<'a>,
-    span_node: &Node<'a>,
     decorators: &[String],
     source: &[u8],
-    file_path: &str,
-    deps: &[String],
     class_name: Option<&str>,
-    chunks: &mut Vec<CodeChunk>,
-) {
+) -> Option<PythonFields> {
     let mut cursor = node.walk();
     let types: Vec<Node<'a>> = node
         .named_children(&mut cursor)
         .filter(|c| c.kind() == "type")
         .collect();
     if types.len() < 2 {
-        return;
+        return None;
     }
-    let name = type_alias_name(&types[0], source);
-    let target = node_text(&types[types.len() - 1], source);
-    let code = source_text(span_node, source);
-    chunks.push(make_chunk(
-        file_path,
-        None,
-        class_name.map(|s| s.to_string()),
-        Vec::new(),
-        None,
-        Vec::new(),
-        decorators.to_vec(),
-        false,
-        false,
-        false,
-        true,
-        Some(name),
-        Some(target),
-        None,
-        None,
-        code,
-        node.kind(),
-        deps,
-    ));
+    Some(PythonFields {
+        class_name: class_name.map(str::to_string),
+        decorators: decorators.to_vec(),
+        is_type_alias: true,
+        alias_name: Some(type_alias_name(&types[0], source)),
+        alias_target: Some(node_text(&types[types.len() - 1], source)),
+        ..Default::default()
+    })
 }
 
-fn append_pep_613_alias_chunk<'a>(
+fn pep_613_alias_fields<'a>(
     node: &Node<'a>,
     source: &[u8],
-    file_path: &str,
-    deps: &[String],
     class_name: Option<&str>,
-    chunks: &mut Vec<CodeChunk>,
-) {
-    let Some(assignment) = assignment(node) else { return };
-    let Some(name_node) = assignment.child_by_field_name("left") else { return };
-    let name = node_text(&name_node, source);
-    let target = field_text(&assignment, "right", source);
-    let code = source_text(node, source);
-    chunks.push(make_chunk(
-        file_path,
-        None,
-        class_name.map(|s| s.to_string()),
-        Vec::new(),
-        None,
-        Vec::new(),
-        Vec::new(),
-        false,
-        false,
-        false,
-        true,
-        Some(name),
-        target,
-        None,
-        None,
-        code,
-        "type_alias_assignment",
-        deps,
-    ));
+) -> Option<PythonFields> {
+    let assignment = assignment(node)?;
+    let name_node = assignment.child_by_field_name("left")?;
+    Some(PythonFields {
+        class_name: class_name.map(str::to_string),
+        is_type_alias: true,
+        alias_name: Some(node_text(&name_node, source)),
+        alias_target: field_text(&assignment, "right", source),
+        ..Default::default()
+    })
 }
 
-fn append_lambda_chunk<'a>(
+fn lambda_fields<'a>(
     node: &Node<'a>,
     source: &[u8],
-    file_path: &str,
-    deps: &[String],
     class_name: Option<&str>,
-    chunks: &mut Vec<CodeChunk>,
-) {
-    let Some(assignment) = assignment(node) else { return };
-    let Some(name_node) = assignment.child_by_field_name("left") else { return };
-    let Some(lambda_node) = assignment.child_by_field_name("right") else { return };
-    let function_name = node_text(&name_node, source);
+) -> Option<PythonFields> {
+    let assignment = assignment(node)?;
+    let name_node = assignment.child_by_field_name("left")?;
+    let lambda_node = assignment.child_by_field_name("right")?;
     let parameters_node = lambda_node.child_by_field_name("parameters");
-    let parameters = extract_parameters(parameters_node.as_ref(), source);
-    let code = source_text(node, source);
-    chunks.push(make_chunk(
-        file_path,
-        Some(function_name),
-        class_name.map(|s| s.to_string()),
-        parameters,
-        None,
-        Vec::new(),
-        Vec::new(),
-        false,
-        false,
-        false,
-        false,
-        None,
-        None,
-        None,
-        None,
-        code,
-        "lambda",
-        deps,
-    ));
+    Some(PythonFields {
+        function_name: Some(node_text(&name_node, source)),
+        class_name: class_name.map(str::to_string),
+        parameters: extract_parameters(parameters_node.as_ref(), source),
+        ..Default::default()
+    })
 }
 
 fn extract_parameters<'a>(parameters_node: Option<&Node<'a>>, source: &[u8]) -> Vec<Parameter> {
-    let Some(node) = parameters_node else { return Vec::new() };
+    let Some(node) = parameters_node else {
+        return Vec::new();
+    };
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
-        .map(|c| Parameter::new(parameter_name(&c, source), node_text(&c, source).trim().to_string()))
+        .map(|c| {
+            Parameter::new(
+                parameter_name(&c, source),
+                node_text(&c, source).trim().to_string(),
+            )
+        })
         .collect()
 }
 
@@ -441,8 +313,10 @@ fn extract_class_properties<'a>(class_node: &Node<'a>, source: &[u8]) -> Vec<Par
 }
 
 fn class_header_and_properties<'a>(node: &Node<'a>, span_node: &Node<'a>, source: &[u8]) -> String {
-    let code = source_text(span_node, source);
-    let Some(body) = node.child_by_field_name("body") else { return code };
+    let code = node_text(span_node, source);
+    let Some(body) = node.child_by_field_name("body") else {
+        return code;
+    };
     let body_start = body.start_byte() - span_node.start_byte();
     let header = code[..body_start].trim_end().to_string();
     let properties = extract_class_properties(node, source);
@@ -454,9 +328,9 @@ fn class_header_and_properties<'a>(node: &Node<'a>, span_node: &Node<'a>, source
         .filter(|a| is_class_property_assignment(a, source))
         .map(|a| {
             if let Some(parent) = a.parent() {
-                source_text(&parent, source)
+                node_text(&parent, source)
             } else {
-                source_text(&a, source)
+                node_text(&a, source)
             }
         })
         .collect();
@@ -468,11 +342,16 @@ fn class_header_and_properties<'a>(node: &Node<'a>, span_node: &Node<'a>, source
 fn class_bases<'a>(node: &Node<'a>, source: &[u8]) -> Option<String> {
     let superclasses = node.child_by_field_name("superclasses")?;
     let raw = node_text(&superclasses, source).trim().to_string();
-    Some(raw.trim_start_matches('(').trim_end_matches(')').to_string())
+    Some(
+        raw.trim_start_matches('(')
+            .trim_end_matches(')')
+            .to_string(),
+    )
 }
 
 fn field_text<'a>(node: &Node<'a>, field: &str, source: &[u8]) -> Option<String> {
-    node.child_by_field_name(field).map(|n| node_text(&n, source).trim().to_string())
+    node.child_by_field_name(field)
+        .map(|n| node_text(&n, source).trim().to_string())
 }
 
 fn contains_yield<'a>(node: &Node<'a>) -> bool {
@@ -488,15 +367,19 @@ fn contains_yield<'a>(node: &Node<'a>) -> bool {
 }
 
 fn is_pep_613_alias<'a>(node: &Node<'a>, source: &[u8]) -> bool {
-    let Some(assignment) = assignment(node) else { return false };
+    let Some(assignment) = assignment(node) else {
+        return false;
+    };
     let annotation = assignment.child_by_field_name("type");
     annotation
         .map(|a| TYPE_ALIAS_ANNOTATIONS.contains(&node_text(&a, source).trim()))
         .unwrap_or(false)
 }
 
-fn is_named_lambda_assignment<'a>(node: &Node<'a>, _source: &[u8]) -> bool {
-    let Some(assignment) = assignment(node) else { return false };
+fn is_named_lambda_assignment<'a>(node: &Node<'a>) -> bool {
+    let Some(assignment) = assignment(node) else {
+        return false;
+    };
     let left = assignment.child_by_field_name("left");
     let right = assignment.child_by_field_name("right");
     left.map(|n| n.kind() == "identifier").unwrap_or(false)
@@ -515,7 +398,9 @@ fn assignment<'a>(node: &Node<'a>) -> Option<Node<'a>> {
 }
 
 fn class_property_assignments<'a>(class_node: &Node<'a>) -> Vec<Node<'a>> {
-    let Some(body) = class_node.child_by_field_name("body") else { return Vec::new() };
+    let Some(body) = class_node.child_by_field_name("body") else {
+        return Vec::new();
+    };
     let mut assignments = Vec::new();
     let mut cursor = body.walk();
     for child in body.named_children(&mut cursor) {
@@ -546,66 +431,25 @@ fn type_alias_name<'a>(node: &Node<'a>, source: &[u8]) -> String {
     node_text(node, source)
 }
 
-fn source_text<'a>(node: &Node<'a>, source: &[u8]) -> String {
-    node_text(&node, source)
-}
-
-#[allow(clippy::too_many_arguments)]
 fn make_chunk(
     file_path: &str,
-    function_name: Option<String>,
-    class_name: Option<String>,
-    parameters: Vec<Parameter>,
-    return_type: Option<String>,
-    properties: Vec<Parameter>,
-    decorators: Vec<String>,
-    is_method: bool,
-    is_async: bool,
-    is_generator: bool,
-    is_type_alias: bool,
-    alias_name: Option<String>,
-    alias_target: Option<String>,
-    type_parameters: Option<String>,
-    bases: Option<String>,
+    fields: PythonFields,
     code: String,
     chunk_type: &str,
     deps: &[String],
 ) -> CodeChunk {
-    let id = generate_chunk_id(
+    let identifier = fields
+        .function_name
+        .clone()
+        .or_else(|| fields.class_name.clone())
+        .or_else(|| fields.alias_name.clone())
+        .unwrap_or_else(|| "Unknown".to_string());
+    new_chunk(
         file_path,
-        &function_name
-            .clone()
-            .or(class_name.clone())
-            .or(alias_name.clone())
-            .unwrap_or("Unknown".to_string()),
-    );
-    CodeChunk {
-        id,
-        repo_name: String::new(),
-        file_name: Path::new(file_path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(file_path)
-            .to_string(),
+        &identifier,
         code,
-        r#type: chunk_type.to_string(),
-        dependencies: deps.to_vec(),
-        created_at: crate::services::ingestion::types::now_iso(),
-        kind: CodeChunkKind::Python(PythonFields {
-            function_name,
-            class_name,
-            parameters,
-            return_type,
-            properties,
-            decorators,
-            is_method,
-            is_async,
-            is_generator,
-            is_type_alias,
-            alias_name,
-            alias_target,
-            type_parameters,
-            bases,
-        }),
-    }
+        chunk_type,
+        deps,
+        CodeChunkKind::Python(fields),
+    )
 }

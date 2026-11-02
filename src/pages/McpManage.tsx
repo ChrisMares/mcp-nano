@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback } from "react";
 import { useNavigate, Link } from "react-router-dom";
 import { useScopeOptions } from "@/hooks/useScopeOptions";
+import { errorMessage } from "@/lib/utils";
 import {
   getMcpServers,
   getMcpServer,
@@ -15,11 +16,20 @@ import PageHead from "@/components/shared/PageHead";
 import ExpandableCard from "@/components/mcp/ExpandableCard";
 import ToolWizard from "@/components/mcp/ToolWizard";
 import NumberStepper from "@/components/ui/NumberStepper";
-import type { McpServer, ToolDefinition, ToolFormData } from "@/types/mcp";
+import type { McpServer, ToolDefinition, ToolFormData, ToolPayload } from "@/types/mcp";
 import { toolFormToPayload, toolToFormData, DEFAULT_MAX_CHUNK_LIMIT } from "@/types/mcp";
 import { card, badge, btnDanger, btnPrimary, btnSecondary, btnDeleteSmall, alertSuccess, alertError, loader, modalOverlay, modalPanel, confirmInput, btnCancel, btnConfirm } from "@/styles/classes";
 
 type ManageMode = "list" | "add" | "edit";
+
+/** Rebuild the save payload for an existing tool without changing its scopes. */
+const toolDefinitionToPayload = (tool: ToolDefinition, maxChunkLimit: number): ToolPayload => ({
+  name: tool.name,
+  description: tool.description ?? "",
+  code_search_scopes: tool.code_search_scopes.map(({ collection, repo_names }) => ({ collection, repo_names })),
+  document_search_scopes: tool.document_search_scopes.map(({ collection, group_ids }) => ({ collection, group_ids })),
+  max_chunk_limit: maxChunkLimit,
+});
 
 const McpManage: React.FC = () => {
   const navigate = useNavigate();
@@ -40,18 +50,7 @@ const McpManage: React.FC = () => {
   const fetchServers = useCallback(async () => {
     try {
       const res = await getMcpServers();
-      const list: McpServer[] = res?.servers || [];
-      setServers(list);
-      // fetch tool counts for all servers upfront
-      const details = await Promise.allSettled(
-        list.map((s) => getMcpServer(s.id))
-      );
-      setServers(
-        list.map((s, i) => {
-          const r = details[i];
-          return r.status === "fulfilled" ? r.value?.server ?? s : s;
-        })
-      );
+      setServers(res.servers);
     } catch {
       setServers([]);
     } finally {
@@ -61,8 +60,7 @@ const McpManage: React.FC = () => {
 
   const fetchServerDetail = useCallback(async (serverId: string) => {
     try {
-      const res = await getMcpServer(serverId);
-      const server: McpServer = res?.server;
+      const { server } = await getMcpServer(serverId);
       if (server) setServers((prev) => prev.map((s) => (s.id === serverId ? server : s)));
     } catch { /* keep existing data */ }
   }, []);
@@ -84,51 +82,39 @@ const McpManage: React.FC = () => {
   };
 
   const toggleServer = (serverId: string) => {
-    if (expandedServerId === serverId) {
-      setExpandedServerId(null);
-      resetToList();
-    } else {
-      setExpandedServerId(serverId);
-      resetToList();
-      fetchServerDetail(serverId);
-    }
+    setExpandedServerId(expandedServerId === serverId ? null : serverId);
+    resetToList();
   };
 
-  const handleAddTool = useCallback(async (data: ToolFormData) => {
+  const saveTool = useCallback(async (data: ToolFormData, toolId: string | null) => {
     if (!expandedServerId) return;
     setSaving(true);
     setError(null);
     setSuccess(false);
     try {
-      await createMcpTool(expandedServerId, toolFormToPayload(data));
+      const payload = toolFormToPayload(data);
+      if (toolId) {
+        await updateMcpTool(expandedServerId, toolId, payload);
+      } else {
+        await createMcpTool(expandedServerId, payload);
+      }
       setSuccess(true);
       setTimeout(() => setSuccess(false), 4000);
       await fetchServerDetail(expandedServerId);
       resetToList();
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : typeof err === "string" ? err : "Failed to add tool");
+      setError(errorMessage(err, toolId ? "Failed to update tool" : "Failed to add tool"));
     } finally {
       setSaving(false);
     }
   }, [expandedServerId, fetchServerDetail]);
 
-  const handleUpdateTool = useCallback(async (data: ToolFormData) => {
-    if (!expandedServerId || !selectedTool) return;
-    setSaving(true);
-    setError(null);
-    setSuccess(false);
-    try {
-      await updateMcpTool(expandedServerId, selectedTool.id, toolFormToPayload(data));
-      setSuccess(true);
-      setTimeout(() => setSuccess(false), 4000);
-      await fetchServerDetail(expandedServerId);
-      resetToList();
-    } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : "Failed to update tool");
-    } finally {
-      setSaving(false);
-    }
-  }, [expandedServerId, selectedTool, fetchServerDetail]);
+  const handleAddTool = useCallback((data: ToolFormData) => saveTool(data, null), [saveTool]);
+
+  const handleUpdateTool = useCallback(
+    (data: ToolFormData) => saveTool(data, selectedTool?.id ?? null),
+    [saveTool, selectedTool],
+  );
 
   const handleDeleteTool = useCallback(() => {
     if (!selectedTool) return;
@@ -148,7 +134,7 @@ const McpManage: React.FC = () => {
       await fetchServerDetail(expandedServerId);
       resetToList();
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : "Failed to delete tool");
+      setError(errorMessage(err, "Failed to delete tool"));
     } finally {
       setDeleteToolPending(null);
     }
@@ -161,7 +147,7 @@ const McpManage: React.FC = () => {
       await toggleMcpTool(expandedServerId, tool.id, !tool.active);
       await fetchServerDetail(expandedServerId);
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : "Failed to toggle tool");
+      setError(errorMessage(err, "Failed to toggle tool"));
     }
   }, [expandedServerId, fetchServerDetail]);
 
@@ -170,22 +156,10 @@ const McpManage: React.FC = () => {
     setError(null);
     setSavingMaxChunkToolId(tool.id);
     try {
-      await updateMcpTool(expandedServerId, tool.id, {
-        name: tool.name,
-        description: tool.description ?? "",
-        code_search_scopes: tool.code_search_scopes.map((s) => ({
-          collection: s.collection,
-          repo_names: s.repo_names,
-        })),
-        document_search_scopes: tool.document_search_scopes.map((s) => ({
-          collection: s.collection,
-          group_ids: s.group_ids,
-        })),
-        max_chunk_limit: maxChunkLimit,
-      });
+      await updateMcpTool(expandedServerId, tool.id, toolDefinitionToPayload(tool, maxChunkLimit));
       await fetchServerDetail(expandedServerId);
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : "Failed to update max chunk limit");
+      setError(errorMessage(err, "Failed to update max chunk limit"));
     } finally {
       setSavingMaxChunkToolId(null);
     }
@@ -207,7 +181,7 @@ const McpManage: React.FC = () => {
       }
       await fetchServers();
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : "Failed to delete server");
+      setError(errorMessage(err, "Failed to delete server"));
     } finally {
       setDeleteConfirmServerId(null);
       setDeleteConfirmText("");

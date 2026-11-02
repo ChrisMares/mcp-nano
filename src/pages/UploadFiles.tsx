@@ -13,6 +13,8 @@ import ConfigureWebsiteStep from "@/components/uploadfiles/ConfigureWebsiteStep"
 import UploadStep from "@/components/uploadfiles/UploadStep";
 import WebsiteProcessingStep from "@/components/uploadfiles/WebsiteProcessingStep";
 import JobStatusPanel from "@/components/uploadfiles/JobStatusPanel";
+import { alertError } from "@/styles/classes";
+import { errorMessage } from "@/lib/utils";
 import type { UploadJobEntry } from "@/types/embed";
 
 interface CrawlProgressEvent {
@@ -56,6 +58,7 @@ const UploadFiles: React.FC = () => {
   const [websiteRenderJavascript, setWebsiteRenderJavascript] = useState<boolean>(false);
   const [websiteUrls, setWebsiteUrls] = useState<string[]>([]);
   const [websiteCrawlError, setWebsiteCrawlError] = useState<boolean>(false);
+  const [websiteEmbedError, setWebsiteEmbedError] = useState<string | null>(null);
   const [websiteCrawling, setWebsiteCrawling] = useState<boolean>(false);
   const [crawlCurrentUrl, setCrawlCurrentUrl] = useState<string | null>(null);
   const [crawlFoundCount, setCrawlFoundCount] = useState(0);
@@ -64,7 +67,6 @@ const UploadFiles: React.FC = () => {
   const [lastSubmittedCount, setLastSubmittedCount] = useState(0);
   const crawlSessionRef = useRef(0);
   const websiteEmbedJobIdRef = useRef<string | null>(null);
-  websiteEmbedJobIdRef.current = websiteEmbedJobId;
   const { activeJobs, completedJobs, trackUploadedJobs, trackQueuedJob } = useJobTracking();
 
   useEffect(() => {
@@ -108,6 +110,7 @@ const UploadFiles: React.FC = () => {
   const handleWebsiteSubmit = useCallback(async () => {
     setWebsiteCrawlError(false);
     setWebsiteUrls([]);
+    websiteEmbedJobIdRef.current = null;
     setWebsiteEmbedJobId(null);
     setCrawlCurrentUrl(websiteUrl.trim() || null);
     setCrawlFoundCount(0);
@@ -120,7 +123,7 @@ const UploadFiles: React.FC = () => {
         setStep((s) => (s === 2 ? 3 : s));
       }
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const message = errorMessage(err);
       if (crawlSessionRef.current === session && !message.includes("cancelled")) {
         setWebsiteCrawlError(true);
       }
@@ -147,9 +150,11 @@ const UploadFiles: React.FC = () => {
 
   const handleWebsiteEmbed = useCallback(
     async (urls: string[]) => {
+      setWebsiteEmbedError(null);
       try {
         const res = await embedWebsite(urls, urlToGroupName(websiteUrl), websiteRenderJavascript);
         const jobId = res.job_id;
+        websiteEmbedJobIdRef.current = jobId;
         setWebsiteEmbedJobId(jobId);
         trackQueuedJob({
           job_id: jobId,
@@ -159,7 +164,7 @@ const UploadFiles: React.FC = () => {
           created_at: new Date().toISOString(),
         });
       } catch (err) {
-        console.error("Failed to start website embedding:", err);
+        setWebsiteEmbedError(`Failed to start website embedding: ${String(err)}`);
       }
     },
     [websiteUrl, websiteRenderJavascript, trackQueuedJob],
@@ -173,7 +178,12 @@ const UploadFiles: React.FC = () => {
       .catch(() => setRepoOptions([]));
   }, [collection]);
 
-  // Fetch group names when general is selected
+  // Fetch group names once per collection change. The mode is read through a
+  // ref so typing a new group name does not refetch on every keystroke.
+  const groupModeRef = useRef(groupMode);
+  useEffect(() => {
+    groupModeRef.current = groupMode;
+  }, [groupMode]);
   useEffect(() => {
     if (collection !== "general") return;
     getMetadataValues("general", "group")
@@ -181,10 +191,12 @@ const UploadFiles: React.FC = () => {
         const vals: string[] = res.values ?? [];
         if (!vals.includes("default")) vals.unshift("default");
         setGroupOptions(vals);
-        if (!vals.includes(groupName) && groupMode === "existing") setGroupName("");
+        if (groupModeRef.current === "existing") {
+          setGroupName((prev) => (vals.includes(prev) ? prev : ""));
+        }
       })
       .catch(() => setGroupOptions(["default"]));
-  }, [collection, groupName, groupMode]);
+  }, [collection]);
 
   const uploadProps = useLocalUpload({
     collection: collection === "" ? "general" : collection === "website" ? "general" : collection,
@@ -237,6 +249,7 @@ const UploadFiles: React.FC = () => {
     setWebsiteCrawling(false);
     setCrawlCurrentUrl(null);
     setCrawlFoundCount(0);
+    websiteEmbedJobIdRef.current = null;
     setWebsiteEmbedJobId(null);
   };
 
@@ -369,6 +382,11 @@ const UploadFiles: React.FC = () => {
             onEmbed={handleWebsiteEmbed}
             onStartAnother={handleStartAnother}
           />
+        )}
+        {step === 3 && collection === "website" && websiteEmbedError && (
+          <div className={`${alertError} mt-4`} role="alert">
+            {websiteEmbedError}
+          </div>
         )}
       </div>
 

@@ -3,7 +3,6 @@
 //!
 //! Chunk size is 768 tokens with 64 overlap (Python `CODE_CHUNK_SIZE=768`).
 
-
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -35,6 +34,18 @@ fn code_splitter() -> text_splitter::TextSplitter<tokenizers::Tokenizer> {
 
 fn chunk_file(path: &Path, repo_name: &str) -> Vec<CodeChunk> {
     code_chunker::chunk_single_code_file(path, repo_name, None, &code_splitter(), 768)
+}
+
+fn sample_dependencies(
+    file: &str,
+    language: impl Into<tree_sitter::Language>,
+    extract: fn(tree_sitter::Node<'_>, &[u8]) -> Vec<String>,
+) -> Vec<String> {
+    let bytes = std::fs::read(sample(file)).unwrap();
+    let mut parser = Parser::new();
+    parser.set_language(&language.into()).unwrap();
+    let tree = parser.parse(&bytes, None).unwrap();
+    extract(tree.root_node(), &bytes)
 }
 
 fn sql_chunks(path: &Path) -> Vec<CodeChunk> {
@@ -73,16 +84,16 @@ fn rust_extracts_dependencies_and_fmt_chunk() {
         .iter()
         .find(|c| matches!(&c.kind, CodeChunkKind::Rust(f) if f.function_name.as_deref() == Some("fmt")))
         .expect("missing fmt");
-    let CodeChunkKind::Rust(f) = &fmt.kind else { panic!() };
+    let CodeChunkKind::Rust(f) = &fmt.kind else {
+        panic!()
+    };
     assert_eq!(f.class_name.as_deref(), Some("Wrapping<T>"));
 
-    let bytes = std::fs::read(sample("sample_rust.rs")).unwrap();
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter::Language::from(tree_sitter_rust::LANGUAGE))
-        .unwrap();
-    let tree = parser.parse(&bytes, None).unwrap();
-    let deps = code_chunker::rust_lang::extract_dependencies(tree.root_node(), &bytes);
+    let deps = sample_dependencies(
+        "sample_rust.rs",
+        tree_sitter_rust::LANGUAGE,
+        code_chunker::rust_lang::extract_dependencies,
+    );
     assert_eq!(
         deps,
         vec![
@@ -116,7 +127,14 @@ fn rust_struct_enum_trait_and_poco() {
         .iter()
         .find(|c| matches!(&c.kind, CodeChunkKind::Rust(f) if f.class_name.as_deref() == Some("CustomerProfile")))
         .expect("CustomerProfile");
-    for field in ["CustomerProfile", "first_name", "last_name", "age", "email", "is_active"] {
+    for field in [
+        "CustomerProfile",
+        "first_name",
+        "last_name",
+        "age",
+        "email",
+        "is_active",
+    ] {
         assert!(poco.code.contains(field), "missing {field}");
     }
     let embed = poco.chunk_embedding_text();
@@ -127,7 +145,10 @@ fn rust_struct_enum_trait_and_poco() {
 #[test]
 fn rust_remainder_excludes_extracted_fn() {
     let chunks = chunk_file(&sample("sample_rust.rs"), "test_repo");
-    let rem = chunks.iter().find(|c| c.r#type == "file_remainder").unwrap();
+    let rem = chunks
+        .iter()
+        .find(|c| c.r#type == "file_remainder")
+        .unwrap();
     assert!(!rem.code.contains("fn fmt"));
 }
 
@@ -153,27 +174,42 @@ fn c_functions_params_deps_and_remainder() {
         .iter()
         .find(|c| matches!(&c.kind, CodeChunkKind::C(f) if f.function_name.as_deref() == Some("string2ll")))
         .unwrap();
-    let CodeChunkKind::C(f) = &string2ll.kind else { panic!() };
+    let CodeChunkKind::C(f) = &string2ll.kind else {
+        panic!()
+    };
     let pnames: Vec<_> = f.parameters.iter().map(|p| p.name.as_str()).collect();
     assert_eq!(&pnames[..3], &["s", "slen", "value"]);
     assert_eq!(f.return_type.as_deref(), Some("int"));
 
-    let bytes = std::fs::read(sample("sample_c.c")).unwrap();
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter::Language::from(tree_sitter_c::LANGUAGE))
-        .unwrap();
-    let tree = parser.parse(&bytes, None).unwrap();
-    let deps = code_chunker::c::extract_dependencies(tree.root_node(), &bytes);
+    let deps = sample_dependencies(
+        "sample_c.c",
+        tree_sitter_c::LANGUAGE,
+        code_chunker::c::extract_dependencies,
+    );
     assert_eq!(
         deps,
         vec![
-            "fmacros.h", "string.h", "stdlib.h", "unistd.h", "strings.h", "assert.h",
-            "errno.h", "ctype.h", "limits.h", "math.h", "alloc.h", "read.h", "sds.h", "win32.h",
+            "fmacros.h",
+            "string.h",
+            "stdlib.h",
+            "unistd.h",
+            "strings.h",
+            "assert.h",
+            "errno.h",
+            "ctype.h",
+            "limits.h",
+            "math.h",
+            "alloc.h",
+            "read.h",
+            "sds.h",
+            "win32.h",
         ]
     );
 
-    let rem = chunks.iter().find(|c| c.r#type == "file_remainder").unwrap();
+    let rem = chunks
+        .iter()
+        .find(|c| c.r#type == "file_remainder")
+        .unwrap();
     assert!(rem.code.contains("REDIS_READER_STACK_SIZE"));
     assert!(!rem.code.contains("string2ll"));
 }
@@ -184,7 +220,10 @@ fn c_header_and_struct_in_remainder() {
     assert!(chunks.iter().any(|c| {
         matches!(&c.kind, CodeChunkKind::C(f) if f.function_name.as_deref() == Some("sdslen"))
     }));
-    let rem = chunks.iter().find(|c| c.r#type == "file_remainder").unwrap();
+    let rem = chunks
+        .iter()
+        .find(|c| c.r#type == "file_remainder")
+        .unwrap();
     assert!(rem.code.contains("struct __attribute__") || rem.code.contains("CustomerProfile"));
     assert!(rem.code.contains("CustomerProfile"));
     assert!(rem.code.contains("firstName"));
@@ -201,7 +240,9 @@ fn cpp_functions_class_and_poco() {
         .iter()
         .find(|c| matches!(&c.kind, CodeChunkKind::Cpp(f) if f.function_name.as_deref() == Some("swap")))
         .unwrap();
-    let CodeChunkKind::Cpp(f) = &swap.kind else { panic!() };
+    let CodeChunkKind::Cpp(f) = &swap.kind else {
+        panic!()
+    };
     assert_eq!(f.class_name.as_deref(), Some("UUID"));
     assert_eq!(f.namespace.as_deref(), Some("Poco"));
     assert!(chunks.iter().any(|c| {
@@ -223,7 +264,14 @@ fn cpp_functions_class_and_poco() {
         .find(|c| matches!(&c.kind, CodeChunkKind::Cpp(f) if f.class_name.as_deref() == Some("CustomerProfile")))
         .expect("CustomerProfile struct");
     assert_eq!(poco.r#type, "struct_specifier");
-    for field in ["CustomerProfile", "firstName", "lastName", "age", "email", "isActive"] {
+    for field in [
+        "CustomerProfile",
+        "firstName",
+        "lastName",
+        "age",
+        "email",
+        "isActive",
+    ] {
         assert!(poco.code.contains(field));
     }
 }
@@ -239,7 +287,9 @@ fn java_methods_types_and_poco() {
         .iter()
         .find(|c| matches!(&c.kind, CodeChunkKind::Java(f) if f.function_name.as_deref() == Some("state") && f.class_name.as_deref() == Some("Assert")))
         .unwrap();
-    let CodeChunkKind::Java(f) = &state.kind else { panic!() };
+    let CodeChunkKind::Java(f) = &state.kind else {
+        panic!()
+    };
     assert_eq!(f.namespace.as_deref(), Some("com.example.demo"));
     assert!(chunks.iter().any(|c| c.r#type == "class_declaration"
         && matches!(&c.kind, CodeChunkKind::Java(f) if f.class_name.as_deref() == Some("Assert"))));
@@ -253,7 +303,14 @@ fn java_methods_types_and_poco() {
         .iter()
         .find(|c| matches!(&c.kind, CodeChunkKind::Java(f) if f.class_name.as_deref() == Some("CustomerProfile")))
         .unwrap();
-    for field in ["CustomerProfile", "firstName", "lastName", "age", "email", "active"] {
+    for field in [
+        "CustomerProfile",
+        "firstName",
+        "lastName",
+        "age",
+        "email",
+        "active",
+    ] {
         assert!(poco.code.contains(field));
     }
 }
@@ -275,9 +332,14 @@ fn js_functions_class_method_and_remainder() {
         .iter()
         .find(|c| matches!(&c.kind, CodeChunkKind::JavaScript(f) if f.function_name.as_deref() == Some("getFullName")))
         .unwrap();
-    let CodeChunkKind::JavaScript(f) = &full.kind else { panic!() };
+    let CodeChunkKind::JavaScript(f) = &full.kind else {
+        panic!()
+    };
     assert_eq!(f.class_name.as_deref(), Some("CustomerProfile"));
-    let rem = chunks.iter().find(|c| c.r#type == "file_remainder").unwrap();
+    let rem = chunks
+        .iter()
+        .find(|c| c.r#type == "file_remainder")
+        .unwrap();
     assert!(rem.code.contains("const {isArray}") || rem.code.contains("CustomerProfile"));
     assert!(!rem.code.contains("function merge"));
 }
@@ -294,7 +356,9 @@ fn ts_functions_types_and_poco_interface() {
         .iter()
         .find(|c| matches!(&c.kind, CodeChunkKind::TypeScript(f) if f.function_name.as_deref() == Some("makeIssue")))
         .unwrap();
-    let CodeChunkKind::TypeScript(f) = &make.kind else { panic!() };
+    let CodeChunkKind::TypeScript(f) = &make.kind else {
+        panic!()
+    };
     assert_eq!(f.parameters.len(), 1);
     assert_eq!(f.return_type.as_deref(), Some("ZodIssue"));
     assert!(chunks.iter().any(|c| {
@@ -314,7 +378,14 @@ fn ts_functions_types_and_poco_interface() {
         .iter()
         .find(|c| matches!(&c.kind, CodeChunkKind::TypeScript(f) if f.class_name.as_deref() == Some("CustomerProfile")))
         .unwrap();
-    for field in ["CustomerProfile", "firstName", "lastName", "age", "email", "isActive"] {
+    for field in [
+        "CustomerProfile",
+        "firstName",
+        "lastName",
+        "age",
+        "email",
+        "isActive",
+    ] {
         assert!(iface.code.contains(field));
     }
 }
@@ -326,14 +397,18 @@ fn react_components_hooks_export_and_inner() {
         .iter()
         .find(|c| matches!(&c.kind, CodeChunkKind::React(f) if f.component_name.as_deref() == Some("App")))
         .unwrap();
-    let CodeChunkKind::React(f) = &app.kind else { panic!() };
+    let CodeChunkKind::React(f) = &app.kind else {
+        panic!()
+    };
     assert!(f.is_exported);
     assert_eq!(app.r#type, "functional_component");
     let layout = chunks
         .iter()
         .find(|c| matches!(&c.kind, CodeChunkKind::React(f) if f.component_name.as_deref() == Some("Layout")))
         .unwrap();
-    let CodeChunkKind::React(lf) = &layout.kind else { panic!() };
+    let CodeChunkKind::React(lf) = &layout.kind else {
+        panic!()
+    };
     assert!(!lf.is_exported);
     assert!(chunks.iter().any(|c| {
         c.r#type == "hook"
@@ -371,7 +446,9 @@ fn csharp_records_struct_enum_poco_and_modern() {
                 && matches!(&c.kind, CodeChunkKind::CSharp(f) if f.class_name.as_deref() == Some("MaxDiscountLogItemSummary"))
         })
         .unwrap();
-    let CodeChunkKind::CSharp(rf) = &record.kind else { panic!() };
+    let CodeChunkKind::CSharp(rf) = &record.kind else {
+        panic!()
+    };
     let props: HashSet<_> = rf.properties.iter().map(|p| p.name.as_str()).collect();
     assert_eq!(
         props,
@@ -388,7 +465,9 @@ fn csharp_records_struct_enum_poco_and_modern() {
         .iter()
         .find(|c| matches!(&c.kind, CodeChunkKind::CSharp(f) if f.class_name.as_deref() == Some("MaxDicount2")))
         .unwrap();
-    let CodeChunkKind::CSharp(pf) = &pos.kind else { panic!() };
+    let CodeChunkKind::CSharp(pf) = &pos.kind else {
+        panic!()
+    };
     assert!(pf.properties.iter().any(|p| p.r#type == "string"));
     assert!(pf.properties.iter().any(|p| p.r#type == "decimal"));
 
@@ -412,7 +491,9 @@ fn csharp_records_struct_enum_poco_and_modern() {
                 && matches!(&c.kind, CodeChunkKind::CSharp(f) if f.class_name.as_deref() == Some("CustomerProfile"))
         })
         .unwrap();
-    let CodeChunkKind::CSharp(cf) = &poco.kind else { panic!() };
+    let CodeChunkKind::CSharp(cf) = &poco.kind else {
+        panic!()
+    };
     let prop_map: std::collections::HashMap<_, _> = cf
         .properties
         .iter()
@@ -440,13 +521,11 @@ fn csharp_records_struct_enum_poco_and_modern() {
 
 #[test]
 fn python_dependencies_exact_order() {
-    let bytes = std::fs::read(sample("sample_python.py")).unwrap();
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter::Language::from(tree_sitter_python::LANGUAGE))
-        .unwrap();
-    let tree = parser.parse(&bytes, None).unwrap();
-    let deps = code_chunker::python::extract_dependencies(tree.root_node(), &bytes);
+    let deps = sample_dependencies(
+        "sample_python.py",
+        tree_sitter_python::LANGUAGE,
+        code_chunker::python::extract_dependencies,
+    );
     assert_eq!(
         deps,
         vec![
@@ -468,11 +547,28 @@ fn python_dependencies_exact_order() {
 #[test]
 fn python_functions_classes_signatures_and_remainder() {
     let chunks = chunk_file(&sample("sample_python.py"), "test_repo");
-    assert!(chunks.iter().all(|c| matches!(c.kind, CodeChunkKind::Python(_)) || c.r#type == "file_remainder"));
+    assert!(chunks
+        .iter()
+        .all(|c| matches!(c.kind, CodeChunkKind::Python(_)) || c.r#type == "file_remainder"));
     for name in [
-        "traced", "decorate", "identity", "describe", "fetch_records", "consume", "values",
-        "stream_values", "yield_from_values", "callback", "__init__", "create", "parse", "label",
-        "outer", "local", "format", "control_flow",
+        "traced",
+        "decorate",
+        "identity",
+        "describe",
+        "fetch_records",
+        "consume",
+        "values",
+        "stream_values",
+        "yield_from_values",
+        "callback",
+        "__init__",
+        "create",
+        "parse",
+        "label",
+        "outer",
+        "local",
+        "format",
+        "control_flow",
     ] {
         assert!(
             chunks.iter().any(|c| matches!(&c.kind, CodeChunkKind::Python(f) if f.function_name.as_deref() == Some(name))),
@@ -486,9 +582,14 @@ fn python_functions_classes_signatures_and_remainder() {
         .iter()
         .find(|c| matches!(&c.kind, CodeChunkKind::Python(f) if f.function_name.as_deref() == Some("describe")))
         .unwrap();
-    let CodeChunkKind::Python(df) = &describe.kind else { panic!() };
+    let CodeChunkKind::Python(df) = &describe.kind else {
+        panic!()
+    };
     assert_eq!(
-        df.parameters.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+        df.parameters
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect::<Vec<_>>(),
         vec!["item", "/", "count", "labels", "enabled", "options"]
     );
     assert_eq!(df.return_type.as_deref(), Some("dict[str, object]"));
@@ -498,7 +599,9 @@ fn python_functions_classes_signatures_and_remainder() {
         .iter()
         .find(|c| matches!(&c.kind, CodeChunkKind::Python(f) if f.class_name.as_deref() == Some("Service") && f.function_name.is_none() && !f.is_type_alias))
         .unwrap();
-    let CodeChunkKind::Python(sf) = &service.kind else { panic!() };
+    let CodeChunkKind::Python(sf) = &service.kind else {
+        panic!()
+    };
     assert_eq!(sf.type_parameters.as_deref(), Some("[T]"));
     assert_eq!(sf.bases.as_deref(), Some("BaseService, metaclass=type"));
     let props: std::collections::HashMap<_, _> = sf
@@ -516,29 +619,49 @@ fn python_functions_classes_signatures_and_remainder() {
         .iter()
         .find(|c| matches!(&c.kind, CodeChunkKind::Python(f) if f.function_name.as_deref() == Some("values")))
         .unwrap();
-    let CodeChunkKind::Python(vf) = &values.kind else { panic!() };
+    let CodeChunkKind::Python(vf) = &values.kind else {
+        panic!()
+    };
     assert!(vf.is_generator);
 
-    let rem = chunks.iter().find(|c| c.r#type == "file_remainder").unwrap();
+    let rem = chunks
+        .iter()
+        .find(|c| c.r#type == "file_remainder")
+        .unwrap();
     assert!(matches!(rem.kind, CodeChunkKind::Python(_)));
-    assert!(rem.code.contains("CONSTANT = \"module remainder\"") || rem.code.contains("CONSTANT = 'module remainder'") || rem.code.contains("module remainder"));
+    assert!(
+        rem.code.contains("CONSTANT = \"module remainder\"")
+            || rem.code.contains("CONSTANT = 'module remainder'")
+            || rem.code.contains("module remainder")
+    );
     assert!(rem.code.contains("match CONSTANT:"));
 }
 
 #[test]
 fn python_realworld_sources() {
     let cases = [
-        ("realworld_fastapi_api_key.py", "__call__", Some("APIKeyQuery")),
+        (
+            "realworld_fastapi_api_key.py",
+            "__call__",
+            Some("APIKeyQuery"),
+        ),
         ("realworld_httpx_auth.py", "async_auth_flow", Some("Auth")),
-        ("realworld_pydantic_decorator.py", "validate_arguments", None),
+        (
+            "realworld_pydantic_decorator.py",
+            "validate_arguments",
+            None,
+        ),
     ];
     for (file, fn_name, class_name) in cases {
         let chunks = chunk_file(&sample(file), "real_world");
-        assert!(chunks.iter().any(|c| {
-            matches!(&c.kind, CodeChunkKind::Python(f)
+        assert!(
+            chunks.iter().any(|c| {
+                matches!(&c.kind, CodeChunkKind::Python(f)
                 if f.function_name.as_deref() == Some(fn_name)
                 && (class_name.is_none() || f.class_name.as_deref() == class_name))
-        }), "{file}");
+            }),
+            "{file}"
+        );
     }
 }
 
@@ -560,7 +683,9 @@ fn sql_sample_core_statements() {
         .iter()
         .find(|c| matches!(&c.kind, CodeChunkKind::Sql(f) if f.object_name.as_deref() == Some("customers")))
         .unwrap();
-    let CodeChunkKind::Sql(cf) = &customers.kind else { panic!() };
+    let CodeChunkKind::Sql(cf) = &customers.kind else {
+        panic!()
+    };
     assert_eq!(cf.schema_name.as_deref(), Some("dbo"));
     assert!(customers.code.contains("PRIMARY KEY"));
 
@@ -593,7 +718,9 @@ fn sql_sfa_schema_counts_and_metadata() {
         matches!(&c.kind, CodeChunkKind::Sql(f) if f.statement_type.as_deref().map(|s| s.eq_ignore_ascii_case("MERGE")).unwrap_or(false))
     }));
     for c in &chunks {
-        let CodeChunkKind::Sql(f) = &c.kind else { panic!() };
+        let CodeChunkKind::Sql(f) = &c.kind else {
+            panic!()
+        };
         assert_eq!(f.database_name.as_deref(), Some("SFA"));
         assert_eq!(f.schema_name.as_deref(), Some("dbo"));
         assert!(!c.code.lines().any(|l| l.trim().eq_ignore_ascii_case("GO")));
@@ -648,7 +775,9 @@ fn sql_postgresql_oracle_sqlite_dialects() {
 #[test]
 fn chunk_single_sets_repo_and_override() {
     let chunks = chunk_file(&sample("sample_js.js"), "test_repo");
-    assert!(chunks.iter().all(|c| c.repo_name == "test_repo" && c.file_name == "sample_js.js"));
+    assert!(chunks
+        .iter()
+        .all(|c| c.repo_name == "test_repo" && c.file_name == "sample_js.js"));
     let overridden = code_chunker::chunk_single_code_file(
         &sample("sample_js.js"),
         "test_repo",
@@ -663,12 +792,16 @@ fn chunk_single_sets_repo_and_override() {
 fn generic_fallback_and_oversized_split() {
     let chunks = chunk_file(&sample("sample_special_token.txt"), "test_repo");
     assert!(!chunks.is_empty());
-    assert!(chunks.iter().all(|c| matches!(c.kind, CodeChunkKind::Generic)));
+    assert!(chunks
+        .iter()
+        .all(|c| matches!(c.kind, CodeChunkKind::Generic)));
 
     let big = CodeChunk::generic("orig-1", "my_repo", "big.py", "x = 1\n".repeat(2000));
     let split = split_oversized_code_chunks(vec![big], &code_splitter());
     assert!(split.len() > 1);
-    assert!(split.iter().all(|c| c.repo_name == "my_repo" && c.file_name == "big.py"));
+    assert!(split
+        .iter()
+        .all(|c| c.repo_name == "my_repo" && c.file_name == "big.py"));
 
     let small = CodeChunk::generic("small-1", "r", "f.py", "x = 1");
     let passthrough = split_oversized_code_chunks(vec![small], &code_splitter());
@@ -695,13 +828,8 @@ fn chartjs_radar_radius_indexable_chunks_without_panic() {
         .iter()
         .all(|c| c.file_name == "chartjs_radar_radius_indexable.js"));
 
-    let docs = code_chunker::chunk_file_to_documents(
-        &path,
-        "Chart.js-4.5.1",
-        None,
-        &code_splitter(),
-        768,
-    );
+    let docs =
+        code_chunker::chunk_file_to_documents(&path, "Chart.js-4.5.1", None, &code_splitter(), 768);
     assert!(!docs.is_empty(), "chunk_file_to_documents returned no docs");
     let joined: String = docs.iter().map(|d| d.content.as_str()).collect();
     assert!(joined.contains("radar"), "missing radar marker: {joined}");
@@ -715,3 +843,35 @@ fn chartjs_radar_radius_indexable_chunks_without_panic() {
     );
 }
 
+#[test]
+fn cpp_class_in_dot_h_header_gets_a_class_chunk_and_member_symbols() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sessionimpl.h");
+    std::fs::write(
+        &path,
+        "#pragma once\n\nnamespace BitTorrent\n{\n    class Session;\n    struct Options;\n    class SessionImpl final : public Session\n    {\n    public:\n        bool isRestored() const\n        {\n            return m_restored;\n        }\n    private:\n        bool m_restored = false;\n    };\n}\n",
+    )
+    .unwrap();
+    let chunks = chunk_file(&path, "repo");
+
+    let class_chunk = chunks
+        .iter()
+        .find(|c| c.r#type == "class_specifier")
+        .expect("class chunk");
+    assert_eq!(class_chunk.symbol().as_deref(), Some("SessionImpl"));
+    assert!(
+        chunks
+            .iter()
+            .all(|c| !matches!(c.symbol().as_deref(), Some("Session" | "Options"))),
+        "forward declarations must not become chunks"
+    );
+
+    let method = chunks
+        .iter()
+        .find(|c| c.symbol().as_deref() == Some("isRestored"))
+        .expect("inline method chunk");
+    assert_eq!(
+        method.qualified_symbol().as_deref(),
+        Some("SessionImpl::isRestored")
+    );
+}

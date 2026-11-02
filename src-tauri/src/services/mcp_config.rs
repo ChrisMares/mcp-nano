@@ -32,10 +32,7 @@ fn validate_server_name(name: &str) -> Result<String, String> {
     if name.is_empty() {
         return Err("Server name is required".into());
     }
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_')
-    {
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         return Err("Only letters, numbers, and underscores allowed".into());
     }
     Ok(name)
@@ -364,9 +361,11 @@ pub fn collection_requests(tool: &ToolDefinition) -> Vec<serde_json::Value> {
         .code_search_scopes
         .iter()
         .map(|s| scope_request(&s.collection, "codebase", "repo_name", &s.repo_names))
-        .chain(tool.document_search_scopes.iter().map(|s| {
-            scope_request(&s.collection, "general", "group", &s.group_ids)
-        }))
+        .chain(
+            tool.document_search_scopes
+                .iter()
+                .map(|s| scope_request(&s.collection, "general", "group", &s.group_ids)),
+        )
         .collect();
 
     if requests.is_empty() {
@@ -629,7 +628,13 @@ mod tests {
 
     #[test]
     fn validate_server_name_rejects_invalid_chars() {
-        for bad in ["has space", "dash-name", "dot.name", "slash/name", "emoji🦀"] {
+        for bad in [
+            "has space",
+            "dash-name",
+            "dot.name",
+            "slash/name",
+            "emoji🦀",
+        ] {
             assert!(validate_server_name(bad).is_err(), "{bad} should fail");
         }
     }

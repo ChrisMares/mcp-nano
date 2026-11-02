@@ -1,3 +1,6 @@
+/** Pixel-block "mcp nano" wordmark drawn as SVG rects. */
+import type React from "react";
+
 interface BlockLogoProps {
   className?: string;
 }
@@ -12,28 +15,30 @@ const letters = [
   { pattern: ["01110", "10001", "10001", "10001", "10001", "10001", "01110"], color: "logo-block-9" },
 ];
 
+const blocks = letters.flatMap(({ pattern, color }, letterIndex) => {
+  const xOffset = letterIndex * 31 + (letterIndex > 2 ? 6 : 0);
+  return pattern.flatMap((row, rowIndex) =>
+    [...row].flatMap((cell, columnIndex) =>
+      cell === "1"
+        ? [
+            <rect
+              key={`${letterIndex}-${rowIndex}-${columnIndex}`}
+              x={xOffset + columnIndex * 5}
+              y={rowIndex * 5}
+              width="5"
+              height="5"
+              className={color}
+            />,
+          ]
+        : [],
+    ),
+  );
+});
+
+/** The app wordmark. Fill colors come from the `.logo-block-N` classes. */
 const BlockLogo: React.FC<BlockLogoProps> = ({ className = "" }) => (
   <svg viewBox="0 0 217 35" className={className} aria-label="mcp nano" role="img">
-    {letters.map(({ pattern, color }, letterIndex) => {
-      const xOffset = letterIndex * 31 + (letterIndex > 2 ? 6 : 0);
-
-      return pattern.flatMap((row, rowIndex) =>
-        [...row].flatMap((cell, columnIndex) =>
-          cell === "1"
-            ? [
-                <rect
-                  key={`${letterIndex}-${rowIndex}-${columnIndex}`}
-                  x={xOffset + columnIndex * 5}
-                  y={rowIndex * 5}
-                  width="5"
-                  height="5"
-                  className={color}
-                />,
-              ]
-            : [],
-        ),
-      );
-    })}
+    {blocks}
   </svg>
 );
 

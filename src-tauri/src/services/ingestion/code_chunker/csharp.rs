@@ -1,10 +1,8 @@
 //! C# chunker. Direct port of `chunk_code_csharp.py`.
 
-use std::path::Path;
-
 use tree_sitter::Node;
 
-use super::helpers::{generate_chunk_id, node_text, walk_preorder};
+use super::helpers::{collect_dependencies, field_text, find_child_of_kind, new_chunk, node_text};
 use crate::services::ingestion::types::{CSharpFields, CodeChunk, CodeChunkKind, Parameter};
 
 const NAMED_DECLARATION_TYPES: &[&str] = &[
@@ -18,19 +16,13 @@ const NAMED_DECLARATION_TYPES: &[&str] = &[
 ];
 
 pub fn extract_dependencies<'a>(root: Node<'a>, source: &[u8]) -> Vec<String> {
-    let mut deps: Vec<String> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    walk_preorder(root, |node| {
+    collect_dependencies(root, |node, deps| {
         if node.kind() == "using_directive" {
-            let using_text = node_text(&node, source);
-            if let Some(dep) = normalize_csharp_using(&using_text) {
-                if seen.insert(dep.clone()) {
-                    deps.push(dep);
-                }
+            if let Some(dep) = normalize_csharp_using(&node_text(&node, source)) {
+                deps.push(dep);
             }
         }
-    });
-    deps
+    })
 }
 
 fn normalize_csharp_using(using_text: &str) -> Option<String> {
@@ -51,7 +43,11 @@ fn normalize_csharp_using(using_text: &str) -> Option<String> {
     if let Some(stripped) = t.strip_prefix("global::") {
         t = stripped.to_string();
     }
-    if t.is_empty() { None } else { Some(t) }
+    if t.is_empty() {
+        None
+    } else {
+        Some(t)
+    }
 }
 
 pub fn extract_chunks<'a>(
@@ -72,216 +68,144 @@ fn extract_impl<'a>(
     deps: &[String],
     chunks: &mut Vec<CodeChunk>,
 ) {
-    if !NAMED_DECLARATION_TYPES.contains(&node.kind()) {
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            extract_impl(&child, source, file_path, deps, chunks);
+    if NAMED_DECLARATION_TYPES.contains(&node.kind()) {
+        if let Some(chunk) = declaration_chunk(node, source, file_path, deps) {
+            chunks.push(chunk);
         }
-        return;
     }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        extract_impl(&child, source, file_path, deps, chunks);
+    }
+}
 
-    let mut class_name: Option<String> = None;
-    let mut interface_name: Option<String> = None;
-    let mut method_name: Option<String> = None;
-    let mut parameters: Vec<Parameter> = Vec::new();
-    let mut return_type: Option<String> = None;
-    let mut properties: Vec<Parameter> = Vec::new();
-    let mut chunk_code = node_text(&node, source);
+/// Chunk for one named declaration. Methods inside interfaces return `None`
+/// (parity with Python).
+fn declaration_chunk<'a>(
+    node: &Node<'a>,
+    source: &[u8],
+    file_path: &str,
+    deps: &[String],
+) -> Option<CodeChunk> {
+    let mut fields = CSharpFields::default();
+    let mut chunk_code = node_text(node, source);
+    let name = field_text(node, "name", source);
 
     match node.kind() {
         "method_declaration" => {
-            if let Some(n) = node.child_by_field_name("name") {
-                method_name = Some(node_text(&n, source));
-            }
-            if let Some(t) = node.child_by_field_name("type") {
-                return_type = Some(node_text(&t, source));
-            }
-            if let Some(pl) = node.child_by_field_name("parameters") {
-                let mut cursor = pl.walk();
-                for pn in pl.children(&mut cursor) {
-                    if pn.kind() == "parameter" {
-                        let name = pn.child_by_field_name("name").map(|n| node_text(&n, source));
-                        let ty = pn.child_by_field_name("type").map(|n| node_text(&n, source));
-                        if let (Some(n), Some(t)) = (name, ty) {
-                            parameters.push(Parameter::new(n, t));
-                        }
-                    }
-                }
-            }
+            fields.function_name = name;
+            fields.return_type = field_text(node, "type", source);
+            fields.parameters = parameter_list(node.child_by_field_name("parameters"), source);
             let mut current = node.parent();
             while let Some(parent) = current {
-                if matches!(parent.kind(), "class_declaration" | "struct_declaration" | "record_declaration") {
-                    if let Some(cn) = parent.child_by_field_name("name") {
-                        class_name = Some(node_text(&cn, source));
-                    }
+                if matches!(
+                    parent.kind(),
+                    "class_declaration" | "struct_declaration" | "record_declaration"
+                ) {
+                    fields.class_name = field_text(&parent, "name", source);
                     break;
                 }
                 if parent.kind() == "interface_declaration" {
-                    if let Some(in_) = parent.child_by_field_name("name") {
-                        interface_name = Some(node_text(&in_, source));
-                    }
+                    fields.interface_name = field_text(&parent, "name", source);
                     break;
                 }
                 current = parent.parent();
             }
         }
-        "interface_declaration" => {
-            if let Some(n) = node.child_by_field_name("name") {
-                interface_name = Some(node_text(&n, source));
-            }
-        }
+        "interface_declaration" => fields.interface_name = name,
         "class_declaration" => {
-            if let Some(n) = node.child_by_field_name("name") {
-                class_name = Some(node_text(&n, source));
-            }
-            let full = node_text(&node, source);
+            fields.class_name = name;
+            let full = node_text(node, source);
             let header = match full.find('{') {
                 Some(i) => full[..i].trim().to_string(),
                 None => full.trim().to_string(),
             };
-            let body_node = {
-                let mut cursor = node.walk();
-                let found = node
-                    .children(&mut cursor)
-                    .find(|c| c.kind() == "declaration_list");
-                found
-            };
-            let prop_parent = body_node.as_ref().unwrap_or(node);
+            let body = find_child_of_kind(node, "declaration_list");
+            let declarations = property_declarations(body.as_ref().unwrap_or(node));
+            fields.properties = typed_properties(&declarations, source);
             let mut property_codes: Vec<String> = Vec::new();
-            let mut cursor = prop_parent.walk();
-            for child in prop_parent.children(&mut cursor) {
-                if child.kind() == "property_declaration" {
-                    if let (Some(n), Some(t)) = (
-                        child.child_by_field_name("name"),
-                        child.child_by_field_name("type"),
-                    ) {
-                        properties.push(Parameter::new(node_text(&n, source), node_text(&t, source)));
-                    }
-                    let pc = node_text(&child, source);
-                    property_codes.push(pc);
-                }
+            for declaration in &declarations {
+                property_codes.push(node_text(declaration, source));
             }
             chunk_code = format!("{header}\n{}", property_codes.join("\n"));
         }
-        "struct_declaration" => {
-            if let Some(n) = node.child_by_field_name("name") {
-                class_name = Some(node_text(&n, source));
-            }
-        }
         "record_declaration" => {
-            if let Some(n) = node.child_by_field_name("name") {
-                class_name = Some(node_text(&n, source));
-            }
+            fields.class_name = name;
             // Positional record: parameter_list is a direct child.
-            let mut cursor = node.walk();
-            let param_list = {
-                let found = node
-                    .children(&mut cursor)
-                    .find(|c| c.kind() == "parameter_list");
-                found
-            };
-            if let Some(pl) = param_list {
-                let mut cur2 = pl.walk();
-                for pn in pl.children(&mut cur2) {
-                    if pn.kind() == "parameter" {
-                        let name = pn.child_by_field_name("name").map(|n| node_text(&n, source));
-                        let ty = pn.child_by_field_name("type").map(|n| node_text(&n, source));
-                        if let (Some(n), Some(t)) = (name, ty) {
-                            properties.push(Parameter::new(n, t));
-                        }
-                    }
-                }
-            } else {
-                let body = {
-                    let found = node
-                        .children(&mut cursor)
-                        .find(|c| c.kind() == "declaration_list");
-                    found
-                };
-                if let Some(body) = body {
-                    let mut cur2 = body.walk();
-                    for child in body.children(&mut cur2) {
-                        if child.kind() == "property_declaration" {
-                            if let (Some(n), Some(t)) = (
-                                child.child_by_field_name("name"),
-                                child.child_by_field_name("type"),
-                            ) {
-                                properties.push(Parameter::new(node_text(&n, source), node_text(&t, source)));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        "enum_declaration" => {
-            if let Some(n) = node.child_by_field_name("name") {
-                class_name = Some(node_text(&n, source));
+            if let Some(pl) = find_child_of_kind(node, "parameter_list") {
+                fields.properties = parameter_list(Some(pl), source);
+            } else if let Some(body) = find_child_of_kind(node, "declaration_list") {
+                fields.properties = typed_properties(&property_declarations(&body), source);
             }
         }
         "delegate_declaration" => {
-            if let Some(n) = node.child_by_field_name("name") {
-                class_name = Some(node_text(&n, source));
-            }
-            if let Some(t) = node.child_by_field_name("type") {
-                return_type = Some(node_text(&t, source));
-            }
-            if let Some(pl) = node.child_by_field_name("parameters") {
-                let mut cursor = pl.walk();
-                for pn in pl.children(&mut cursor) {
-                    if pn.kind() == "parameter" {
-                        let name = pn.child_by_field_name("name").map(|n| node_text(&n, source));
-                        let ty = pn.child_by_field_name("type").map(|n| node_text(&n, source));
-                        if let (Some(n), Some(t)) = (name, ty) {
-                            parameters.push(Parameter::new(n, t));
-                        }
-                    }
-                }
-            }
+            fields.class_name = name;
+            fields.return_type = field_text(node, "type", source);
+            fields.parameters = parameter_list(node.child_by_field_name("parameters"), source);
         }
-        _ => {}
+        _ => fields.class_name = name,
     }
 
-    // Functions inside interfaces are not added (parity with Python).
-    if interface_name.is_some() && method_name.is_some() {
-        // continue descending into children
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            extract_impl(&child, source, file_path, deps, chunks);
-        }
-        return;
+    if fields.interface_name.is_some() && fields.function_name.is_some() {
+        return None;
     }
-
-    let identifier = class_name
+    let identifier = fields
+        .class_name
         .clone()
-        .or(interface_name.clone())
-        .or(method_name.clone())
-        .unwrap_or("Unknown".to_string());
-    let chunk_id = generate_chunk_id(file_path, &identifier);
-    let chunk = CodeChunk {
-        id: chunk_id,
-        repo_name: String::new(),
-        file_name: Path::new(file_path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(file_path)
-            .to_string(),
-        code: chunk_code,
-        r#type: node.kind().to_string(),
-        dependencies: deps.to_vec(),
-        created_at: crate::services::ingestion::types::now_iso(),
-        kind: CodeChunkKind::CSharp(CSharpFields {
-            class_name,
-            interface_name,
-            function_name: method_name,
-            parameters,
-            return_type,
-            properties,
-        }),
-    };
-    chunks.push(chunk);
+        .or_else(|| fields.interface_name.clone())
+        .or_else(|| fields.function_name.clone())
+        .unwrap_or_else(|| "Unknown".to_string());
+    Some(new_chunk(
+        file_path,
+        &identifier,
+        chunk_code,
+        node.kind(),
+        deps,
+        CodeChunkKind::CSharp(fields),
+    ))
+}
 
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        extract_impl(&child, source, file_path, deps, chunks);
+/// `parameter` children of a parameter list that have both a name and a type.
+fn parameter_list<'a>(list: Option<Node<'a>>, source: &[u8]) -> Vec<Parameter> {
+    let mut parameters = Vec::new();
+    let Some(list) = list else {
+        return parameters;
+    };
+    let mut cursor = list.walk();
+    for pn in list.children(&mut cursor) {
+        if pn.kind() == "parameter" {
+            if let (Some(n), Some(t)) = (
+                field_text(&pn, "name", source),
+                field_text(&pn, "type", source),
+            ) {
+                parameters.push(Parameter::new(n, t));
+            }
+        }
     }
+    parameters
+}
+
+fn property_declarations<'a>(parent: &Node<'a>) -> Vec<Node<'a>> {
+    let mut declarations = Vec::new();
+    let mut cursor = parent.walk();
+    for child in parent.children(&mut cursor) {
+        if child.kind() == "property_declaration" {
+            declarations.push(child);
+        }
+    }
+    declarations
+}
+
+/// Properties of `declarations` that have both a name and a type.
+fn typed_properties<'a>(declarations: &[Node<'a>], source: &[u8]) -> Vec<Parameter> {
+    let mut properties = Vec::new();
+    for declaration in declarations {
+        if let (Some(n), Some(t)) = (
+            field_text(declaration, "name", source),
+            field_text(declaration, "type", source),
+        ) {
+            properties.push(Parameter::new(n, t));
+        }
+    }
+    properties
 }

@@ -56,11 +56,6 @@ pub fn format_param_types(params: &[Parameter]) -> String {
         .join(", ")
 }
 
-/// Format property list as `"<type> <name>, <type> <name>"`.
-pub fn format_props_typed(props: &[Parameter]) -> String {
-    format_params_typed(props)
-}
-
 /// Format property list as `"<name>: <type>, <name>: <type>"`. Used by the
 /// Python chunker's metadata output.
 pub fn format_props_python(props: &[Parameter]) -> String {
@@ -109,14 +104,21 @@ pub struct CFields {
     pub namespace: Option<String>,
 }
 
+/// Fields shared by the C++, Java, and Rust chunkers: a function inside an
+/// optional class (C++ class, Java type, Rust `impl`/trait) and namespace
+/// (C++ namespace, Java package, Rust `mod`).
 #[derive(Debug, Clone, PartialEq, Default)]
-pub struct CppFields {
+pub struct MemberFields {
     pub function_name: Option<String>,
     pub class_name: Option<String>,
     pub parameters: Vec<Parameter>,
     pub return_type: Option<String>,
     pub namespace: Option<String>,
 }
+
+pub type CppFields = MemberFields;
+pub type JavaFields = MemberFields;
+pub type RustFields = MemberFields;
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct CSharpFields {
@@ -126,15 +128,6 @@ pub struct CSharpFields {
     pub parameters: Vec<Parameter>,
     pub return_type: Option<String>,
     pub properties: Vec<Parameter>,
-}
-
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct JavaFields {
-    pub function_name: Option<String>,
-    pub class_name: Option<String>,
-    pub parameters: Vec<Parameter>,
-    pub return_type: Option<String>,
-    pub namespace: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -148,16 +141,7 @@ pub struct JavaScriptFields {
     pub is_generator: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct TypeScriptFields {
-    pub function_name: Option<String>,
-    pub class_name: Option<String>,
-    pub parameters: Vec<Parameter>,
-    pub return_type: Option<String>,
-    pub is_method: bool,
-    pub is_async: bool,
-    pub is_generator: bool,
-}
+pub type TypeScriptFields = JavaScriptFields;
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ReactFields {
@@ -168,15 +152,6 @@ pub struct ReactFields {
     pub is_exported: bool,
     pub component_type: Option<String>,
     pub parent_component: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct RustFields {
-    pub function_name: Option<String>,
-    pub class_name: Option<String>,
-    pub parameters: Vec<Parameter>,
-    pub return_type: Option<String>,
-    pub namespace: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -263,13 +238,12 @@ impl CodeChunk {
         match &self.kind {
             CodeChunkKind::Generic => Map::new(),
             CodeChunkKind::C(f) => c_metadata(f),
-            CodeChunkKind::Cpp(f) => cpp_metadata(f),
+            CodeChunkKind::Cpp(f) | CodeChunkKind::Java(f) | CodeChunkKind::Rust(f) => {
+                member_metadata(f)
+            }
             CodeChunkKind::CSharp(f) => csharp_metadata(f),
-            CodeChunkKind::Java(f) => java_metadata(f),
-            CodeChunkKind::JavaScript(f) => js_metadata(f),
-            CodeChunkKind::TypeScript(f) => ts_metadata(f),
+            CodeChunkKind::JavaScript(f) | CodeChunkKind::TypeScript(f) => js_metadata(f),
             CodeChunkKind::React(f) => react_metadata(f),
-            CodeChunkKind::Rust(f) => rust_metadata(f),
             CodeChunkKind::Python(f) => python_metadata(f),
             CodeChunkKind::Sql(f) => sql_metadata(f),
         }
@@ -281,13 +255,12 @@ impl CodeChunk {
         match &self.kind {
             CodeChunkKind::Generic => Vec::new(),
             CodeChunkKind::C(f) => c_embedding_parts(f),
-            CodeChunkKind::Cpp(f) => cpp_embedding_parts(f),
+            CodeChunkKind::Cpp(f) | CodeChunkKind::Java(f) | CodeChunkKind::Rust(f) => {
+                member_embedding_parts(f)
+            }
             CodeChunkKind::CSharp(f) => csharp_embedding_parts(f),
-            CodeChunkKind::Java(f) => java_embedding_parts(f),
-            CodeChunkKind::JavaScript(f) => js_embedding_parts(f),
-            CodeChunkKind::TypeScript(f) => ts_embedding_parts(f),
+            CodeChunkKind::JavaScript(f) | CodeChunkKind::TypeScript(f) => js_embedding_parts(f),
             CodeChunkKind::React(f) => react_embedding_parts(f),
-            CodeChunkKind::Rust(f) => rust_embedding_parts(f),
             CodeChunkKind::Python(f) => python_embedding_parts(f),
             CodeChunkKind::Sql(f) => sql_embedding_parts(f),
         }
@@ -306,15 +279,75 @@ impl CodeChunk {
             Value::String(self.dependencies.join(", ")),
         );
         map.insert("created_at".into(), Value::String(self.created_at.clone()));
+        if let Some(symbol) = self.symbol() {
+            map.insert("symbol".into(), Value::String(symbol));
+        }
+        if let Some(qualified) = self.qualified_symbol() {
+            map.insert("qualified_symbol".into(), Value::String(qualified));
+        }
         for (k, v) in self.kind_metadata() {
             map.insert(k, v);
         }
         map
     }
 
-    /// Embedding text built from base + per-language parts. Matches Python
-    /// `CodeChunk.get_chunk_embedding_text`.
-    pub fn chunk_embedding_text(&self) -> String {
+    /// `(container, name)` this chunk defines: the enclosing class/impl type
+    /// (or interface/schema) and the function, component, alias, or object
+    /// name. A type definition has only a container.
+    fn defined_names(&self) -> (Option<&str>, Option<&str>) {
+        match &self.kind {
+            CodeChunkKind::Generic => (None, None),
+            CodeChunkKind::C(f) => (None, f.function_name.as_deref()),
+            CodeChunkKind::Cpp(f) | CodeChunkKind::Java(f) | CodeChunkKind::Rust(f) => {
+                (f.class_name.as_deref(), f.function_name.as_deref())
+            }
+            CodeChunkKind::CSharp(f) => (
+                f.class_name.as_deref().or(f.interface_name.as_deref()),
+                f.function_name.as_deref(),
+            ),
+            CodeChunkKind::JavaScript(f) | CodeChunkKind::TypeScript(f) => {
+                (f.class_name.as_deref(), f.function_name.as_deref())
+            }
+            CodeChunkKind::React(f) => (None, f.component_name.as_deref()),
+            CodeChunkKind::Python(f) => (
+                f.class_name.as_deref(),
+                f.function_name.as_deref().or(f.alias_name.as_deref()),
+            ),
+            CodeChunkKind::Sql(f) => (f.schema_name.as_deref(), f.object_name.as_deref()),
+        }
+    }
+
+    /// Name this chunk defines (`run_rag_query`, `RagService`), used for
+    /// definition lookups. `None` for generic chunks and file remainders.
+    pub fn symbol(&self) -> Option<String> {
+        let (container, name) = self.defined_names();
+        name.or(container)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    }
+
+    /// `Container::name` (Rust, C++) or `Container.name` (other languages)
+    /// when the chunk is a member of a type; otherwise `None`.
+    pub fn qualified_symbol(&self) -> Option<String> {
+        let (container, name) = self.defined_names();
+        let (Some(container), Some(name)) = (container, name) else {
+            return None;
+        };
+        if container.is_empty() || name.is_empty() {
+            return None;
+        }
+        let separator = match &self.kind {
+            CodeChunkKind::Rust(_) | CodeChunkKind::Cpp(_) => "::",
+            _ => ".",
+        };
+        Some(format!("{container}{separator}{name}"))
+    }
+
+    /// Structural header for the embedding text: repo, file, and the
+    /// language-specific identity (class, function, parameters, return type,
+    /// ...). Capped at [`MAX_CODE_HEADER_CHARS`] so a huge parameter or
+    /// property list cannot crowd the code out of the model's 512-token window.
+    pub fn embedding_header(&self) -> String {
         let mut parts: Vec<String> = Vec::new();
         parts.push(format!("Repo Name: {}", self.repo_name));
         parts.push(format!("File Name: {}", self.file_name));
@@ -323,12 +356,30 @@ impl CodeChunk {
                 parts.push(p);
             }
         }
-        parts.push(format!("Code:\n{}", self.code));
-        if !self.dependencies.is_empty() {
-            parts.push(format!("Dependencies: {}", self.dependencies.join(", ")));
-        }
-        parts.into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("\n")
+        truncate_chars(&parts.join("\n"), MAX_CODE_HEADER_CHARS)
     }
+
+    /// Text sent to the dense embedder: [`Self::embedding_header`] followed by
+    /// the code. File-level dependencies are deliberately left out: they are
+    /// identical for every chunk of a file, so they would pull all of a file's
+    /// vectors together and spend tokens without helping retrieval. They stay
+    /// available in the payload metadata.
+    pub fn chunk_embedding_text(&self) -> String {
+        format!("{}\nCode:\n{}", self.embedding_header(), self.code)
+    }
+}
+
+/// Upper bound on the code embedding header, in characters (roughly 100-130
+/// tokens for identifier-heavy text).
+pub const MAX_CODE_HEADER_CHARS: usize = 400;
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max_chars).collect();
+    out.push('…');
+    out
 }
 
 // --- metadata helpers -------------------------------------------------------
@@ -337,27 +388,35 @@ fn str_or_empty(s: &Option<String>) -> Value {
     Value::String(s.clone().unwrap_or_default())
 }
 
-fn c_metadata(f: &CFields) -> Map<String, Value> {
-    let mut m = Map::new();
-    m.insert("function_name".into(), str_or_empty(&f.function_name));
+fn bool_value(b: bool) -> Value {
+    Value::String(b.to_string())
+}
+
+fn insert_function_metadata(
+    m: &mut Map<String, Value>,
+    function_name: &Option<String>,
+    parameters: &[Parameter],
+    return_type: &Option<String>,
+) {
+    m.insert("function_name".into(), str_or_empty(function_name));
     m.insert(
         "parameters".into(),
-        Value::String(format_params_typed(&f.parameters)),
+        Value::String(format_params_typed(parameters)),
     );
-    m.insert("return_type".into(), str_or_empty(&f.return_type));
+    m.insert("return_type".into(), str_or_empty(return_type));
+}
+
+fn c_metadata(f: &CFields) -> Map<String, Value> {
+    let mut m = Map::new();
+    insert_function_metadata(&mut m, &f.function_name, &f.parameters, &f.return_type);
     m.insert("namespace".into(), str_or_empty(&f.namespace));
     m
 }
 
-fn cpp_metadata(f: &CppFields) -> Map<String, Value> {
+fn member_metadata(f: &MemberFields) -> Map<String, Value> {
     let mut m = Map::new();
     m.insert("class_name".into(), str_or_empty(&f.class_name));
-    m.insert("function_name".into(), str_or_empty(&f.function_name));
-    m.insert(
-        "parameters".into(),
-        Value::String(format_params_typed(&f.parameters)),
-    );
-    m.insert("return_type".into(), str_or_empty(&f.return_type));
+    insert_function_metadata(&mut m, &f.function_name, &f.parameters, &f.return_type);
     m.insert("namespace".into(), str_or_empty(&f.namespace));
     m
 }
@@ -366,101 +425,32 @@ fn csharp_metadata(f: &CSharpFields) -> Map<String, Value> {
     let mut m = Map::new();
     m.insert("class_name".into(), str_or_empty(&f.class_name));
     m.insert("interface_name".into(), str_or_empty(&f.interface_name));
-    m.insert("function_name".into(), str_or_empty(&f.function_name));
-    m.insert(
-        "parameters".into(),
-        Value::String(format_params_typed(&f.parameters)),
-    );
-    m.insert("return_type".into(), str_or_empty(&f.return_type));
+    insert_function_metadata(&mut m, &f.function_name, &f.parameters, &f.return_type);
     m.insert(
         "properties".into(),
-        Value::String(format_props_typed(&f.properties)),
+        Value::String(format_params_typed(&f.properties)),
     );
-    m
-}
-
-fn java_metadata(f: &JavaFields) -> Map<String, Value> {
-    let mut m = Map::new();
-    m.insert("class_name".into(), str_or_empty(&f.class_name));
-    m.insert("function_name".into(), str_or_empty(&f.function_name));
-    m.insert(
-        "parameters".into(),
-        Value::String(format_params_typed(&f.parameters)),
-    );
-    m.insert("return_type".into(), str_or_empty(&f.return_type));
-    m.insert("namespace".into(), str_or_empty(&f.namespace));
     m
 }
 
 fn js_metadata(f: &JavaScriptFields) -> Map<String, Value> {
     let mut m = Map::new();
     m.insert("class_name".into(), str_or_empty(&f.class_name));
-    m.insert("function_name".into(), str_or_empty(&f.function_name));
-    m.insert(
-        "parameters".into(),
-        Value::String(format_params_typed(&f.parameters)),
-    );
-    m.insert("return_type".into(), str_or_empty(&f.return_type));
-    m.insert("is_method".into(), Value::String(f.is_method.to_string()));
-    m.insert("is_async".into(), Value::String(f.is_async.to_string()));
-    m.insert(
-        "is_generator".into(),
-        Value::String(f.is_generator.to_string()),
-    );
-    m
-}
-
-fn ts_metadata(f: &TypeScriptFields) -> Map<String, Value> {
-    let mut m = Map::new();
-    m.insert("class_name".into(), str_or_empty(&f.class_name));
-    m.insert("function_name".into(), str_or_empty(&f.function_name));
-    m.insert(
-        "parameters".into(),
-        Value::String(format_params_typed(&f.parameters)),
-    );
-    m.insert("return_type".into(), str_or_empty(&f.return_type));
-    m.insert("is_method".into(), Value::String(f.is_method.to_string()));
-    m.insert("is_async".into(), Value::String(f.is_async.to_string()));
-    m.insert(
-        "is_generator".into(),
-        Value::String(f.is_generator.to_string()),
-    );
+    insert_function_metadata(&mut m, &f.function_name, &f.parameters, &f.return_type);
+    m.insert("is_method".into(), bool_value(f.is_method));
+    m.insert("is_async".into(), bool_value(f.is_async));
+    m.insert("is_generator".into(), bool_value(f.is_generator));
     m
 }
 
 fn react_metadata(f: &ReactFields) -> Map<String, Value> {
     let mut m = Map::new();
     m.insert("component_name".into(), str_or_empty(&f.component_name));
-    m.insert(
-        "is_functional".into(),
-        Value::String(f.is_functional.to_string()),
-    );
-    m.insert(
-        "hooks_used".into(),
-        Value::String(f.hooks_used.join(", ")),
-    );
-    m.insert(
-        "props".into(),
-        Value::String(format_params_typed(&f.props)),
-    );
+    m.insert("is_functional".into(), bool_value(f.is_functional));
+    m.insert("hooks_used".into(), Value::String(f.hooks_used.join(", ")));
+    m.insert("props".into(), Value::String(format_params_typed(&f.props)));
     m.insert("component_type".into(), str_or_empty(&f.component_type));
-    m.insert(
-        "parent_component".into(),
-        str_or_empty(&f.parent_component),
-    );
-    m
-}
-
-fn rust_metadata(f: &RustFields) -> Map<String, Value> {
-    let mut m = Map::new();
-    m.insert("class_name".into(), str_or_empty(&f.class_name));
-    m.insert("function_name".into(), str_or_empty(&f.function_name));
-    m.insert(
-        "parameters".into(),
-        Value::String(format_params_typed(&f.parameters)),
-    );
-    m.insert("return_type".into(), str_or_empty(&f.return_type));
-    m.insert("namespace".into(), str_or_empty(&f.namespace));
+    m.insert("parent_component".into(), str_or_empty(&f.parent_component));
     m
 }
 
@@ -482,16 +472,10 @@ fn python_metadata(f: &PythonFields) -> Map<String, Value> {
     m.insert("decorators".into(), Value::String(f.decorators.join(", ")));
     m.insert("type_parameters".into(), str_or_empty(&f.type_parameters));
     m.insert("bases".into(), str_or_empty(&f.bases));
-    m.insert("is_method".into(), Value::String(f.is_method.to_string()));
-    m.insert("is_async".into(), Value::String(f.is_async.to_string()));
-    m.insert(
-        "is_generator".into(),
-        Value::String(f.is_generator.to_string()),
-    );
-    m.insert(
-        "is_type_alias".into(),
-        Value::String(f.is_type_alias.to_string()),
-    );
+    m.insert("is_method".into(), bool_value(f.is_method));
+    m.insert("is_async".into(), bool_value(f.is_async));
+    m.insert("is_generator".into(), bool_value(f.is_generator));
+    m.insert("is_type_alias".into(), bool_value(f.is_type_alias));
     m
 }
 
@@ -506,216 +490,117 @@ fn sql_metadata(f: &SqlFields) -> Map<String, Value> {
 
 // --- embedding-parts helpers ------------------------------------------------
 
+fn push_opt(v: &mut Vec<String>, label: &str, value: &Option<String>) {
+    if let Some(value) = value {
+        v.push(format!("{label}: {value}"));
+    }
+}
+
+fn push_flag(v: &mut Vec<String>, label: &str, flag: bool) {
+    if flag {
+        v.push(format!("{label}: True"));
+    }
+}
+
+fn push_function_parts(
+    v: &mut Vec<String>,
+    function_name: &Option<String>,
+    parameters: &[Parameter],
+    return_type: &Option<String>,
+) {
+    push_opt(v, "Function", function_name);
+    if !parameters.is_empty() {
+        v.push(format!("Parameters: {}", format_params_typed(parameters)));
+    }
+    push_opt(v, "Return Type", return_type);
+}
+
 fn c_embedding_parts(f: &CFields) -> Vec<String> {
     let mut v = Vec::new();
-    if let Some(ns) = &f.namespace {
-        v.push(format!("Namespace: {ns}"));
-    }
-    if let Some(fn_) = &f.function_name {
-        v.push(format!("Function: {fn_}"));
-    }
-    if !f.parameters.is_empty() {
-        v.push(format!("Parameters: {}", format_params_typed(&f.parameters)));
-    }
-    if let Some(rt) = &f.return_type {
-        v.push(format!("Return Type: {rt}"));
-    }
+    push_opt(&mut v, "Namespace", &f.namespace);
+    push_function_parts(&mut v, &f.function_name, &f.parameters, &f.return_type);
     v
 }
 
-fn cpp_embedding_parts(f: &CppFields) -> Vec<String> {
+fn member_embedding_parts(f: &MemberFields) -> Vec<String> {
     let mut v = Vec::new();
-    if let Some(ns) = &f.namespace {
-        v.push(format!("Namespace: {ns}"));
-    }
-    if let Some(c) = &f.class_name {
-        v.push(format!("Class: {c}"));
-    }
-    if let Some(fn_) = &f.function_name {
-        v.push(format!("Function: {fn_}"));
-    }
-    if !f.parameters.is_empty() {
-        v.push(format!("Parameters: {}", format_params_typed(&f.parameters)));
-    }
-    if let Some(rt) = &f.return_type {
-        v.push(format!("Return Type: {rt}"));
-    }
+    push_opt(&mut v, "Namespace", &f.namespace);
+    push_opt(&mut v, "Class", &f.class_name);
+    push_function_parts(&mut v, &f.function_name, &f.parameters, &f.return_type);
     v
 }
 
 fn csharp_embedding_parts(f: &CSharpFields) -> Vec<String> {
     let mut v = Vec::new();
-    if let Some(c) = &f.class_name {
-        v.push(format!("Class: {c}"));
-    }
-    if let Some(i) = &f.interface_name {
-        v.push(format!("Interface: {i}"));
-    }
-    if let Some(fn_) = &f.function_name {
-        v.push(format!("Function: {fn_}"));
-    }
-    if !f.parameters.is_empty() {
-        v.push(format!("Parameters: {}", format_params_typed(&f.parameters)));
-    }
-    if let Some(rt) = &f.return_type {
-        v.push(format!("Return Type: {rt}"));
-    }
+    push_opt(&mut v, "Class", &f.class_name);
+    push_opt(&mut v, "Interface", &f.interface_name);
+    push_function_parts(&mut v, &f.function_name, &f.parameters, &f.return_type);
     if !f.properties.is_empty() {
-        v.push(format!("Properties: {}", format_props_typed(&f.properties)));
-    }
-    v
-}
-
-fn java_embedding_parts(f: &JavaFields) -> Vec<String> {
-    let mut v = Vec::new();
-    if let Some(ns) = &f.namespace {
-        v.push(format!("Namespace: {ns}"));
-    }
-    if let Some(c) = &f.class_name {
-        v.push(format!("Class: {c}"));
-    }
-    if let Some(fn_) = &f.function_name {
-        v.push(format!("Function: {fn_}"));
-    }
-    if !f.parameters.is_empty() {
-        v.push(format!("Parameters: {}", format_params_typed(&f.parameters)));
-    }
-    if let Some(rt) = &f.return_type {
-        v.push(format!("Return Type: {rt}"));
+        v.push(format!(
+            "Properties: {}",
+            format_params_typed(&f.properties)
+        ));
     }
     v
 }
 
 fn js_embedding_parts(f: &JavaScriptFields) -> Vec<String> {
     let mut v = Vec::new();
-    if let Some(c) = &f.class_name {
-        v.push(format!("Class: {c}"));
-    }
-    if let Some(fn_) = &f.function_name {
-        v.push(format!("Function: {fn_}"));
-    }
-    if !f.parameters.is_empty() {
-        v.push(format!("Parameters: {}", format_params_typed(&f.parameters)));
-    }
-    if let Some(rt) = &f.return_type {
-        v.push(format!("Return Type: {rt}"));
-    }
-    v.push(format!("Method: {}", f.is_method));
-    v.push(format!("Async: {}", f.is_async));
-    v.push(format!("Generator: {}", f.is_generator));
+    push_opt(&mut v, "Class", &f.class_name);
+    push_function_parts(&mut v, &f.function_name, &f.parameters, &f.return_type);
+    push_flag(&mut v, "Method", f.is_method);
+    push_flag(&mut v, "Async", f.is_async);
+    push_flag(&mut v, "Generator", f.is_generator);
     v
-}
-
-fn ts_embedding_parts(f: &TypeScriptFields) -> Vec<String> {
-    js_embedding_parts(&JavaScriptFields {
-        function_name: f.function_name.clone(),
-        class_name: f.class_name.clone(),
-        parameters: f.parameters.clone(),
-        return_type: f.return_type.clone(),
-        is_method: f.is_method,
-        is_async: f.is_async,
-        is_generator: f.is_generator,
-    })
 }
 
 fn react_embedding_parts(f: &ReactFields) -> Vec<String> {
     let mut v = Vec::new();
-    if let Some(c) = &f.component_name {
-        v.push(format!("Component: {c}"));
-    }
+    push_opt(&mut v, "Component", &f.component_name);
     if !f.hooks_used.is_empty() {
         v.push(format!("Hooks: {}", f.hooks_used.join(", ")));
     }
     if !f.props.is_empty() {
         v.push(format!("Props: {}", format_params_typed(&f.props)));
     }
-    if let Some(p) = &f.parent_component {
-        v.push(format!("Parent Component: {p}"));
-    }
-    v
-}
-
-fn rust_embedding_parts(f: &RustFields) -> Vec<String> {
-    let mut v = Vec::new();
-    if let Some(ns) = &f.namespace {
-        v.push(format!("Namespace: {ns}"));
-    }
-    if let Some(c) = &f.class_name {
-        v.push(format!("Class: {c}"));
-    }
-    if let Some(fn_) = &f.function_name {
-        v.push(format!("Function: {fn_}"));
-    }
-    if !f.parameters.is_empty() {
-        v.push(format!("Parameters: {}", format_params_typed(&f.parameters)));
-    }
-    if let Some(rt) = &f.return_type {
-        v.push(format!("Return Type: {rt}"));
-    }
+    push_opt(&mut v, "Parent Component", &f.parent_component);
     v
 }
 
 fn python_embedding_parts(f: &PythonFields) -> Vec<String> {
     let mut v = Vec::new();
-    if let Some(c) = &f.class_name {
-        v.push(format!("Class: {c}"));
-    }
-    if let Some(fn_) = &f.function_name {
-        v.push(format!("Function: {fn_}"));
-    }
-    if let Some(a) = &f.alias_name {
-        v.push(format!("Type Alias: {a}"));
-    }
-    if let Some(a) = &f.alias_target {
-        v.push(format!("Alias Target: {a}"));
-    }
+    push_opt(&mut v, "Class", &f.class_name);
+    push_opt(&mut v, "Function", &f.function_name);
+    push_opt(&mut v, "Type Alias", &f.alias_name);
+    push_opt(&mut v, "Alias Target", &f.alias_target);
     if !f.parameters.is_empty() {
         v.push(format!("Parameters: {}", format_param_types(&f.parameters)));
     }
-    if let Some(rt) = &f.return_type {
-        v.push(format!("Return Type: {rt}"));
-    }
+    push_opt(&mut v, "Return Type", &f.return_type);
     if !f.properties.is_empty() {
-        v.push(format!("Properties: {}", format_props_python(&f.properties)));
+        v.push(format!(
+            "Properties: {}",
+            format_props_python(&f.properties)
+        ));
     }
     if !f.decorators.is_empty() {
         v.push(format!("Decorators: {}", f.decorators.join(", ")));
     }
-    if let Some(tp) = &f.type_parameters {
-        v.push(format!("Type Parameters: {tp}"));
-    }
-    if let Some(b) = &f.bases {
-        v.push(format!("Bases: {b}"));
-    }
-    if f.is_method {
-        v.push("Method: True".into());
-    }
-    if f.is_async {
-        v.push("Async: True".into());
-    }
-    if f.is_generator {
-        v.push("Generator: True".into());
-    }
-    if f.is_type_alias {
-        v.push("Type Alias: True".into());
-    }
+    push_opt(&mut v, "Type Parameters", &f.type_parameters);
+    push_opt(&mut v, "Bases", &f.bases);
+    push_flag(&mut v, "Method", f.is_method);
+    push_flag(&mut v, "Async", f.is_async);
+    push_flag(&mut v, "Generator", f.is_generator);
+    push_flag(&mut v, "Type Alias", f.is_type_alias);
     v
 }
 
 fn sql_embedding_parts(f: &SqlFields) -> Vec<String> {
     let mut v = Vec::new();
-    if let Some(d) = &f.database_name {
-        v.push(format!("Database: {d}"));
-    }
-    if let Some(s) = &f.statement_type {
-        v.push(format!("Statement: {s}"));
-    }
-    if let Some(s) = &f.schema_name {
-        v.push(format!("Schema: {s}"));
-    }
-    if let Some(o) = &f.object_name {
-        v.push(format!("Object: {o}"));
-    }
+    push_opt(&mut v, "Database", &f.database_name);
+    push_opt(&mut v, "Statement", &f.statement_type);
+    push_opt(&mut v, "Schema", &f.schema_name);
+    push_opt(&mut v, "Object", &f.object_name);
     v
 }
 
@@ -733,6 +618,9 @@ pub struct DocumentChunk {
     pub page: Option<i64>,
     pub metadata: Map<String, Value>,
     pub created_at: String,
+    /// Set for code chunks: the [`CodeChunk::embedding_header`] that replaces
+    /// the generic file/type header in [`Self::chunk_embedding_text`].
+    pub code_header: Option<String>,
 }
 
 impl DocumentChunk {
@@ -752,6 +640,7 @@ impl DocumentChunk {
             page: None,
             metadata: Map::new(),
             created_at: now_iso(),
+            code_header: None,
         }
     }
 
@@ -761,10 +650,7 @@ impl DocumentChunk {
         let mut m = Map::new();
         m.insert("file_name".into(), Value::String(self.file_name.clone()));
         m.insert("doc_type".into(), Value::String(self.doc_type.clone()));
-        m.insert(
-            "chunk_index".into(),
-            Value::Number(self.chunk_index.into()),
-        );
+        m.insert("chunk_index".into(), Value::Number(self.chunk_index.into()));
         m.insert("content".into(), Value::String(self.content.clone()));
         m.insert("created_at".into(), Value::String(self.created_at.clone()));
         if let Some(p) = self.page {
@@ -776,8 +662,12 @@ impl DocumentChunk {
         m
     }
 
-    /// Embedding text. Matches Python `DocumentChunk.get_chunk_embedding_text`.
+    /// Text sent to the dense embedder. Code chunks use their structural
+    /// header; everything else gets file name, type, and page.
     pub fn chunk_embedding_text(&self) -> String {
+        if let Some(header) = &self.code_header {
+            return format!("{header}\nCode:\n{}", self.content);
+        }
         let mut parts: Vec<String> = Vec::new();
         parts.push(format!("File_name: {}", self.file_name));
         parts.push(format!("Type: {}", self.doc_type));
@@ -992,7 +882,6 @@ mod tests {
             created_at: now_iso(),
             kind: CodeChunkKind::Python(PythonFields {
                 function_name: Some("describe".into()),
-                class_name: None,
                 parameters: vec![
                     Parameter::new("item", "Annotated[str, \"display\"]"),
                     Parameter::new("/", "/"),
@@ -1000,15 +889,7 @@ mod tests {
                 ],
                 return_type: Some("dict[str, object]".into()),
                 decorators: vec!["@traced(\"sync\")".into()],
-                is_method: false,
-                is_async: false,
-                is_generator: false,
-                is_type_alias: false,
-                properties: Vec::new(),
-                alias_name: None,
-                alias_target: None,
-                type_parameters: None,
-                bases: None,
+                ..Default::default()
             }),
         };
         let m = chunk.chunk_metadata();
@@ -1039,19 +920,9 @@ mod tests {
             created_at: now_iso(),
             kind: CodeChunkKind::Python(PythonFields {
                 function_name: Some("describe".into()),
-                class_name: None,
-                parameters: Vec::new(),
                 return_type: Some("dict[str, object]".into()),
                 decorators: vec!["@traced(\"sync\")".into()],
-                is_method: false,
-                is_async: false,
-                is_generator: false,
-                is_type_alias: false,
-                properties: Vec::new(),
-                alias_name: None,
-                alias_target: None,
-                type_parameters: None,
-                bases: None,
+                ..Default::default()
             }),
         };
         let t = chunk.chunk_embedding_text();

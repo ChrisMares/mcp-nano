@@ -13,6 +13,14 @@ pub struct ModelStatusResponse {
 #[derive(Debug, Default, Serialize)]
 pub struct RagResponse {
     pub results: Vec<RagResult>,
+    /// Definitions of functions called by `results`. Only filled (and only
+    /// serialized) for `expand` requests.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub related: Vec<RagResult>,
+    /// Hints about the request, e.g. that a symbol is defined in several
+    /// files and how to qualify it. Only serialized when present.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
     pub total_count: i64,
     pub user_query: String,
 }
@@ -22,7 +30,7 @@ pub struct MetadataValuesResponse {
     pub values: Vec<String>,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Clone, Serialize)]
 pub struct BackendStatusResponse {
     pub qdrant_ready: bool,
     pub qdrant_error: Option<String>,

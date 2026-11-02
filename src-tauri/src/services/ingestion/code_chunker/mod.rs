@@ -3,7 +3,8 @@
 //!
 //! Each language lives in its own submodule (`c.rs`, `cpp.rs`, ...) and
 //! exposes `extract_dependencies(root, src) -> Vec<String>` plus
-//! `extract_chunks(root, src, file_path, deps) -> Vec<CodeChunk>` names.
+//! `extract_chunks(root, src, file_path, deps) -> Vec<CodeChunk>` names
+//! (Java also takes its package, SQL its `USE` database).
 //! The [`Language`] enum + `match` in [`extract_for`] maps a file extension
 //! to its chunker pair.
 //!
@@ -17,6 +18,7 @@ use tree_sitter::{Language as TsLanguage, Node, Parser};
 use super::types::{CodeChunk, DocumentChunk};
 
 pub mod c;
+pub mod calls;
 pub mod cpp;
 pub mod csharp;
 pub mod helpers;
@@ -77,12 +79,14 @@ impl Language {
         }
     }
 
+    /// `database_name` is the SQL `USE` database; other languages ignore it.
     pub fn extract_chunks<'a>(
         self,
         root: Node<'a>,
         source: &[u8],
         file_path: &str,
         deps: &[String],
+        database_name: Option<&str>,
     ) -> Vec<CodeChunk> {
         match self {
             Language::C => c::extract_chunks(root, source, file_path, deps),
@@ -100,7 +104,7 @@ impl Language {
             Language::TypeScriptTsx => react::extract_chunks(root, source, file_path, deps),
             Language::Rust => rust_lang::extract_chunks(root, source, file_path, deps),
             Language::Python => python::extract_chunks(root, source, file_path, deps),
-            Language::Sql => sql::extract_chunks(root, source, file_path, deps),
+            Language::Sql => sql::extract_chunks(root, source, file_path, deps, database_name),
         }
     }
 }
@@ -111,7 +115,7 @@ impl Language {
 pub fn language_for_extension(ext: &str) -> Option<Language> {
     Some(match ext {
         "c" | "h" => Language::C,
-        "cpp" | "hpp" | "cc" | "cxx" | "hh" => Language::Cpp,
+        "cpp" | "hpp" | "cc" | "cxx" | "hh" | "hxx" => Language::Cpp,
         "cs" => Language::CSharp,
         "java" => Language::Java,
         "ts" => Language::TypeScript,
@@ -124,13 +128,61 @@ pub fn language_for_extension(ext: &str) -> Option<Language> {
     })
 }
 
+/// Language of `path`, refining the extension mapping for headers: `.H`
+/// (uppercase) is always C++, and a `.h` file is C++ when its source has
+/// C++-only declarations. `source` is the file text when already loaded.
+pub fn language_for_file(path: &Path, source: Option<&str>) -> Option<Language> {
+    let raw_ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    if raw_ext == "H" {
+        return Some(Language::Cpp);
+    }
+    let ext = raw_ext.to_lowercase();
+    let lang = language_for_extension(&ext)?;
+    if ext != "h" {
+        return Some(lang);
+    }
+    let is_cpp = match source {
+        Some(text) => header_is_cpp(text),
+        None => read_file_text(path)
+            .map(|text| header_is_cpp(&text))
+            .unwrap_or(false),
+    };
+    Some(if is_cpp { Language::Cpp } else { Language::C })
+}
+
+/// True when a `.h` header uses C++: a line starting with a class,
+/// namespace, template, or access-specifier declaration, or any `std::`.
+/// C headers wrapped in `extern "C"` for C++ callers do not match.
+fn header_is_cpp(source: &str) -> bool {
+    const LINE_STARTS: [&str; 8] = [
+        "class ",
+        "namespace ",
+        "template<",
+        "template <",
+        "public:",
+        "private:",
+        "protected:",
+        "using namespace ",
+    ];
+    for line in source.lines() {
+        let line = line.trim_start();
+        if line.contains("std::") {
+            return true;
+        }
+        for start in LINE_STARTS {
+            if line.starts_with(start) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// True if the extension has a dedicated tree-sitter chunker.
 pub fn is_code_file(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
-        .map(|e| e.to_lowercase())
-        .map(|e| language_for_extension(&e).is_some())
-        .unwrap_or(false)
+        .is_some_and(|e| language_for_extension(&e.to_lowercase()).is_some())
 }
 
 /// Chunk a single source file. Mirrors `chunk_single_code_file`.
@@ -145,13 +197,7 @@ pub fn chunk_single_code_file(
     splitter: &text_splitter::TextSplitter<tokenizers::Tokenizer>,
     max_chunk_tokens: usize,
 ) -> Vec<CodeChunk> {
-    let ext = file_path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|s| s.to_lowercase())
-        .unwrap_or_default();
-
-    let mut chunks: Vec<CodeChunk> = if let Some(lang) = language_for_extension(&ext) {
+    let mut chunks: Vec<CodeChunk> = if let Some(lang) = language_for_file(file_path, None) {
         chunk_with_language(file_path, lang)
     } else {
         Vec::new()
@@ -185,13 +231,7 @@ fn chunk_with_language(file_path: &Path, lang: Language) -> Vec<CodeChunk> {
 
     let mut database_name: Option<String> = None;
     let mut processed_source = source;
-    if file_path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|s| s.to_lowercase())
-        .map(|s| s == "sql")
-        .unwrap_or(false)
-    {
+    if lang == Language::Sql {
         let (clean, db) = helpers::strip_sql_boilerplate(&processed_source);
         processed_source = helpers::strip_sql_comments(&clean);
         database_name = db;
@@ -200,7 +240,10 @@ fn chunk_with_language(file_path: &Path, lang: Language) -> Vec<CodeChunk> {
     let source_bytes = processed_source.into_bytes();
     let mut parser = Parser::new();
     if let Err(e) = parser.set_language(&lang.tree_sitter_language()) {
-        tracing::error!("tree-sitter parser init failed for {}: {e}", file_path.display());
+        tracing::error!(
+            "tree-sitter parser init failed for {}: {e}",
+            file_path.display()
+        );
         return Vec::new();
     }
     let Some(tree) = parser.parse(&source_bytes, None) else {
@@ -208,17 +251,13 @@ fn chunk_with_language(file_path: &Path, lang: Language) -> Vec<CodeChunk> {
     };
     let root = tree.root_node();
     let deps = lang.extract_dependencies(root, &source_bytes);
-    if lang == Language::Sql {
-        sql::extract_chunks_with_db(
-            root,
-            &source_bytes,
-            file_path.to_str().unwrap_or(""),
-            &deps,
-            database_name.as_deref(),
-        )
-    } else {
-        lang.extract_chunks(root, &source_bytes, file_path.to_str().unwrap_or(""), &deps)
-    }
+    lang.extract_chunks(
+        root,
+        &source_bytes,
+        file_path.to_str().unwrap_or(""),
+        &deps,
+        database_name.as_deref(),
+    )
 }
 
 /// Generic fallback: token-based chunking (mirrors Python `_parse_generic_file`).
@@ -298,30 +337,41 @@ fn decode_utf16(bytes: &[u8], little_endian: bool) -> String {
 
 /// Convert a `CodeChunk` list into `DocumentChunk`s for the uniform
 /// embed+upsert pipeline. The language-specific metadata is folded into the
-/// per-chunk `metadata` map. Used by `IngestionService::ingest_code_file`.
-pub fn code_chunks_to_document_chunks(code_chunks: Vec<CodeChunk>) -> Vec<DocumentChunk> {
-    code_chunks
-        .into_iter()
-        .enumerate()
-        .map(|(chunk_index, cc)| {
-            let metadata = cc.chunk_metadata();
-            let ext = Path::new(&cc.file_name)
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("txt")
-                .to_lowercase();
-            DocumentChunk {
-                id: cc.id,
-                file_name: cc.file_name.clone(),
-                content: cc.code.clone(),
-                doc_type: ext,
-                chunk_index: chunk_index as i64,
-                page: None,
-                metadata,
-                created_at: cc.created_at.clone(),
+/// per-chunk `metadata` map, together with the `calls` made by the chunk's
+/// code, parsed as `lang` (the file's detected language; `None` for files
+/// without a grammar). Used by `IngestionService::ingest_code_file`.
+pub fn code_chunks_to_document_chunks(
+    code_chunks: Vec<CodeChunk>,
+    lang: Option<Language>,
+) -> Vec<DocumentChunk> {
+    let mut out = Vec::with_capacity(code_chunks.len());
+    for (chunk_index, cc) in code_chunks.into_iter().enumerate() {
+        let ext = Path::new(&cc.file_name)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("txt")
+            .to_lowercase();
+        let mut metadata = cc.chunk_metadata();
+        if let Some(lang) = lang {
+            let calls = calls::extract_calls(lang, &cc.code);
+            if !calls.is_empty() {
+                let values = calls.into_iter().map(serde_json::Value::String).collect();
+                metadata.insert("calls".into(), serde_json::Value::Array(values));
             }
-        })
-        .collect()
+        }
+        out.push(DocumentChunk {
+            code_header: Some(cc.embedding_header()),
+            id: cc.id,
+            file_name: cc.file_name,
+            content: cc.code,
+            doc_type: ext,
+            chunk_index: chunk_index as i64,
+            page: None,
+            metadata,
+            created_at: cc.created_at,
+        });
+    }
+    out
 }
 
 /// Chunked + oversized-split path that returns `DocumentChunk`s ready for
@@ -337,8 +387,13 @@ pub fn chunk_file_to_documents(
     // panic becomes a per-file error rather than killing the whole job.
     let path_s = file_path.display().to_string();
     let t0 = std::time::Instant::now();
-    let chunks =
-        chunk_single_code_file(file_path, repo_name, file_name_override, splitter, max_chunk_tokens);
+    let chunks = chunk_single_code_file(
+        file_path,
+        repo_name,
+        file_name_override,
+        splitter,
+        max_chunk_tokens,
+    );
     let parse_ms = t0.elapsed().as_millis();
     let t1 = std::time::Instant::now();
     let split = oversized::split_oversized_code_chunks(chunks, splitter);
@@ -347,7 +402,7 @@ pub fn chunk_file_to_documents(
         "code chunk {path_s}: parse_ms={parse_ms} split_ms={split_ms} chunks={}",
         split.len()
     );
-    code_chunks_to_document_chunks(split)
+    code_chunks_to_document_chunks(split, language_for_file(file_path, None))
 }
 
 #[cfg(test)]
@@ -364,7 +419,9 @@ mod tests {
 
     #[test]
     fn is_code_file_recognizes_supported_extensions() {
-        for ext in &["py", "rs", "ts", "tsx", "c", "h", "cpp", "cs", "java", "sql", "js"] {
+        for ext in &[
+            "py", "rs", "ts", "tsx", "c", "h", "cpp", "cs", "java", "sql", "js",
+        ] {
             assert!(is_code_file(Path::new(&format!("foo.{ext}"))), "{ext}");
         }
         assert!(!is_code_file(Path::new("foo.txt")));
@@ -383,12 +440,40 @@ mod tests {
     }
 
     #[test]
+    fn headers_are_detected_as_cpp_by_content_or_uppercase_extension() {
+        let cpp = "#pragma once\nnamespace BitTorrent {\nclass SessionImpl : public Session\n{\npublic:\n  void run();\n};\n}\n";
+        let c = "#ifdef __cplusplus\nextern \"C\" {\n#endif\nint stbi_info(char const *f, int *x);\n/* the class of images */\n";
+        assert!(header_is_cpp(cpp));
+        assert!(!header_is_cpp(c));
+        assert_eq!(
+            language_for_file(Path::new("a/session.h"), Some(cpp)),
+            Some(Language::Cpp)
+        );
+        assert_eq!(
+            language_for_file(Path::new("stb_image.h"), Some(c)),
+            Some(Language::C)
+        );
+        assert_eq!(
+            language_for_file(Path::new("FL/Fl_Button.H"), Some(c)),
+            Some(Language::Cpp)
+        );
+        assert_eq!(
+            language_for_file(Path::new("x.hxx"), None),
+            Some(Language::Cpp)
+        );
+        assert_eq!(
+            language_for_file(Path::new("x.rs"), None),
+            Some(Language::Rust)
+        );
+    }
+
+    #[test]
     fn code_documents_have_sequential_chunk_indexes() {
         let chunks = vec![
             CodeChunk::generic("one", "repo", "file.txt", "first"),
             CodeChunk::generic("two", "repo", "file.txt", "second"),
         ];
-        let documents = code_chunks_to_document_chunks(chunks);
+        let documents = code_chunks_to_document_chunks(chunks, None);
         assert_eq!(documents[0].chunk_index, 0);
         assert_eq!(documents[1].chunk_index, 1);
     }

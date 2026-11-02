@@ -16,13 +16,11 @@ use std::sync::Arc;
 use axum::middleware::from_fn;
 use axum::Router;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
-use rmcp::transport::streamable_http_server::{
-    StreamableHttpServerConfig, StreamableHttpService,
-};
+use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
-use crate::services::rag_service::RagService;
+use crate::services::rag::RagService;
 
 pub const DEFAULT_MCP_PORT: u16 = 18651;
 

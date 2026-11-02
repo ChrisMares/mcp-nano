@@ -3,10 +3,10 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
+use ort::inputs;
 use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
 use ort::value::Tensor;
-use ort::inputs;
 use tokenizers::{Tokenizer, TruncationParams, TruncationStrategy};
 use tracing::debug;
 
@@ -128,8 +128,7 @@ impl DenseEmbedder {
             .map(|e| e.get_ids().len().min(MAX_SEQ_LEN))
             .max()
             .unwrap_or(0)
-            .min(MAX_SEQ_LEN)
-            .max(1);
+            .clamp(1, MAX_SEQ_LEN);
         let batch = encodings.len();
 
         let (input_ids, attention_mask_t, token_type_ids, attention_mask) =
@@ -279,9 +278,7 @@ pub(crate) fn build_session(model_path: &Path, device: InferenceDevice) -> Resul
             #[cfg(all(feature = "cuda", target_os = "linux"))]
             {
                 builder
-                    .with_execution_providers([
-                        ort::ep::CUDA::default().build().error_on_failure(),
-                    ])
+                    .with_execution_providers([ort::ep::CUDA::default().build().error_on_failure()])
                     .map_err(|e| anyhow!("registering CUDA execution provider: {e}"))?
             }
             #[cfg(not(all(feature = "cuda", target_os = "linux")))]
@@ -296,9 +293,9 @@ pub(crate) fn build_session(model_path: &Path, device: InferenceDevice) -> Resul
             #[cfg(all(feature = "directml", target_os = "windows"))]
             {
                 builder
-                    .with_execution_providers([
-                        ort::ep::DirectML::default().build().error_on_failure(),
-                    ])
+                    .with_execution_providers([ort::ep::DirectML::default()
+                        .build()
+                        .error_on_failure()])
                     .map_err(|e| anyhow!("registering DirectML execution provider: {e}"))?
             }
             #[cfg(not(all(feature = "directml", target_os = "windows")))]

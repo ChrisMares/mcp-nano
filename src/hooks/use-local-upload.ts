@@ -7,6 +7,7 @@ import {
   uploadCodeFiles,
 } from "@/utils/apicalls";
 import type { EmbeddingOptions, UploadJobEntry } from "@/types/embed";
+import { errorMessage } from "@/lib/utils";
 
 type FileError = {
   code: string;
@@ -195,16 +196,29 @@ export const useLocalUpload = (options: UseLocalUploadOptions) => {
           : await uploadRepoZip(paths, embeddingOptions)
         : await uploadDocuments(paths, embeddingOptions);
 
-      if (response.errors.length > 0) {
-        throw new Error(response.errors.join("; "));
+      // The backend queues every file it can and reports the rest in
+      // `errors`, so a partial failure still has jobs that must be tracked.
+      const queuedNames = new Set<string>();
+      for (const job of response.jobs) {
+        queuedNames.add(job.filename);
       }
-
-      const uploaded = validFiles.map((file) => file.name);
+      const uploaded: string[] = [];
+      const failed: { name: string; message: string }[] = [];
+      const failureMessage = response.errors.join("; ") || "Upload failed";
+      for (const file of validFiles) {
+        if (queuedNames.has(file.name)) {
+          uploaded.push(file.name);
+        } else if (response.errors.length > 0) {
+          failed.push({ name: file.name, message: failureMessage });
+        }
+      }
       setSuccesses(uploaded);
-      setErrors([]);
-      if (onSuccess) await onSuccess(uploaded.length, response.jobs ?? []);
+      setErrors(failed);
+      if (onSuccess && response.jobs.length > 0) {
+        await onSuccess(uploaded.length, response.jobs);
+      }
     } catch (error) {
-      const message = error instanceof Error ? error.message : typeof error === "string" ? error : "Upload failed";
+      const message = errorMessage(error, "Upload failed");
       setErrors(files.map((file) => ({ name: file.name, message })));
       setSuccesses([]);
     } finally {

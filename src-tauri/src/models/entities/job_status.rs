@@ -1,7 +1,7 @@
 use serde::Serialize;
 use sqlx::FromRow;
 
-#[derive(Debug, Default, Serialize, FromRow)]
+#[derive(Debug, Default, Clone, Serialize, FromRow)]
 pub struct JobStatus {
     pub id: i64,
     pub job_id: String,

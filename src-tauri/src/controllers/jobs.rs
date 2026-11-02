@@ -329,7 +329,7 @@ async fn enqueue_upload_jobs(
             .unwrap_or("upload.bin")
             .to_string();
         let job_id = Uuid::new_v4();
-        let dest_name = format!("{}_{orig_name}", job_id.simple());
+        let dest_name = format!("{job_id}_{orig_name}");
         let dest_path = uploads_dir.join(&dest_name);
         if let Err(e) = std::fs::copy(&source, &dest_path) {
             errors.push(format!("copy {p} to {}: {e}", dest_path.display()));

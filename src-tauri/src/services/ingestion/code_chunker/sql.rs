@@ -8,12 +8,13 @@
 //! 4. ALTER TABLE chunks are merged per `object_name` (Phase 4).
 //! 5. Junk chunks with unrecognized statement types are filtered (Phase 5).
 
-use std::collections::HashSet;
-
 use regex::Regex;
 use tree_sitter::Node;
 
-use super::helpers::{build_remainder_code, generate_chunk_id, node_text, byte_slice_text};
+use super::helpers::{
+    build_remainder_code, byte_slice_text, collect_dependencies, find_child_of_kind, new_chunk,
+    node_text,
+};
 use crate::services::ingestion::types::{CodeChunk, CodeChunkKind, SqlFields};
 
 // Tree-sitter statement types that get their own chunk (Phase 1).
@@ -83,38 +84,21 @@ fn sql_object_re() -> &'static Regex {
     })
 }
 
-const DOLLAR_TAG_RE_RAW: &str = r"\$[A-Za-z_]*\$";
-
-pub fn extract_dependencies<'a>(root: Node<'a>, source: &[u8]) -> Vec<String> {
-    let mut deps: Vec<String> = Vec::new();
-    let mut seen = HashSet::new();
-    collect_references(&root, source, &mut deps, &mut seen);
-    deps
+fn dollar_tag_re() -> &'static Regex {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\$[A-Za-z_]*\$").expect("dollar tag regex must compile"))
 }
 
-fn collect_references<'a>(
-    node: &Node<'a>,
-    source: &[u8],
-    deps: &mut Vec<String>,
-    seen: &mut HashSet<String>,
-) {
-    if node.kind() == "object_reference" {
-        if node.parent().is_some() {
-            if let Some(prev) = prev_named_sibling(node) {
-                if prev.kind() == "keyword_references" {
-                    if let Some(name) = extract_object_name(node, source) {
-                        if seen.insert(name.clone()) {
-                            deps.push(name);
-                        }
-                    }
-                }
+pub fn extract_dependencies<'a>(root: Node<'a>, source: &[u8]) -> Vec<String> {
+    collect_dependencies(root, |node, deps| {
+        let follows_references = node.kind() == "object_reference"
+            && prev_named_sibling(&node).is_some_and(|prev| prev.kind() == "keyword_references");
+        if follows_references {
+            if let Some(name) = extract_object_name(&node, source) {
+                deps.push(name);
             }
         }
-    }
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_references(&child, source, deps, seen);
-    }
+    })
 }
 
 fn prev_named_sibling<'a>(node: &Node<'a>) -> Option<Node<'a>> {
@@ -141,15 +125,29 @@ fn strip_brackets(name: &str) -> String {
     }
 }
 
-fn extract_object_name<'a>(obj_ref: &Node<'a>, source: &[u8]) -> Option<String> {
+fn identifier_children<'a>(obj_ref: &Node<'a>) -> Vec<Node<'a>> {
     let mut cursor = obj_ref.walk();
-    let identifiers: Vec<Node<'a>> = obj_ref
+    let identifiers = obj_ref
         .children(&mut cursor)
         .filter(|c| c.kind() == "identifier")
         .collect();
+    identifiers
+}
+
+/// Whole text of `obj_ref` without brackets, or `None` when empty.
+fn raw_object_name<'a>(obj_ref: &Node<'a>, source: &[u8]) -> Option<String> {
+    let raw = strip_brackets(&node_text(obj_ref, source));
+    if raw.is_empty() {
+        None
+    } else {
+        Some(raw)
+    }
+}
+
+fn extract_object_name<'a>(obj_ref: &Node<'a>, source: &[u8]) -> Option<String> {
+    let identifiers = identifier_children(obj_ref);
     if identifiers.is_empty() {
-        let raw = strip_brackets(&node_text(obj_ref, source).trim());
-        return if raw.is_empty() { None } else { Some(raw) };
+        return raw_object_name(obj_ref, source);
     }
     Some(
         identifiers
@@ -160,25 +158,22 @@ fn extract_object_name<'a>(obj_ref: &Node<'a>, source: &[u8]) -> Option<String> 
     )
 }
 
-fn extract_schema_and_name<'a>(obj_ref: &Node<'a>, source: &[u8]) -> (Option<String>, Option<String>) {
-    let mut cursor = obj_ref.walk();
-    let identifiers: Vec<Node<'a>> = obj_ref
-        .children(&mut cursor)
-        .filter(|c| c.kind() == "identifier")
-        .collect();
+fn extract_schema_and_name<'a>(
+    obj_ref: &Node<'a>,
+    source: &[u8],
+) -> (Option<String>, Option<String>) {
+    let identifiers = identifier_children(obj_ref);
     if identifiers.len() >= 2 {
         let schema = strip_brackets(&node_text(&identifiers[0], source));
         let name = strip_brackets(&node_text(identifiers.last().unwrap(), source));
         (Some(schema), Some(name))
     } else if identifiers.len() == 1 {
-        (None, Some(strip_brackets(&node_text(&identifiers[0], source))))
+        (
+            None,
+            Some(strip_brackets(&node_text(&identifiers[0], source))),
+        )
     } else {
-        let raw = strip_brackets(&node_text(obj_ref, source).trim());
-        if raw.is_empty() {
-            (None, None)
-        } else {
-            (None, Some(raw))
-        }
+        (None, raw_object_name(obj_ref, source))
     }
 }
 
@@ -191,41 +186,28 @@ pub fn extract_chunks<'a>(
     source: &[u8],
     file_path: &str,
     deps: &[String],
-) -> Vec<CodeChunk> {
-    extract_chunks_with_db(node, source, file_path, deps, None)
-}
-
-pub fn extract_chunks_with_db<'a>(
-    node: Node<'a>,
-    source: &[u8],
-    file_path: &str,
-    deps: &[String],
     database_name: Option<&str>,
 ) -> Vec<CodeChunk> {
-    let mut raw_chunks: Vec<CodeChunk> = Vec::new();
+    let mut raw_chunks: Vec<(CodeChunk, bool)> = Vec::new();
     let mut spans: Vec<(usize, usize)> = Vec::new();
-    let mut error_node_ids: HashSet<String> = HashSet::new();
     extract_chunks_impl(
         &node,
         source,
         file_path,
         deps,
+        database_name,
         &mut raw_chunks,
         &mut spans,
-        &mut error_node_ids,
-        database_name,
     );
 
-    // Phase 2: regex re-split each chunk to recover DDL buried inside.
+    // Phase 2: regex re-split each chunk to recover DDL buried inside. Junk
+    // ERROR-node chunks with nothing recognizable are dropped.
     let mut resplit: Vec<CodeChunk> = Vec::new();
-    for chunk in raw_chunks {
-        let is_error = error_node_ids.contains(&chunk.id);
+    for (chunk, is_error) in raw_chunks {
         let sub = regex_split_sql_text(&chunk.code, file_path, deps, database_name);
         if !sub.is_empty() {
             resplit.extend(sub);
-        } else if is_error {
-            // Drop junk ERROR-node chunk.
-        } else {
+        } else if !is_error {
             resplit.push(chunk);
         }
     }
@@ -233,7 +215,12 @@ pub fn extract_chunks_with_db<'a>(
     // Phase 3: regex-split the remainder (tree-sitter didn't touch this).
     let remainder_code = build_remainder_code(source, &spans);
     if !remainder_code.trim().is_empty() {
-        resplit.extend(regex_split_sql_text(&remainder_code, file_path, deps, database_name));
+        resplit.extend(regex_split_sql_text(
+            &remainder_code,
+            file_path,
+            deps,
+            database_name,
+        ));
     }
 
     // Phase 4: merge ALTER TABLE chunks by object_name.
@@ -243,15 +230,15 @@ pub fn extract_chunks_with_db<'a>(
     filter_junk_chunks(merged)
 }
 
+/// Collect statement chunks and root-level ERROR chunks (flagged `true`).
 fn extract_chunks_impl<'a>(
     node: &Node<'a>,
     source: &[u8],
     file_path: &str,
     deps: &[String],
-    chunks: &mut Vec<CodeChunk>,
-    spans: &mut Vec<(usize, usize)>,
-    error_node_ids: &mut HashSet<String>,
     database_name: Option<&str>,
+    chunks: &mut Vec<(CodeChunk, bool)>,
+    spans: &mut Vec<(usize, usize)>,
 ) {
     if node.kind() == "statement" {
         // The first *named* child of a `statement` node is the actual DDL/DML
@@ -261,9 +248,9 @@ fn extract_chunks_impl<'a>(
         if let Some(inner) = inner {
             let inner_kind = inner.kind();
             if STATEMENT_NODE_TYPES.contains(&inner_kind) {
-                emit_chunk(node, &inner, source, file_path, deps, database_name, chunks);
-                spans.push((node.start_byte(), node.end_byte()));
-                extend_span_past_semicolons(node, spans);
+                let chunk = statement_chunk(node, &inner, source, file_path, deps, database_name);
+                chunks.push((chunk, false));
+                spans.push((node.start_byte(), statement_end(node)));
                 return;
             }
         }
@@ -273,30 +260,8 @@ fn extract_chunks_impl<'a>(
     if node.kind() == "ERROR" {
         if let Some(parent) = node.parent() {
             if parent.kind() == "program" {
-                let code = node_text(&node, source);
-                let stmt_type = infer_statement_type(&code);
-                let (schema, obj_name) = infer_schema_and_object_name(&code);
-                let id = generate_chunk_id(file_path, &obj_name.clone().unwrap_or("unknown".to_string()));
-                chunks.push(CodeChunk {
-                    id: id.clone(),
-                    repo_name: String::new(),
-                    file_name: std::path::Path::new(file_path)
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or(file_path)
-                        .to_string(),
-                    code,
-                    r#type: "sql_statement".to_string(),
-                    dependencies: deps.to_vec(),
-                    created_at: crate::services::ingestion::types::now_iso(),
-                    kind: CodeChunkKind::Sql(SqlFields {
-                        statement_type: Some(stmt_type),
-                        object_name: obj_name,
-                        schema_name: schema,
-                        database_name: database_name.map(|s| s.to_string()),
-                    }),
-                });
-                error_node_ids.insert(id);
+                let chunk = inferred_chunk(node_text(node, source), file_path, deps, database_name);
+                chunks.push((chunk, true));
                 spans.push((node.start_byte(), node.end_byte()));
                 return;
             }
@@ -305,70 +270,89 @@ fn extract_chunks_impl<'a>(
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        extract_chunks_impl(&child, source, file_path, deps, chunks, spans, error_node_ids, database_name);
+        extract_chunks_impl(
+            &child,
+            source,
+            file_path,
+            deps,
+            database_name,
+            chunks,
+            spans,
+        );
     }
 }
 
-fn emit_chunk<'a>(
+/// End byte of a statement, including a trailing `;` sibling.
+fn statement_end<'a>(stmt_node: &Node<'a>) -> usize {
+    match stmt_node.next_sibling() {
+        Some(next_sib) if next_sib.kind() == ";" => next_sib.end_byte(),
+        _ => stmt_node.end_byte(),
+    }
+}
+
+fn statement_chunk<'a>(
     stmt_node: &Node<'a>,
     inner_node: &Node<'a>,
     source: &[u8],
     file_path: &str,
     deps: &[String],
     database_name: Option<&str>,
-    chunks: &mut Vec<CodeChunk>,
-) {
-    // Include trailing ';' in the chunk text.
-    let mut end_byte = stmt_node.end_byte();
-    if let Some(next_sib) = stmt_node.next_sibling() {
-        if next_sib.kind() == ";" {
-            end_byte = next_sib.end_byte();
-        }
-    }
-    let code = byte_slice_text(source, stmt_node.start_byte(), end_byte);
+) -> CodeChunk {
+    let code = byte_slice_text(source, stmt_node.start_byte(), statement_end(stmt_node));
 
     let mut schema_name: Option<String> = None;
     let mut object_name: Option<String> = None;
-    let mut cursor = inner_node.walk();
-    if let Some(obj_ref) = inner_node
-        .children(&mut cursor)
-        .find(|c| c.kind() == "object_reference")
-    {
+    if let Some(obj_ref) = find_child_of_kind(inner_node, "object_reference") {
         let (s, n) = extract_schema_and_name(&obj_ref, source);
         schema_name = s;
         object_name = n;
     }
 
-    let id = generate_chunk_id(file_path, &object_name.clone().unwrap_or_else(|| inner_node.kind().to_string()));
-    chunks.push(CodeChunk {
-        id,
-        repo_name: String::new(),
-        file_name: std::path::Path::new(file_path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(file_path)
-            .to_string(),
-        code,
-        r#type: "sql_statement".to_string(),
-        dependencies: deps.to_vec(),
-        created_at: crate::services::ingestion::types::now_iso(),
-        kind: CodeChunkKind::Sql(SqlFields {
-            statement_type: Some(get_statement_label(inner_node.kind())),
-            object_name,
-            schema_name,
-            database_name: database_name.map(|s| s.to_string()),
-        }),
-    });
+    let identifier = object_name
+        .clone()
+        .unwrap_or_else(|| inner_node.kind().to_string());
+    let fields = SqlFields {
+        statement_type: Some(get_statement_label(inner_node.kind())),
+        object_name,
+        schema_name,
+        database_name: database_name.map(str::to_string),
+    };
+    sql_chunk(file_path, &identifier, code, deps, fields)
 }
 
-fn extend_span_past_semicolons<'a>(node: &Node<'a>, spans: &mut Vec<(usize, usize)>) {
-    if let Some(next_sib) = node.next_sibling() {
-        if next_sib.kind() == ";" {
-            if let Some(last) = spans.last_mut() {
-                last.1 = next_sib.end_byte();
-            }
-        }
-    }
+fn sql_chunk(
+    file_path: &str,
+    identifier: &str,
+    code: String,
+    deps: &[String],
+    fields: SqlFields,
+) -> CodeChunk {
+    new_chunk(
+        file_path,
+        identifier,
+        code,
+        "sql_statement",
+        deps,
+        CodeChunkKind::Sql(fields),
+    )
+}
+
+/// Chunk whose statement type and object name are inferred from `code`.
+fn inferred_chunk(
+    code: String,
+    file_path: &str,
+    deps: &[String],
+    database_name: Option<&str>,
+) -> CodeChunk {
+    let (schema_name, object_name) = infer_schema_and_object_name(&code);
+    let identifier = object_name.clone().unwrap_or_else(|| "unknown".to_string());
+    let fields = SqlFields {
+        statement_type: Some(infer_statement_type(&code)),
+        object_name,
+        schema_name,
+        database_name: database_name.map(str::to_string),
+    };
+    sql_chunk(file_path, &identifier, code, deps, fields)
 }
 
 fn regex_split_sql_text(
@@ -402,13 +386,8 @@ fn regex_split_sql_text(
     if positions.is_empty() {
         return Vec::new();
     }
-    positions = positions.into_iter().collect::<HashSet<_>>().into_iter().collect();
     positions.sort();
-    let file_basename = std::path::Path::new(file_path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(file_path)
-        .to_string();
+    positions.dedup();
 
     let mut chunks = Vec::new();
     for (i, start) in positions.iter().enumerate() {
@@ -421,31 +400,18 @@ fn regex_split_sql_text(
         if segment.is_empty() {
             continue;
         }
-        let stmt_type = infer_statement_type(segment);
-        let (schema, obj_name) = infer_schema_and_object_name(segment);
-        let id = generate_chunk_id(file_path, &obj_name.clone().unwrap_or("unknown".to_string()));
-        chunks.push(CodeChunk {
-            id,
-            repo_name: String::new(),
-            file_name: file_basename.clone(),
-            code: segment.to_string(),
-            r#type: "sql_statement".to_string(),
-            dependencies: deps.to_vec(),
-            created_at: crate::services::ingestion::types::now_iso(),
-            kind: CodeChunkKind::Sql(SqlFields {
-                statement_type: Some(stmt_type),
-                object_name: obj_name,
-                schema_name: schema,
-                database_name: database_name.map(|s| s.to_string()),
-            }),
-        });
+        chunks.push(inferred_chunk(
+            segment.to_string(),
+            file_path,
+            deps,
+            database_name,
+        ));
     }
     chunks
 }
 
 fn find_dollar_quoted_spans(text: &str) -> Vec<(usize, usize)> {
-    let re = Regex::new(DOLLAR_TAG_RE_RAW).unwrap();
-    let chars: Vec<char> = text.chars().collect();
+    let re = dollar_tag_re();
     let mut spans = Vec::new();
     // Index-based iteration over byte positions, but `text` ASCII by use-case.
     let bytes = text.as_bytes();
@@ -484,7 +450,6 @@ fn find_dollar_quoted_spans(text: &str) -> Vec<(usize, usize)> {
         }
         i += 1;
     }
-    let _ = chars; // suppress unused warning when feature not enabled
     spans
 }
 
@@ -499,58 +464,40 @@ fn merge_alter_table_chunks(
     database_name: Option<&str>,
 ) -> Vec<CodeChunk> {
     let mut result: Vec<CodeChunk> = Vec::new();
-    let mut alter_groups: std::collections::HashMap<String, Vec<CodeChunk>> = std::collections::HashMap::new();
-    let mut group_order: Vec<String> = Vec::new();
+    let mut groups: Vec<(String, Vec<CodeChunk>)> = Vec::new();
 
     for chunk in chunks {
-        let is_alter_table = matches!(&chunk.kind, CodeChunkKind::Sql(f) if f.statement_type.as_deref() == Some("ALTER TABLE"));
-        if is_alter_table {
-            let key = chunk
-                .kind_metadata()
-                .get("object_name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown")
-                .to_lowercase();
-            if !group_order.contains(&key) {
-                group_order.push(key.clone());
+        let key = match &chunk.kind {
+            CodeChunkKind::Sql(f) if f.statement_type.as_deref() == Some("ALTER TABLE") => {
+                f.object_name.clone().unwrap_or_default().to_lowercase()
             }
-            alter_groups.entry(key).or_default().push(chunk);
-        } else {
-            result.push(chunk);
+            _ => {
+                result.push(chunk);
+                continue;
+            }
+        };
+        match groups.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, group)) => group.push(chunk),
+            None => groups.push((key, vec![chunk])),
         }
     }
 
-    for key in group_order {
-        if let Some(group) = alter_groups.remove(&key) {
-            let merged_code = group
-                .iter()
-                .map(|c| c.code.clone())
-                .collect::<Vec<_>>()
-                .join("\n\n");
-            let first = &group[0];
-            let id = generate_chunk_id(file_path, &key);
-            result.push(CodeChunk {
-                id,
-                repo_name: first.repo_name.clone(),
-                file_name: first.file_name.clone(),
-                code: merged_code,
-                r#type: "sql_statement".to_string(),
-                dependencies: deps.to_vec(),
-                created_at: crate::services::ingestion::types::now_iso(),
-                kind: CodeChunkKind::Sql(SqlFields {
-                    statement_type: Some("ALTER TABLE".to_string()),
-                    object_name: match &first.kind {
-                        CodeChunkKind::Sql(f) => f.object_name.clone(),
-                        _ => None,
-                    },
-                    schema_name: match &first.kind {
-                        CodeChunkKind::Sql(f) => f.schema_name.clone(),
-                        _ => None,
-                    },
-                    database_name: database_name.map(|s| s.to_string()),
-                }),
-            });
+    for (key, group) in groups {
+        let mut codes: Vec<&str> = Vec::new();
+        for chunk in &group {
+            codes.push(&chunk.code);
         }
+        let (object_name, schema_name) = match &group[0].kind {
+            CodeChunkKind::Sql(f) => (f.object_name.clone(), f.schema_name.clone()),
+            _ => (None, None),
+        };
+        let fields = SqlFields {
+            statement_type: Some("ALTER TABLE".to_string()),
+            object_name,
+            schema_name,
+            database_name: database_name.map(str::to_string),
+        };
+        result.push(sql_chunk(file_path, &key, codes.join("\n\n"), deps, fields));
     }
     result
 }
@@ -618,7 +565,11 @@ fn filter_junk_chunks(chunks: Vec<CodeChunk>) -> Vec<CodeChunk> {
 }
 
 fn infer_statement_type(code: &str) -> String {
-    let normalized: String = code.split_whitespace().collect::<Vec<_>>().join(" ").to_uppercase();
+    let normalized: String = code
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_uppercase();
     let prefixes = [
         "CREATE OR REPLACE PACKAGE BODY",
         "CREATE OR REPLACE PACKAGE",
@@ -666,18 +617,22 @@ fn infer_statement_type(code: &str) -> String {
     for keyword in prefixes {
         if normalized.starts_with(keyword) {
             if keyword.contains(" IF EXISTS") || keyword.contains(" IF NOT EXISTS") {
-                return keyword.split(" IF ").next().unwrap_or(keyword).trim().to_string();
+                return keyword
+                    .split(" IF ")
+                    .next()
+                    .unwrap_or(keyword)
+                    .trim()
+                    .to_string();
             }
             return keyword.to_string();
         }
     }
     // Match `CREATE PROCEDUREdbo.Name` no-space quirks.
-    if let Some(m) = Regex::new(
-        r"^CREATE\s+(?:TABLE|VIEW|PROCEDURE|FUNCTION|INDEX|TRIGGER)",
-    )
-    .ok()
-    .and_then(|r| r.find(&normalized))
-    {
+    static CREATE_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let create_re = CREATE_RE.get_or_init(|| {
+        Regex::new(r"^CREATE\s+(?:TABLE|VIEW|PROCEDURE|FUNCTION|INDEX|TRIGGER)").unwrap()
+    });
+    if let Some(m) = create_re.find(&normalized) {
         return m.as_str().trim().to_string();
     }
     let first_token = normalized.split_whitespace().next().unwrap_or("");
@@ -698,36 +653,38 @@ fn infer_statement_type(code: &str) -> String {
 }
 
 fn infer_schema_and_object_name(code: &str) -> (Option<String>, Option<String>) {
+    static RES: std::sync::OnceLock<[Regex; 3]> = std::sync::OnceLock::new();
+    let res = RES.get_or_init(|| {
+        [
+            Regex::new(r"(?i)^(?:GRANT|REVOKE)\s+.*?\bON\s+(\S+)").unwrap(),
+            Regex::new(
+                r"(?i)^(?:CREATE|ALTER|DROP)\s+(?:OR\s+REPLACE\s+)?POLICY(?:\s+IF\s+(?:NOT\s+)?EXISTS)?\s+(\S+)",
+            )
+            .unwrap(),
+            Regex::new(
+                r"(?i)^(?:CREATE|ALTER|DROP)\s+(?:OR\s+REPLACE\s+)?(?:PUBLIC\s+)?(?:UNIQUE\s+)?(?:MATERIALIZED\s+VIEW|VIRTUAL\s+TABLE|PACKAGE\s+BODY|TYPE\s+BODY|TABLESPACE|TABLE|VIEW|FUNCTION|PROCEDURE|INDEX|TRIGGER|TYPE|SEQUENCE|SCHEMA|DATABASE|EXTENSION|ROLE|SYNONYM|PACKAGE)(?:\s+IF\s+(?:NOT\s+)?EXISTS)?\s*(\S+)",
+            )
+            .unwrap(),
+        ]
+    });
     let stripped = code.trim();
-    let grant_re = Regex::new(r"(?i)^(?:GRANT|REVOKE)\s+.*?\bON\s+(\S+)").unwrap();
-    if let Some(c) = grant_re.captures(stripped) {
-        let raw = c.get(1).unwrap().as_str().split('(').next().unwrap_or("").trim_end_matches(|c: char| c == ';' || c == ',');
-        return parse_qualified_name(raw);
-    }
-    let policy_re = Regex::new(
-        r"(?i)^(?:CREATE|ALTER|DROP)\s+(?:OR\s+REPLACE\s+)?POLICY(?:\s+IF\s+(?:NOT\s+)?EXISTS)?\s+(\S+)",
-    )
-    .unwrap();
-    if let Some(c) = policy_re.captures(stripped) {
-        let raw = c.get(1).unwrap().as_str().split('(').next().unwrap_or("").trim_end_matches(|c: char| c == ';' || c == ',');
-        return parse_qualified_name(raw);
-    }
-    let general_re = Regex::new(
-        r"(?i)^(?:CREATE|ALTER|DROP)\s+(?:OR\s+REPLACE\s+)?(?:PUBLIC\s+)?(?:UNIQUE\s+)?(?:MATERIALIZED\s+VIEW|VIRTUAL\s+TABLE|PACKAGE\s+BODY|TYPE\s+BODY|TABLESPACE|TABLE|VIEW|FUNCTION|PROCEDURE|INDEX|TRIGGER|TYPE|SEQUENCE|SCHEMA|DATABASE|EXTENSION|ROLE|SYNONYM|PACKAGE)(?:\s+IF\s+(?:NOT\s+)?EXISTS)?\s*(\S+)",
-    )
-    .unwrap();
-    if let Some(c) = general_re.captures(stripped) {
-        let raw = c.get(1).unwrap().as_str().split('(').next().unwrap_or("").trim_end_matches(|c: char| c == ';' || c == ',');
-        return parse_qualified_name(raw);
+    for re in res {
+        if let Some(c) = re.captures(stripped) {
+            let raw = c[1].split('(').next().unwrap_or("");
+            return parse_qualified_name(raw.trim_end_matches([';', ',']));
+        }
     }
     (None, None)
 }
 
 fn parse_qualified_name(raw: &str) -> (Option<String>, Option<String>) {
-    let clean = raw.replace('[', "").replace(']', "");
+    let clean = raw.replace(['[', ']'], "");
     let parts: Vec<&str> = clean.split('.').collect();
     if parts.len() >= 2 {
-        (Some(parts[0].to_string()), Some(parts.last().unwrap().to_string()))
+        (
+            Some(parts[0].to_string()),
+            Some(parts.last().unwrap().to_string()),
+        )
     } else if let Some(single) = parts.first() {
         if single.is_empty() {
             (None, None)

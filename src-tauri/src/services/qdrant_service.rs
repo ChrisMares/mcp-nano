@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use anyhow::{anyhow, Context, Result};
 use qdrant_client::qdrant::{
     point_id::PointIdOptions, Condition, DeletePointsBuilder, FieldType, Filter, Fusion, PointId,
-    PointStruct, PrefetchQueryBuilder, QueryPointsBuilder, SetPayloadPointsBuilder,
-    UpsertPointsBuilder, Vector, Vectors,
+    PointStruct, PrefetchQueryBuilder, Query, QueryPointsBuilder, ScrollPointsBuilder,
+    SetPayloadPointsBuilder, UpsertPointsBuilder, Vector, Vectors,
 };
 use qdrant_client::{Payload, Qdrant};
 use uuid::Uuid;
@@ -44,6 +44,56 @@ impl Include {
 #[derive(Clone)]
 pub struct QdrantService {
     client: Qdrant,
+}
+
+/// Remove the legacy `document` key from a point payload and return the
+/// chunk text: the legacy key if present, else `content`, else `code`.
+fn take_document_text(payload: &mut serde_json::Value) -> String {
+    let serde_json::Value::Object(map) = payload else {
+        return String::new();
+    };
+    if let Some(serde_json::Value::String(text)) = map.remove("document") {
+        return text;
+    }
+    for key in ["content", "code"] {
+        if let Some(text) = map.get(key).and_then(|v| v.as_str()) {
+            return text.to_string();
+        }
+    }
+    String::new()
+}
+
+/// A point's id as a string and its payload as JSON with the chunk text
+/// taken out (see [`take_document_text`]).
+fn point_parts(
+    id: Option<PointId>,
+    payload: HashMap<String, qdrant_client::qdrant::Value>,
+) -> (String, serde_json::Value, String) {
+    let id = match id.and_then(|pid| pid.point_id_options) {
+        Some(PointIdOptions::Num(n)) => n.to_string(),
+        Some(PointIdOptions::Uuid(s)) => s,
+        None => String::new(),
+    };
+    // Points written by older builds carry a separate "document" key; newer
+    // points keep the text only in metadata.
+    let mut payload = serde_json::Value::from(Payload::from(payload));
+    let document = take_document_text(&mut payload);
+    (id, payload, document)
+}
+
+fn single_row(
+    ids: Vec<String>,
+    documents: Vec<String>,
+    metadatas: Vec<serde_json::Value>,
+    distances: Vec<f64>,
+) -> VecDbResult {
+    VecDbResult {
+        ids: vec![ids],
+        documents: vec![documents],
+        metadatas: vec![metadatas],
+        distances: vec![distances],
+        count: None,
+    }
 }
 
 impl QdrantService {
@@ -92,10 +142,7 @@ impl QdrantService {
             .count(CountPointsBuilder::new(collection).exact(true))
             .await
             .with_context(|| format!("count({collection})"))?;
-        let count = resp
-            .result
-            .map(|r| r.count as i64)
-            .unwrap_or(0);
+        let count = resp.result.map(|r| r.count as i64).unwrap_or(0);
         Ok(count)
     }
 
@@ -103,8 +150,9 @@ impl QdrantService {
     ///
     /// `ids`, `documents`, `dense_embeddings`, `metadatas` must all have the
     /// same length. Sparse vectors are computed from `documents` via the
-    /// supplied `Bm25Embedder`. Payload is `{ "document": <text>, ...meta }`
-    /// per point — matches the Python `upsert_items` contract.
+    /// supplied `Bm25Embedder`. The payload is the metadata only: chunk text
+    /// already lives in `metadata.content` (documents) or `metadata.code`
+    /// (code), so it is not stored a second time.
     #[allow(clippy::too_many_arguments)]
     pub async fn upsert_items(
         &self,
@@ -132,7 +180,10 @@ impl QdrantService {
             return Ok(());
         }
         let bs = if batch_size == 0 { 250 } else { batch_size };
-        debug!("upserting {} items to {collection} in batches of {bs}", ids.len());
+        debug!(
+            "upserting {} items to {collection} in batches of {bs}",
+            ids.len()
+        );
 
         for chunk_start in (0..ids.len()).step_by(bs) {
             let chunk_end = (chunk_start + bs).min(ids.len());
@@ -171,23 +222,14 @@ impl QdrantService {
                 }
                 let vectors = Vectors::from(vectors);
 
-                let mut payload = serde_json::Map::new();
-                payload.insert("document".to_string(), serde_json::Value::String(documents[idx].clone()));
-                if let serde_json::Value::Object(map) = &metadatas[idx] {
-                    for (k, v) in map {
-                        payload.insert(k.clone(), v.clone());
-                    }
-                }
-                let payload = Payload::try_from(serde_json::Value::Object(payload))
+                let payload = Payload::try_from(metadatas[idx].clone())
                     .map_err(|e| anyhow!("payload build failed: {e}"))?;
 
                 points.push(PointStruct::new(ids[idx], vectors, payload));
             }
 
             self.client
-                .upsert_points(
-                    UpsertPointsBuilder::new(collection, points).wait(true),
-                )
+                .upsert_points(UpsertPointsBuilder::new(collection, points).wait(true))
                 .await
                 .with_context(|| {
                     format!("upsert batch {chunk_start}..{chunk_end} on {collection}")
@@ -214,63 +256,50 @@ impl QdrantService {
         bm25: Option<&Bm25Embedder>,
     ) -> Result<VecDbResult> {
         let limit = n_results.max(1) as u64;
-        let prefetch_limit = limit.saturating_mul(crate::qdrant::PREFETCH_OVERFETCH).max(limit);
+        let prefetch_limit = limit
+            .saturating_mul(crate::qdrant::PREFETCH_OVERFETCH)
+            .max(limit);
 
         debug!(
             "query {collection}: limit={n_results} prefetch={prefetch_limit} hybrid={}",
             query_text.is_some()
         );
-        let builder = if let (Some(text), Some(bm25)) = (query_text, bm25) {
-            let sparse_vecs = bm25
+        let sparse = match (query_text, bm25) {
+            (Some(text), Some(bm25)) => bm25
                 .embed_query_sparse(&[text])
-                .context("BM25 sparse query embed")?;
-            let sparse = sparse_vecs.into_iter().next().unwrap_or_default();
-
-            let mut dense_pf = PrefetchQueryBuilder::default()
-                .query(query_dense.to_vec())
-                .using("dense")
+                .context("BM25 sparse query embed")?
+                .into_iter()
+                .next()
+                .unwrap_or_default(),
+            _ => Default::default(),
+        };
+        let prefetch = |query: Query, using: &str| {
+            let mut builder = PrefetchQueryBuilder::default()
+                .query(query)
+                .using(using)
                 .limit(prefetch_limit);
             if let Some(f) = filter.clone() {
-                dense_pf = dense_pf.filter(f);
+                builder = builder.filter(f);
             }
+            builder
+        };
 
-            // Hybrid only when the query produced at least one sparse term.
-            let mut b = if sparse.is_empty() {
-                QueryPointsBuilder::new(collection)
-                    .query(query_dense.to_vec())
-                    .using("dense")
-                    .limit(limit)
-                    .with_payload(true)
-            } else {
-                let mut sparse_pf = PrefetchQueryBuilder::default()
-                    .query(sparse.to_tuples())
-                    .using("sparse")
-                    .limit(prefetch_limit);
-                if let Some(f) = filter.clone() {
-                    sparse_pf = sparse_pf.filter(f);
-                }
-                QueryPointsBuilder::new(collection)
-                    .add_prefetch(dense_pf)
-                    .add_prefetch(sparse_pf)
-                    .query(Fusion::Rrf)
-                    .limit(limit)
-                    .with_payload(true)
-            };
-            if let Some(f) = filter {
-                b = b.filter(f);
-            }
-            b
-        } else {
-            let mut b = QueryPointsBuilder::new(collection)
+        // Hybrid only when the query produced at least one sparse term.
+        let mut builder = if sparse.is_empty() {
+            QueryPointsBuilder::new(collection)
                 .query(query_dense.to_vec())
                 .using("dense")
-                .limit(limit)
-                .with_payload(true);
-            if let Some(f) = filter {
-                b = b.filter(f);
-            }
-            b
-        };
+        } else {
+            QueryPointsBuilder::new(collection)
+                .add_prefetch(prefetch(query_dense.to_vec().into(), "dense"))
+                .add_prefetch(prefetch(sparse.to_tuples().into(), "sparse"))
+                .query(Fusion::Rrf)
+        }
+        .limit(limit)
+        .with_payload(true);
+        if let Some(f) = filter {
+            builder = builder.filter(f);
+        }
 
         let resp = self
             .client
@@ -282,59 +311,54 @@ impl QdrantService {
         let mut documents = Vec::new();
         let mut metadatas = Vec::new();
         let mut distances = Vec::new();
-
-        let mut row_ids = Vec::new();
-        let mut row_docs = Vec::new();
-        let mut row_meta = Vec::new();
-        let mut row_dist = Vec::new();
         for point in resp.result {
-            let id_str = point
-                .id
-                .as_ref()
-                .and_then(|pid| match &pid.point_id_options {
-                    Some(PointIdOptions::Num(n)) => Some(n.to_string()),
-                    Some(PointIdOptions::Uuid(s)) => Some(s.clone()),
-                    None => None,
-                })
-                .unwrap_or_default();
-            row_ids.push(id_str.clone());
-
-            // Convert the full payload to a serde_json::Value, then pop
-            // "document" out of it — what remains is the metadata.
-            let mut payload_json: serde_json::Value =
-                serde_json::Value::from(Payload::from(point.payload));
-            let doc_str = payload_json
-                .get("document")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .unwrap_or_default();
-            if let serde_json::Value::Object(map) = &mut payload_json {
-                map.remove("document");
-            }
+            let (id, payload, document) = point_parts(point.id, point.payload);
+            ids.push(id);
             if include.documents {
-                row_docs.push(doc_str);
+                documents.push(document);
             }
-
             if include.metadatas {
-                row_meta.push(payload_json);
+                metadatas.push(payload);
             }
             if include.distances {
-                row_dist.push(point.score as f64);
+                distances.push(point.score as f64);
             }
         }
+        Ok(single_row(ids, documents, metadatas, distances))
+    }
 
-        ids.push(row_ids);
-        documents.push(row_docs);
-        metadatas.push(row_meta);
-        distances.push(row_dist);
+    /// Fetch up to `limit` points matching `filter`, without ranking. Returns
+    /// the same shape as [`Self::query_items`] with zero distances.
+    pub async fn scroll_items(
+        &self,
+        collection: &str,
+        filter: Filter,
+        limit: usize,
+    ) -> Result<VecDbResult> {
+        let resp = self
+            .client
+            .scroll(
+                ScrollPointsBuilder::new(collection)
+                    .filter(filter)
+                    .limit(limit.min(u32::MAX as usize) as u32)
+                    .with_payload(true)
+                    .with_vectors(false),
+            )
+            .await
+            .with_context(|| format!("scroll {collection}"))?;
 
-        Ok(VecDbResult {
-            ids,
-            documents,
-            metadatas,
-            distances,
-            count: None,
-        })
+        let mut ids = Vec::new();
+        let mut documents = Vec::new();
+        let mut metadatas = Vec::new();
+        let mut distances = Vec::new();
+        for point in resp.result {
+            let (id, payload, document) = point_parts(point.id, point.payload);
+            ids.push(id);
+            documents.push(document);
+            metadatas.push(payload);
+            distances.push(0.0);
+        }
+        Ok(single_row(ids, documents, metadatas, distances))
     }
 
     /// Delete points by IDs or by metadata filter.
@@ -378,12 +402,7 @@ impl QdrantService {
     /// Create a payload index. `field_type` accepts the same string literals
     /// as the Python `create_index`: "keyword", "integer", "float", "text",
     /// "datetime", "bool", "uuid", "geo".
-    pub async fn create_index(
-        &self,
-        collection: &str,
-        key: &str,
-        field_type: &str,
-    ) -> Result<()> {
+    pub async fn create_index(&self, collection: &str, key: &str, field_type: &str) -> Result<()> {
         use qdrant_client::qdrant::CreateFieldIndexCollectionBuilder;
         let ft = match field_type.to_ascii_lowercase().as_str() {
             "keyword" => FieldType::Keyword,
@@ -397,9 +416,7 @@ impl QdrantService {
             other => return Err(anyhow!("unknown field type '{other}'")),
         };
         self.client
-            .create_field_index(CreateFieldIndexCollectionBuilder::new(
-                collection, key, ft,
-            ))
+            .create_field_index(CreateFieldIndexCollectionBuilder::new(collection, key, ft))
             .await
             .with_context(|| format!("create_index({collection}, {key}, {field_type})"))?;
         Ok(())
@@ -408,14 +425,13 @@ impl QdrantService {
     /// Backfill empty `repo_name` payloads from `zip_filename` (basename minus
     /// `.zip`). Used so Data Management can list zips that were uploaded
     /// before the default-repo-name fix. Idempotent.
-    pub async fn repair_empty_repo_names_from_zip(
-        &self,
-        collection: &str,
-    ) -> Result<usize> {
+    pub async fn repair_empty_repo_names_from_zip(&self, collection: &str) -> Result<usize> {
         use crate::services::ingestion_service::repo_name_from_zip_filename;
 
         // Ensure zip_filename is indexed so we can facet it.
-        let _ = self.create_index(collection, "zip_filename", "keyword").await;
+        let _ = self
+            .create_index(collection, "zip_filename", "keyword")
+            .await;
 
         let zip_names = match self
             .get_metadata_values_by_key(collection, "zip_filename", None)
@@ -446,14 +462,10 @@ impl QdrantService {
                 .get_metadata_values_by_key(collection, "repo_name", Some(zip_filter.clone()))
                 .await
                 .unwrap_or_default();
-            let has_named = existing.iter().any(|v| {
-                v.as_str()
-                    .map(|s| !s.is_empty() && s != repo)
-                    .unwrap_or(false)
-            });
-            let already_ok = existing
+            let has_named = existing
                 .iter()
-                .any(|v| v.as_str() == Some(repo.as_str()));
+                .any(|v| v.as_str().is_some_and(|s| !s.is_empty() && s != repo));
+            let already_ok = existing.iter().any(|v| v.as_str() == Some(repo.as_str()));
             if has_named || already_ok {
                 continue;
             }
@@ -529,34 +541,14 @@ impl QdrantService {
     fn build_filter_map(obj: &serde_json::Map<String, serde_json::Value>) -> Result<Filter> {
         // Handle operator keys first.
         if let Some(and_val) = obj.get("$and") {
-            let arr = and_val
-                .as_array()
-                .ok_or_else(|| anyhow!("$and value must be an array"))?;
-            let mut sub_filters = Vec::with_capacity(arr.len());
-            for clause in arr {
-                let clause_obj = clause
-                    .as_object()
-                    .ok_or_else(|| anyhow!("$and clause must be an object"))?;
-                sub_filters.push(Self::build_filter_map(clause_obj)?);
-            }
             return Ok(Filter {
-                must: sub_filters.into_iter().map(Condition::from).collect(),
+                must: Self::sub_filters("$and", and_val)?,
                 ..Default::default()
             });
         }
         if let Some(or_val) = obj.get("$or") {
-            let arr = or_val
-                .as_array()
-                .ok_or_else(|| anyhow!("$or value must be an array"))?;
-            let mut sub_filters = Vec::with_capacity(arr.len());
-            for clause in arr {
-                let clause_obj = clause
-                    .as_object()
-                    .ok_or_else(|| anyhow!("$or clause must be an object"))?;
-                sub_filters.push(Self::build_filter_map(clause_obj)?);
-            }
             return Ok(Filter {
-                should: sub_filters.into_iter().map(Condition::from).collect(),
+                should: Self::sub_filters("$or", or_val)?,
                 ..Default::default()
             });
         }
@@ -596,11 +588,30 @@ impl QdrantService {
                     }
                 }
                 serde_json::Value::Bool(b) => Condition::matches(key.clone(), *b),
-                _ => return Err(anyhow!("unsupported value type in filter for key '{key}': {val}")),
+                _ => {
+                    return Err(anyhow!(
+                        "unsupported value type in filter for key '{key}': {val}"
+                    ))
+                }
             };
             conds.push(cond);
         }
         Ok(Filter::must(conds))
+    }
+
+    /// The clauses of an `$and`/`$or` operator, each as a nested filter.
+    fn sub_filters(op: &str, value: &serde_json::Value) -> Result<Vec<Condition>> {
+        let clauses = value
+            .as_array()
+            .ok_or_else(|| anyhow!("{op} value must be an array"))?;
+        let mut conditions = Vec::with_capacity(clauses.len());
+        for clause in clauses {
+            let clause_obj = clause
+                .as_object()
+                .ok_or_else(|| anyhow!("{op} clause must be an object"))?;
+            conditions.push(Condition::from(Self::build_filter_map(clause_obj)?));
+        }
+        Ok(conditions)
     }
 }
 
@@ -608,6 +619,24 @@ impl QdrantService {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn take_document_text_prefers_legacy_key_then_content_then_code() {
+        let mut legacy = json!({"document": "old", "content": "new"});
+        assert_eq!(take_document_text(&mut legacy), "old");
+        assert!(legacy.get("document").is_none());
+        assert_eq!(legacy["content"], "new");
+
+        let mut doc = json!({"content": "text", "file_name": "a.md"});
+        assert_eq!(take_document_text(&mut doc), "text");
+        assert_eq!(doc["content"], "text");
+
+        let mut code = json!({"code": "fn main() {}"});
+        assert_eq!(take_document_text(&mut code), "fn main() {}");
+
+        let mut empty = json!({"file_name": "a.md"});
+        assert_eq!(take_document_text(&mut empty), "");
+    }
 
     #[test]
     fn build_filter_plain_equality() {

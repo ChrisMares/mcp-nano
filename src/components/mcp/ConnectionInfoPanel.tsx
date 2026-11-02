@@ -32,10 +32,10 @@ const ConnectionInfoPanel: React.FC<ConnectionInfoPanelProps> = ({ info }) => {
   };
 
   const snippetSections = [
-    { field: "claude_desktop", label: "Claude Desktop Config", snippet: info.config_snippets.claude_desktop as object | string },
-    { field: "opencode", label: "OpenCode Config", snippet: info.config_snippets.opencode as object | string },
-    { field: "vscode", label: "VS Code Config", snippet: info.config_snippets.vscode as object | string },
-    { field: "codex", label: "OpenAI Codex Config (TOML)", snippet: info.config_snippets.codex as object | string },
+    { field: "claude_desktop", label: "Claude Desktop Config", text: JSON.stringify(info.config_snippets.claude_desktop, null, 2) },
+    { field: "opencode", label: "OpenCode Config", text: JSON.stringify(info.config_snippets.opencode, null, 2) },
+    { field: "vscode", label: "VS Code Config", text: JSON.stringify(info.config_snippets.vscode, null, 2) },
+    { field: "codex", label: "OpenAI Codex Config (TOML)", text: info.config_snippets.codex },
   ];
 
   return (
@@ -48,18 +48,15 @@ const ConnectionInfoPanel: React.FC<ConnectionInfoPanelProps> = ({ info }) => {
         </div>
       </div>
 
-      {snippetSections.map(({ field, label, snippet }) => {
-        const text = typeof snippet === "string" ? snippet : JSON.stringify(snippet, null, 2);
-        return (
-          <div key={field}>
-            <div className="flex items-center justify-between mb-1">
-              <label className={fieldLabel}>{label}</label>
-              <CopyButton field={field} text={text} copiedField={copiedField} onCopy={handleCopy} />
-            </div>
-            <pre className={`${codeBlock} text-xs overflow-x-auto`}>{text}</pre>
+      {snippetSections.map(({ field, label, text }) => (
+        <div key={field}>
+          <div className="flex items-center justify-between mb-1">
+            <label className={fieldLabel}>{label}</label>
+            <CopyButton field={field} text={text} copiedField={copiedField} onCopy={handleCopy} />
           </div>
-        );
-      })}
+          <pre className={`${codeBlock} text-xs overflow-x-auto`}>{text}</pre>
+        </div>
+      ))}
     </div>
   );
 };

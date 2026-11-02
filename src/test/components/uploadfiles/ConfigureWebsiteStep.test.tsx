@@ -6,6 +6,7 @@ const defaults = {
   websiteUrl: '',
   depth: 1,
   sameDomainOnly: true,
+  renderJavascript: false,
   isCrawling: false,
   onUrlChange: vi.fn(),
   onDepthChange: vi.fn(),

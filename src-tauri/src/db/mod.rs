@@ -83,17 +83,55 @@ fn backup_existing_database(path: &Path) -> Result<(), String> {
         }
     }
 
-    info!("SQLite migration backup created at {}", backup_path.display());
+    info!(
+        "SQLite migration backup created at {}",
+        backup_path.display()
+    );
     Ok(())
 }
 
+/// Open the SQLite database, back it up first if migrations are about to
+/// change it, apply migrations, and register [`DbState`].
 pub async fn init(app: AppHandle) -> Result<(), String> {
     let path = db_path(&app)?;
-    backup_existing_database(&path)?;
+    if has_pending_migrations(&path).await {
+        backup_existing_database(&path)?;
+    }
     let pool = connect(&path).await?;
     app.manage(DbState { pool });
     info!("SQLite initialized at {}", path.display());
     Ok(())
+}
+
+/// True when an existing database file is missing at least one migration.
+/// Any error reading the migration table is treated as "pending" so the
+/// backup is taken whenever in doubt. A missing file needs no backup.
+async fn has_pending_migrations(path: &Path) -> bool {
+    if !path.exists() {
+        return false;
+    }
+    let options = SqliteConnectOptions::new().filename(path);
+    let Ok(pool) = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+    else {
+        return true;
+    };
+    let applied: Result<Vec<i64>, sqlx::Error> =
+        sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE success = 1")
+            .fetch_all(&pool)
+            .await;
+    pool.close().await;
+    let Ok(applied) = applied else {
+        return true;
+    };
+    for migration in sqlx::migrate!("./migrations").iter() {
+        if !applied.contains(&migration.version) {
+            return true;
+        }
+    }
+    false
 }
 
 async fn connect(path: &PathBuf) -> Result<SqlitePool, String> {
@@ -120,6 +158,29 @@ async fn connect(path: &PathBuf) -> Result<SqlitePool, String> {
 mod tests {
     use super::*;
     use sqlx::Row;
+
+    #[tokio::test]
+    async fn pending_migrations_detected_only_before_migrating() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("app.db");
+        assert!(
+            !has_pending_migrations(&path).await,
+            "missing file needs no backup"
+        );
+
+        std::fs::write(&path, b"").expect("create empty db");
+        assert!(
+            has_pending_migrations(&path).await,
+            "unmigrated db is pending"
+        );
+
+        let pool = connect(&path).await.expect("connect and migrate");
+        pool.close().await;
+        assert!(
+            !has_pending_migrations(&path).await,
+            "fully migrated db is not pending"
+        );
+    }
 
     #[tokio::test]
     async fn connect_enables_wal() {
@@ -188,7 +249,10 @@ mod tests {
             ("mcp_servers", "PRAGMA table_info(mcp_servers)"),
             ("tool_definitions", "PRAGMA table_info(tool_definitions)"),
             ("tool_code_search", "PRAGMA table_info(tool_code_search)"),
-            ("tool_document_search", "PRAGMA table_info(tool_document_search)"),
+            (
+                "tool_document_search",
+                "PRAGMA table_info(tool_document_search)",
+            ),
         ] {
             let columns: Vec<String> = sqlx::query(query)
                 .fetch_all(&pool)

@@ -75,6 +75,7 @@ describe('mcp type helpers', () => {
         active: true,
         created_at: '2024-01-01',
         updated_at: '2024-01-01',
+        max_chunk_limit: null,
         code_search_scopes: [
           { id: 'cs1', tool_definition_id: 't1', collection: 'codebase', repo_names: ['repo-a', 'repo-b'] },
         ],
@@ -96,6 +97,7 @@ describe('mcp type helpers', () => {
         id: 't1', mcp_server_id: 's1', name: 'tool',
         description: null, active: true, created_at: '', updated_at: '',
         code_search_scopes: [], document_search_scopes: [],
+      max_chunk_limit: null,
       }
       expect(toolToFormData(tool).description).toBe('')
     })
@@ -103,7 +105,7 @@ describe('mcp type helpers', () => {
     it('splits website group_ids into selectedWebsites when provided website list', () => {
       const tool: ToolDefinition = {
         id: 't2', mcp_server_id: 's1', name: 'mixed',
-        description: '', active: true, created_at: '', updated_at: '',
+        description: '', active: true, created_at: '', updated_at: '', max_chunk_limit: null,
         code_search_scopes: [],
         document_search_scopes: [
           { id: 'ds1', tool_definition_id: 't2', collection: 'general', group_ids: ['doc-group', 'docs.example.com'] },

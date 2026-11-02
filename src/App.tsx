@@ -1,3 +1,4 @@
+/** Root component: global providers and the route table. */
 import {
   BrowserRouter as Router,
   Routes,
@@ -6,6 +7,7 @@ import {
 } from "react-router-dom";
 import { HelmetProvider } from "react-helmet-async";
 import { ThemeProvider } from "./contexts/ThemeContext";
+import { BackendStatusProvider } from "./contexts/BackendStatusContext";
 import AppLayout from "./components/layout/AppLayout";
 import UploadFiles from "./pages/UploadFiles";
 import DataManagement from "./pages/DataManagement";
@@ -16,25 +18,28 @@ import McpConnect from "./pages/McpConnect";
 import Dashboard from "./pages/Dashboard";
 import Settings from "./pages/Settings";
 
+/** Application shell with theme, backend status, and routing. */
 function App() {
   return (
     <HelmetProvider>
       <Router>
         <ThemeProvider>
-          <Routes>
-            <Route element={<AppLayout />}>
-              <Route path="/" element={<Navigate to="/dashboard" replace />} />
-              <Route path="/dashboard" element={<Dashboard />} />
-              <Route path="/settings" element={<Settings />} />
-              <Route path="/embed/upload" element={<UploadFiles />} />
-              <Route path="/embed/data" element={<DataManagement />} />
-              <Route path="/query/fetch" element={<FetchContext />} />
-              <Route path="/mcp/create" element={<McpCreate />} />
-              <Route path="/mcp/manage" element={<McpManage />} />
-              <Route path="/mcp/connect" element={<McpConnect />} />
-            </Route>
-            <Route path="*" element={<Navigate to="/" replace />} />
-          </Routes>
+          <BackendStatusProvider>
+            <Routes>
+              <Route element={<AppLayout />}>
+                <Route path="/" element={<Navigate to="/dashboard" replace />} />
+                <Route path="/dashboard" element={<Dashboard />} />
+                <Route path="/settings" element={<Settings />} />
+                <Route path="/embed/upload" element={<UploadFiles />} />
+                <Route path="/embed/data" element={<DataManagement />} />
+                <Route path="/query/fetch" element={<FetchContext />} />
+                <Route path="/mcp/create" element={<McpCreate />} />
+                <Route path="/mcp/manage" element={<McpManage />} />
+                <Route path="/mcp/connect" element={<McpConnect />} />
+              </Route>
+              <Route path="*" element={<Navigate to="/" replace />} />
+            </Routes>
+          </BackendStatusProvider>
         </ThemeProvider>
       </Router>
     </HelmetProvider>

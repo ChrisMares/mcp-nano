@@ -32,8 +32,8 @@ pub fn models_dir() -> PathBuf {
 /// Locate the bundled qdrant binary for the current target triple.
 /// Returns `None` if the binary isn't present (skips the test).
 pub fn qdrant_binary() -> Option<PathBuf> {
-    let bin = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("binaries/qdrant-x86_64-unknown-linux-gnu");
+    let bin =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("binaries/qdrant-x86_64-unknown-linux-gnu");
     if bin.exists() {
         Some(bin)
     } else {
@@ -103,7 +103,10 @@ pub async fn open_sqlite_pool(dir: &Path) -> SqlitePool {
         .connect_with(options)
         .await
         .expect("connect pool");
-    sqlx::migrate!("./migrations").run(&pool).await.expect("migrate");
+    sqlx::migrate!("./migrations")
+        .run(&pool)
+        .await
+        .expect("migrate");
     pool
 }
 
@@ -120,9 +123,7 @@ pub fn load_embedders() -> Option<Arc<EmbedderState>> {
         tracing::warn!("skipping: minilm-l6-v2 not downloaded; run scripts/download-models.sh");
         return None;
     }
-    Some(Arc::new(
-        EmbedderState::load(&dir).expect("load embedders"),
-    ))
+    Some(Arc::new(EmbedderState::load(&dir).expect("load embedders")))
 }
 
 /// Skip-safe dense embedder loader. Returns `None` if arctic-embed-xs

@@ -1,7 +1,6 @@
 import { describe, it, expect, vi } from 'vitest'
 import { render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import React from 'react'
 import ServerSelectStep from '@/components/mcp/ServerSelectStep'
 
 vi.mock('@/components/ui/CustomSelect', () => ({
@@ -14,8 +13,8 @@ vi.mock('@/components/ui/CustomSelect', () => ({
 }))
 
 const servers = [
-  { id: 'srv-1', name: 'Alpha', active: true, created_at: '', updated_at: '' },
-  { id: 'srv-2', name: 'Beta', active: true, created_at: '', updated_at: '' },
+  { id: 'srv-1', name: 'Alpha', description: null, active: true, created_at: null, updated_at: null },
+  { id: 'srv-2', name: 'Beta', description: null, active: true, created_at: null, updated_at: null },
 ]
 
 const baseProps = {

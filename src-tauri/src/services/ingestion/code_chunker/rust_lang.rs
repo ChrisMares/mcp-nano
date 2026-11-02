@@ -4,29 +4,26 @@
 //! `struct_item`, `enum_item`, and `trait_item`. Enclosing `impl` types
 //! and `mod` names become `class_name` and `namespace` respectively.
 
-use std::path::Path;
-
 use tree_sitter::Node;
 
-use super::helpers::{generate_chunk_id, make_remainder_chunk, node_text, walk_preorder};
+use super::helpers::{
+    chunks_with_remainder, collect_dependencies, field_text, member_chunk, nearest_ancestor_name,
+    node_text, normalize_type_text,
+};
 use crate::services::ingestion::types::{CodeChunk, CodeChunkKind, Parameter, RustFields};
 
 const FUNCTION_NODE_TYPES: &[&str] = &["function_item"];
 const TYPE_NODE_TYPES: &[&str] = &["struct_item", "enum_item", "trait_item"];
 
 pub fn extract_dependencies<'a>(root: Node<'a>, source: &[u8]) -> Vec<String> {
-    let mut deps: Vec<String> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    walk_preorder(root, |node| {
-        let kind = node.kind();
-        if kind == "use_declaration" || kind == "extern_crate_declaration" {
+    collect_dependencies(root, |node, deps| {
+        if matches!(node.kind(), "use_declaration" | "extern_crate_declaration") {
             let dep = normalize_rust_dependency(&node_text(&node, source));
-            if !dep.is_empty() && seen.insert(dep.clone()) {
+            if !dep.is_empty() {
                 deps.push(dep);
             }
         }
-    });
-    deps
+    })
 }
 
 fn normalize_rust_dependency(text: &str) -> String {
@@ -48,7 +45,9 @@ fn normalize_rust_dependency(text: &str) -> String {
 
 fn extract_parameters<'a>(parameters_node: Option<&Node<'a>>, source: &[u8]) -> Vec<Parameter> {
     let mut params = Vec::new();
-    let Some(node) = parameters_node else { return params };
+    let Some(node) = parameters_node else {
+        return params;
+    };
     let mut cursor = node.walk();
     for param in node.named_children(&mut cursor) {
         if param.kind() == "self_parameter" {
@@ -76,14 +75,6 @@ fn extract_parameters<'a>(parameters_node: Option<&Node<'a>>, source: &[u8]) -> 
         }
     }
     params
-}
-
-fn normalize_type_text(text: &str) -> String {
-    let mut s = text.trim().to_string();
-    if let Some(stripped) = s.strip_prefix(':') {
-        s = stripped.trim().to_string();
-    }
-    s
 }
 
 fn get_return_type<'a>(node: &Node<'a>, source: &[u8]) -> Option<String> {
@@ -117,62 +108,12 @@ fn find_enclosing_impl_type<'a>(node: &Node<'a>, source: &[u8]) -> Option<String
 }
 
 fn find_nearest_module<'a>(node: &Node<'a>, source: &[u8]) -> Option<String> {
-    let mut current = node.parent();
-    while let Some(parent) = current {
-        if parent.kind() == "mod_item" || parent.kind() == "mod_declaration" {
-            if let Some(name) = parent.child_by_field_name("name") {
-                return Some(node_text(&name, source));
-            }
-            let mut cursor = parent.walk();
-            for child in parent.named_children(&mut cursor) {
-                if child.kind() == "identifier" || child.kind() == "type_identifier" {
-                    return Some(node_text(&child, source));
-                }
-            }
-        }
-        current = parent.parent();
-    }
-    None
-}
-
-fn make_chunk(
-    file_path: &str,
-    function_name: Option<String>,
-    class_name: Option<String>,
-    parameters: Vec<Parameter>,
-    return_type: Option<String>,
-    namespace: Option<String>,
-    code: String,
-    chunk_type: &str,
-    dependencies: &[String],
-) -> CodeChunk {
-    let id = generate_chunk_id(
-        file_path,
-        &function_name
-            .clone()
-            .or(class_name.clone())
-            .unwrap_or("Unknown".to_string()),
-    );
-    CodeChunk {
-        id,
-        repo_name: String::new(),
-        file_name: Path::new(file_path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(file_path)
-            .to_string(),
-        code,
-        r#type: chunk_type.to_string(),
-        dependencies: dependencies.to_vec(),
-        created_at: crate::services::ingestion::types::now_iso(),
-        kind: CodeChunkKind::Rust(RustFields {
-            function_name,
-            class_name,
-            parameters,
-            return_type,
-            namespace,
-        }),
-    }
+    nearest_ancestor_name(
+        node,
+        source,
+        &["mod_item", "mod_declaration"],
+        &["identifier", "type_identifier"],
+    )
 }
 
 pub fn extract_chunks<'a>(
@@ -181,13 +122,9 @@ pub fn extract_chunks<'a>(
     file_path: &str,
     dependencies: &[String],
 ) -> Vec<CodeChunk> {
-    let mut chunks = Vec::new();
-    let mut spans: Vec<(usize, usize)> = Vec::new();
-    extract_impl(&node, source, file_path, dependencies, &mut chunks, &mut spans);
-    if let Some(r) = make_remainder_chunk(source, &spans, file_path, dependencies) {
-        chunks.push(r);
-    }
-    chunks
+    chunks_with_remainder(source, file_path, dependencies, |chunks, spans| {
+        extract_impl(&node, source, file_path, dependencies, chunks, spans)
+    })
 }
 
 fn extract_impl<'a>(
@@ -198,46 +135,31 @@ fn extract_impl<'a>(
     chunks: &mut Vec<CodeChunk>,
     spans: &mut Vec<(usize, usize)>,
 ) {
-    if FUNCTION_NODE_TYPES.contains(&node.kind()) {
-        let name_node = node.child_by_field_name("name");
-        let function_name = name_node.map(|n| node_text(&n, source));
-        let parameters_node = node.child_by_field_name("parameters");
-        let parameters = extract_parameters(parameters_node.as_ref(), source);
-        let return_type = get_return_type(node, source);
-        let class_name = find_enclosing_impl_type(node, source);
-        let namespace = find_nearest_module(node, source);
-        let code =
-            node_text(&node, source);
-        chunks.push(make_chunk(
+    let is_function = FUNCTION_NODE_TYPES.contains(&node.kind());
+    if is_function || TYPE_NODE_TYPES.contains(&node.kind()) {
+        let fields = if is_function {
+            let parameters_node = node.child_by_field_name("parameters");
+            RustFields {
+                function_name: field_text(node, "name", source),
+                class_name: find_enclosing_impl_type(node, source),
+                parameters: extract_parameters(parameters_node.as_ref(), source),
+                return_type: get_return_type(node, source),
+                namespace: find_nearest_module(node, source),
+            }
+        } else {
+            RustFields {
+                class_name: field_text(node, "name", source),
+                namespace: find_nearest_module(node, source),
+                ..Default::default()
+            }
+        };
+        chunks.push(member_chunk(
             file_path,
-            function_name,
-            class_name,
-            parameters,
-            return_type,
-            namespace,
-            code,
+            fields,
+            node_text(node, source),
             node.kind(),
             deps,
-        ));
-        spans.push((node.start_byte(), node.end_byte()));
-    }
-
-    if TYPE_NODE_TYPES.contains(&node.kind()) {
-        let name_node = node.child_by_field_name("name");
-        let type_name = name_node.map(|n| node_text(&n, source));
-        let namespace = find_nearest_module(node, source);
-        let code =
-            node_text(&node, source);
-        chunks.push(make_chunk(
-            file_path,
-            None,
-            type_name,
-            Vec::new(),
-            None,
-            namespace,
-            code,
-            node.kind(),
-            deps,
+            CodeChunkKind::Rust,
         ));
         spans.push((node.start_byte(), node.end_byte()));
     }

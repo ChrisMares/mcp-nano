@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Clone, Serialize)]
 pub struct RagResult {
     pub id: String,
     pub document: String,

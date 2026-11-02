@@ -4,49 +4,34 @@
 //! chunk. Includes are normalized into the dependency list (angle-bracket
 //! and quote forms both supported).
 
-use std::path::Path;
-
 use tree_sitter::Node;
 
-use super::helpers::{generate_chunk_id, make_remainder_chunk, node_text, walk_preorder};
+use super::helpers::{chunks_with_remainder, collect_dependencies, new_chunk, node_text};
 use crate::services::ingestion::types::{CFields, CodeChunk, CodeChunkKind, Parameter};
 
 const FUNCTION_NODE_TYPES: &[&str] = &["function_definition"];
 
 /// Shared dependency extractor for C and C++ (both scan `preproc_include`).
 pub fn extract_dependencies<'a>(root: Node<'a>, source: &[u8]) -> Vec<String> {
-    let mut deps: Vec<String> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    walk_preorder(root, |node| {
+    collect_dependencies(root, |node, deps| {
         if node.kind() == "preproc_include" {
-            if let Some(dep) = extract_include_target(&node, source) {
-                if seen.insert(dep.clone()) {
-                    deps.push(dep);
-                }
-            }
+            deps.push(extract_include_target(&node, source));
         }
-    });
-    deps
+    })
 }
 
-/// Same as `extract_dependencies` — re-exported under a clearer name for
-/// the C++ chunker to reuse.
-pub(super) fn extract_dependencies_same<'a>(root: Node<'a>, source: &[u8]) -> Vec<String> {
-    extract_dependencies(root, source)
-}
-
-fn extract_include_target<'a>(node: &Node<'a>, source: &[u8]) -> Option<String> {
+fn extract_include_target<'a>(node: &Node<'a>, source: &[u8]) -> String {
     if let Some(pn) = node
         .child_by_field_name("path")
         .or_else(|| node.child_by_field_name("name"))
     {
-        return Some(normalize_include_target(&node_text(&pn, source)));
+        return normalize_include_target(&node_text(&pn, source));
     }
     let raw = node_text(node, source);
     if let Some(idx) = raw.find("#include") {
-        return Some(normalize_include_target(&raw[idx + "#include".len()..]));
+        return normalize_include_target(&raw[idx + "#include".len()..]);
     }
-    Some(normalize_include_target(&raw))
+    normalize_include_target(&raw)
 }
 
 fn normalize_include_target(value: &str) -> String {
@@ -64,14 +49,10 @@ fn normalize_include_target(value: &str) -> String {
     cleaned.to_string()
 }
 
-pub(super) fn extract_declarator_name_pub<'a>(
+pub(super) fn extract_declarator_name<'a>(
     node: Option<&Node<'a>>,
     source: &[u8],
 ) -> Option<String> {
-    extract_declarator_name(node, source)
-}
-
-fn extract_declarator_name<'a>(node: Option<&Node<'a>>, source: &[u8]) -> Option<String> {
     let node = node?;
     let mut name: Option<String> = None;
     if matches!(
@@ -120,11 +101,7 @@ fn extract_function_name_from_declarator<'a>(
     }
 }
 
-pub(super) fn find_parameters_node_pub<'a>(node: Option<&Node<'a>>) -> Option<Node<'a>> {
-    find_parameters_node(node)
-}
-
-fn find_parameters_node<'a>(node: Option<&Node<'a>>) -> Option<Node<'a>> {
+pub(super) fn find_parameters_node<'a>(node: Option<&Node<'a>>) -> Option<Node<'a>> {
     let node = node?;
     if let Some(pn) = node.child_by_field_name("parameters") {
         return Some(pn);
@@ -141,19 +118,14 @@ fn find_parameters_node<'a>(node: Option<&Node<'a>>) -> Option<Node<'a>> {
     None
 }
 
-pub(super) fn extract_parameters_pub<'a>(
-    parameters_node: Option<&Node<'a>>,
-    source: &[u8],
-) -> Vec<Parameter> {
-    extract_parameters(parameters_node, source)
-}
-
 pub(super) fn extract_parameters<'a>(
     parameters_node: Option<&Node<'a>>,
     source: &[u8],
 ) -> Vec<Parameter> {
     let mut parameters = Vec::new();
-    let Some(node) = parameters_node else { return parameters };
+    let Some(node) = parameters_node else {
+        return parameters;
+    };
     let mut cursor = node.walk();
     for param in node.named_children(&mut cursor) {
         if param.kind() == "parameter_declaration" {
@@ -197,11 +169,7 @@ fn extract_param_type_from_text(param_text: &str, name: Option<&str>) -> String 
     param_text.to_string()
 }
 
-pub(super) fn extract_return_type_pub<'a>(node: &Node<'a>, source: &[u8]) -> Option<String> {
-    extract_return_type(node, source)
-}
-
-fn extract_return_type<'a>(node: &Node<'a>, source: &[u8]) -> Option<String> {
+pub(super) fn extract_return_type<'a>(node: &Node<'a>, source: &[u8]) -> Option<String> {
     if let Some(tn) = node.child_by_field_name("type") {
         return Some(node_text(&tn, source));
     }
@@ -229,53 +197,15 @@ fn extract_return_type<'a>(node: &Node<'a>, source: &[u8]) -> Option<String> {
     None
 }
 
-fn make_chunk(
-    file_path: &str,
-    function_name: Option<String>,
-    parameters: Vec<Parameter>,
-    return_type: Option<String>,
-    code: String,
-    chunk_type: &str,
-    deps: &[String],
-) -> CodeChunk {
-    let id = generate_chunk_id(
-        file_path,
-        &function_name.clone().unwrap_or("Unknown".to_string()),
-    );
-    CodeChunk {
-        id,
-        repo_name: String::new(),
-        file_name: Path::new(file_path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(file_path)
-            .to_string(),
-        code,
-        r#type: chunk_type.to_string(),
-        dependencies: deps.to_vec(),
-        created_at: crate::services::ingestion::types::now_iso(),
-        kind: CodeChunkKind::C(CFields {
-            function_name,
-            parameters,
-            return_type,
-            namespace: None,
-        }),
-    }
-}
-
 pub fn extract_chunks<'a>(
     node: Node<'a>,
     source: &[u8],
     file_path: &str,
     deps: &[String],
 ) -> Vec<CodeChunk> {
-    let mut chunks = Vec::new();
-    let mut spans: Vec<(usize, usize)> = Vec::new();
-    extract_impl(&node, source, file_path, deps, &mut chunks, &mut spans);
-    if let Some(r) = make_remainder_chunk(source, &spans, file_path, deps) {
-        chunks.push(r);
-    }
-    chunks
+    chunks_with_remainder(source, file_path, deps, |chunks, spans| {
+        extract_impl(&node, source, file_path, deps, chunks, spans)
+    })
 }
 
 fn extract_impl<'a>(
@@ -288,23 +218,27 @@ fn extract_impl<'a>(
 ) {
     if FUNCTION_NODE_TYPES.contains(&node.kind()) {
         let declarator = node.child_by_field_name("declarator");
-        let mut function_name = extract_function_name_from_declarator(declarator.as_ref(), source);
-        if function_name.is_none() {
-            function_name = extract_declarator_name(declarator.as_ref(), source);
-        }
+        let function_name = extract_function_name_from_declarator(declarator.as_ref(), source)
+            .or_else(|| extract_declarator_name(declarator.as_ref(), source));
         let parameters_node = find_parameters_node(declarator.as_ref());
-        let parameters = extract_parameters(parameters_node.as_ref(), source);
-        let return_type = extract_return_type(node, source);
-        let code =
-            node_text(&node, source);
-        chunks.push(make_chunk(
-            file_path,
+        let fields = CFields {
+            parameters: extract_parameters(parameters_node.as_ref(), source),
+            return_type: extract_return_type(node, source),
+            namespace: None,
             function_name,
-            parameters,
-            return_type,
-            code,
+        };
+        let identifier = fields
+            .function_name
+            .as_deref()
+            .unwrap_or("Unknown")
+            .to_string();
+        chunks.push(new_chunk(
+            file_path,
+            &identifier,
+            node_text(node, source),
             node.kind(),
             deps,
+            CodeChunkKind::C(fields),
         ));
         spans.push((node.start_byte(), node.end_byte()));
     }

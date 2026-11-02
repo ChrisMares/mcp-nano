@@ -15,6 +15,7 @@ fn make_rag_response(n: usize) -> RagResponse {
         total_count: count,
         results,
         user_query: "test query".to_string(),
+        ..Default::default()
     }
 }
 
@@ -70,7 +71,10 @@ fn show_documents_false_strips_document_field() {
         r.document.clear();
     }
     for r in &resp.results {
-        assert!(r.document.is_empty(), "document should be empty when stripped");
+        assert!(
+            r.document.is_empty(),
+            "document should be empty when stripped"
+        );
         assert!(!r.id.is_empty(), "id should still be present");
     }
 }
@@ -87,4 +91,17 @@ fn response_serializes_to_expected_json_shape() {
     assert!(result.get("document").unwrap().is_string());
     assert!(result.get("metadata").unwrap().is_object());
     assert!(result.get("score").unwrap().is_number());
+}
+
+#[test]
+fn response_json_ends_with_user_query_and_omits_empty_related() {
+    let mut resp = make_rag_response(1);
+    let text = serde_json::to_string(&resp).unwrap();
+    assert!(!text.contains("\"related\""));
+    assert!(text.ends_with(r#""user_query":"test query"}"#));
+
+    resp.related.push(RagResult::default());
+    let text = serde_json::to_string(&resp).unwrap();
+    assert!(text.contains("\"related\""));
+    assert!(text.ends_with(r#""user_query":"test query"}"#));
 }

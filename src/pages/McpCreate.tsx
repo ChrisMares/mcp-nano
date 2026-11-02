@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
 import { useScopeOptions } from "@/hooks/useScopeOptions";
 import { useToolForm } from "@/hooks/useToolForm";
+import { errorMessage } from "@/lib/utils";
 import { getMcpServers, createMcpServer, createMcpTool } from "@/utils/apicalls";
 import PageHead from "@/components/shared/PageHead";
 import StepIndicator from "@/components/shared/StepIndicator";
@@ -95,7 +96,7 @@ const McpCreate: React.FC = () => {
       await createMcpTool(serverId, toolFormToPayload(form));
       navigate("/mcp/manage");
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : typeof err === "string" ? err : "Failed to save");
+      setError(errorMessage(err, "Failed to save"));
     } finally {
       setSaving(false);
     }

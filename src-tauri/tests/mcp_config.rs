@@ -89,7 +89,11 @@ async fn server_and_tool_crud() {
     mcp_config::delete_server(&pool, &server_id)
         .await
         .expect("delete");
-    assert!(mcp_config::list_servers(&pool).await.unwrap().servers.is_empty());
+    assert!(mcp_config::list_servers(&pool)
+        .await
+        .unwrap()
+        .servers
+        .is_empty());
 }
 
 #[tokio::test]

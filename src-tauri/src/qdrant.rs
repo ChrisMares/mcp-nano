@@ -12,6 +12,7 @@ use std::{
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
+use crate::models::response::{BackendStatusResponse, ModelStatusResponse};
 use qdrant_client::qdrant::{
     vectors_config, CreateCollectionBuilder, CreateFieldIndexCollectionBuilder, Distance,
     FieldType, KeywordIndexParamsBuilder, Modifier, PayloadSchemaType, SparseIndexConfig,
@@ -20,7 +21,6 @@ use qdrant_client::qdrant::{
 use qdrant_client::Qdrant;
 use tauri::{AppHandle, Emitter, Manager};
 use tracing::{error, info, warn};
-use crate::models::response::ModelStatusResponse;
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -37,7 +37,7 @@ fn hide_console(_command: &mut Command) {}
 pub struct QdrantChild(pub Mutex<Option<Child>>);
 
 /// Frontend-facing readiness (managed state + `backend_status` events).
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, Default)]
 pub struct BackendStatus {
     pub qdrant_ready: bool,
     pub qdrant_error: Option<String>,
@@ -48,22 +48,6 @@ pub struct BackendStatus {
     pub embedding_device: Option<String>,
     pub model_statuses: Vec<ModelStatusResponse>,
     pub worker_ready: bool,
-}
-
-impl Default for BackendStatus {
-    fn default() -> Self {
-        Self {
-            qdrant_ready: false,
-            qdrant_error: None,
-            http_port: None,
-            grpc_port: None,
-            db_ready: false,
-            embedders_ready: false,
-            embedding_device: None,
-            model_statuses: Vec::new(),
-            worker_ready: false,
-        }
-    }
 }
 
 pub struct BackendStatusState(pub RwLock<BackendStatus>);
@@ -77,8 +61,14 @@ pub const PREFETCH_OVERFETCH: u64 = 4;
 const COLLECTIONS: [&str; 2] = ["codebase", "general"];
 
 /// Payload indexes. `is_tenant` marks primary partition keys for filtered HNSW.
-const PAYLOAD_INDEXES: [(&str, &str, FieldType, bool); 10] = [
+const PAYLOAD_INDEXES: [(&str, &str, FieldType, bool); 16] = [
     ("codebase", "repo_name", FieldType::Keyword, true),
+    ("codebase", "path", FieldType::Keyword, false),
+    ("codebase", "symbol", FieldType::Keyword, false),
+    ("codebase", "qualified_symbol", FieldType::Keyword, false),
+    ("codebase", "calls", FieldType::Keyword, false),
+    ("codebase", "class_name", FieldType::Keyword, false),
+    ("codebase", "interface_name", FieldType::Keyword, false),
     ("codebase", "file_name", FieldType::Keyword, false),
     ("codebase", "created_at", FieldType::Datetime, false),
     ("general", "file_name", FieldType::Keyword, false),
@@ -169,7 +159,10 @@ fn clear_pidfile(app: &AppHandle) {
     }
 }
 
-fn kill_from_pidfile(app: &AppHandle) {
+/// Stop a sidecar left over from a previous run, using the recorded PID.
+/// On Linux the PID is only signalled if it still runs our bundled binary,
+/// so a recycled PID never hits an unrelated process.
+fn kill_from_pidfile(app: &AppHandle, bin: &Path) {
     let Ok(path) = pidfile_path(app) else {
         return;
     };
@@ -180,7 +173,14 @@ fn kill_from_pidfile(app: &AppHandle) {
         let _ = fs::remove_file(&path);
         return;
     };
-    if pid > 1 {
+    #[cfg(target_os = "linux")]
+    let pid_is_ours = pid_runs_binary(pid, bin);
+    #[cfg(not(target_os = "linux"))]
+    let pid_is_ours = {
+        let _ = bin;
+        true
+    };
+    if pid > 1 && pid_is_ours {
         warn!("killing Qdrant from pidfile pid={pid}");
         #[cfg(unix)]
         {
@@ -243,10 +243,10 @@ fn qdrant_binary() -> Result<PathBuf, String> {
 
 pub fn start(app: &AppHandle) -> Result<(u16, u16, Child), String> {
     let storage = storage_path(app)?;
-    kill_from_pidfile(app);
-    kill_orphaned_sidecars();
-
     let bin = qdrant_binary()?;
+    kill_from_pidfile(app, &bin);
+    kill_orphaned_sidecars(&bin);
+
     let snapshots = storage.join("snapshots");
     fs::create_dir_all(&snapshots)
         .map_err(|error| format!("failed to create Qdrant snapshots directory: {error}"))?;
@@ -312,8 +312,8 @@ pub fn start(app: &AppHandle) -> Result<(u16, u16, Child), String> {
                     "Qdrant exited immediately with {status} (attempt {attempt}). Last log lines:\n{tail}"
                 );
                 warn!("{last_err}");
-                kill_from_pidfile(app);
-                kill_orphaned_sidecars();
+                kill_from_pidfile(app, &bin);
+                kill_orphaned_sidecars(&bin);
             }
             Ok(None) => {
                 let watch_pid = pid;
@@ -330,7 +330,10 @@ pub fn start(app: &AppHandle) -> Result<(u16, u16, Child), String> {
                             tasklist
                                 .args(["/FI", &format!("PID eq {watch_pid}"), "/NH"])
                                 .output()
-                                .map(|o| String::from_utf8_lossy(&o.stdout).contains(&watch_pid.to_string()))
+                                .map(|o| {
+                                    String::from_utf8_lossy(&o.stdout)
+                                        .contains(&watch_pid.to_string())
+                                })
                                 .unwrap_or(false)
                         };
                         #[cfg(not(any(unix, windows)))]
@@ -395,44 +398,49 @@ pub fn shutdown(app: &AppHandle) {
     clear_pidfile(app);
 }
 
-#[cfg(unix)]
-fn is_our_qdrant_cmdline(cmd: &str) -> bool {
-    cmd.contains("target/debug/qdrant")
-        || cmd.contains("target/release/qdrant")
-        || cmd.contains("qdrant-x86_64-unknown-linux-gnu")
-        || cmd.contains("qdrant-x86_64-pc-windows-msvc")
-        || cmd.ends_with("\\qdrant.exe")
-        || cmd.ends_with("/qdrant")
+/// True when `pid` is running exactly the executable at `bin`.
+#[cfg(target_os = "linux")]
+fn pid_runs_binary(pid: u32, bin: &Path) -> bool {
+    let Ok(exe) = fs::read_link(format!("/proc/{pid}/exe")) else {
+        return false;
+    };
+    let Ok(bin) = fs::canonicalize(bin) else {
+        return false;
+    };
+    // The kernel appends " (deleted)" when the binary was replaced on disk
+    // (e.g. after a rebuild) while the old process kept running.
+    let exe = exe.to_string_lossy();
+    let exe = exe.strip_suffix(" (deleted)").unwrap_or(&exe);
+    Path::new(exe) == bin
 }
 
-#[cfg(unix)]
-fn list_our_qdrant_pids() -> Vec<i32> {
+/// PIDs of running processes whose executable is our bundled Qdrant binary.
+/// A system-wide or user-installed Qdrant is never matched.
+#[cfg(target_os = "linux")]
+fn list_our_qdrant_pids(bin: &Path) -> Vec<u32> {
     let Ok(entries) = fs::read_dir("/proc") else {
         return Vec::new();
     };
     let mut pids = Vec::new();
     for entry in entries.flatten() {
-        let pid: i32 = match entry.file_name().to_string_lossy().parse() {
+        let pid: u32 = match entry.file_name().to_string_lossy().parse() {
             Ok(p) if p > 1 => p,
             _ => continue,
         };
-        let Ok(cmdline) = fs::read(format!("/proc/{pid}/cmdline")) else {
-            continue;
-        };
-        if is_our_qdrant_cmdline(&String::from_utf8_lossy(&cmdline)) {
+        if pid_runs_binary(pid, bin) {
             pids.push(pid);
         }
     }
     pids
 }
 
-#[cfg(not(unix))]
-fn list_our_qdrant_pids() -> Vec<i32> {
+#[cfg(not(target_os = "linux"))]
+fn list_our_qdrant_pids(_bin: &Path) -> Vec<u32> {
     Vec::new()
 }
 
-fn kill_orphaned_sidecars() {
-    let pids = list_our_qdrant_pids();
+fn kill_orphaned_sidecars(bin: &Path) {
+    let pids = list_our_qdrant_pids(bin);
     if pids.is_empty() {
         return;
     }
@@ -443,19 +451,19 @@ fn kill_orphaned_sidecars() {
             .status();
     }
     for _ in 0..20 {
-        if list_our_qdrant_pids().is_empty() {
+        if list_our_qdrant_pids(bin).is_empty() {
             break;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    for pid in list_our_qdrant_pids() {
+    for pid in list_our_qdrant_pids(bin) {
         warn!("force-killing Qdrant sidecar pid={pid}");
         let _ = Command::new("kill")
             .args(["-KILL", &pid.to_string()])
             .status();
     }
     for _ in 0..20 {
-        if list_our_qdrant_pids().is_empty() {
+        if list_our_qdrant_pids(bin).is_empty() {
             break;
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -463,13 +471,40 @@ fn kill_orphaned_sidecars() {
     std::thread::sleep(Duration::from_millis(200));
 }
 
+/// Full frontend status: the tracked readiness flags plus on-disk locations.
+/// Used for both the `get_backend_status` command and `backend_status`
+/// events, so both always carry the same shape.
+pub fn status_response(app: &AppHandle, status: &BackendStatus) -> BackendStatusResponse {
+    BackendStatusResponse {
+        qdrant_ready: status.qdrant_ready,
+        qdrant_error: status.qdrant_error.clone(),
+        http_port: status.http_port,
+        grpc_port: status.grpc_port,
+        db_ready: status.db_ready,
+        embedders_ready: status.embedders_ready,
+        embedding_device: status.embedding_device.clone(),
+        model_statuses: status.model_statuses.clone(),
+        qdrant_storage_path: storage_path(app).ok().map(|p| p.display().to_string()),
+        sqlite_path: crate::db::db_path(app)
+            .ok()
+            .map(|p| p.display().to_string()),
+        logs_path: crate::log_directory(app)
+            .ok()
+            .map(|p| p.display().to_string()),
+        logs_size_bytes: crate::log_size_bytes(app),
+        worker_ready: status.worker_ready,
+    }
+}
+
+/// Apply `update` to the shared status and emit the full snapshot as a
+/// `backend_status` event.
 pub fn publish_status(app: &AppHandle, update: impl FnOnce(&mut BackendStatus)) {
     if let Some(state) = app.try_state::<BackendStatusState>() {
         if let Ok(mut guard) = state.0.write() {
             update(&mut guard);
             let snapshot = guard.clone();
             drop(guard);
-            let _ = app.emit("backend_status", snapshot);
+            let _ = app.emit("backend_status", status_response(app, &snapshot));
         }
     }
 }
@@ -550,24 +585,33 @@ pub async fn ensure_collections(client: &Qdrant) -> Result<(), String> {
     for name in COLLECTIONS {
         if existing.iter().any(|collection| collection == name) {
             info!("Collection '{name}' exists.");
-            continue;
+        } else {
+            client
+                .create_collection(hybrid_collection_builder(name, EMBEDDING_DIM))
+                .await
+                .map_err(|error| format!("failed to create collection '{name}': {error}"))?;
+            info!("Created collection '{name}' with dimension {EMBEDDING_DIM} (sparse IDF)");
         }
-
-        client
-            .create_collection(hybrid_collection_builder(name, EMBEDDING_DIM))
-            .await
-            .map_err(|error| format!("failed to create collection '{name}': {error}"))?;
-        info!("Created collection '{name}' with dimension {EMBEDDING_DIM} (sparse IDF)");
+        ensure_payload_indexes(client, name).await?;
     }
 
-    for (collection, field, field_type, is_tenant) in PAYLOAD_INDEXES {
-        let info = client
-            .collection_info(collection)
-            .await
-            .map_err(|error| format!("failed to inspect collection '{collection}': {error}"))?
-            .result
-            .ok_or_else(|| format!("collection '{collection}' returned no metadata"))?;
+    Ok(())
+}
 
+/// Create the [`PAYLOAD_INDEXES`] of `collection` that do not exist yet, and
+/// fail when an existing index has a different type.
+async fn ensure_payload_indexes(client: &Qdrant, collection: &str) -> Result<(), String> {
+    let info = client
+        .collection_info(collection)
+        .await
+        .map_err(|error| format!("failed to inspect collection '{collection}': {error}"))?
+        .result
+        .ok_or_else(|| format!("collection '{collection}' returned no metadata"))?;
+
+    for (index_collection, field, field_type, is_tenant) in PAYLOAD_INDEXES {
+        if index_collection != collection {
+            continue;
+        }
         if let Some(existing) = info.payload_schema.get(field) {
             let expected = payload_schema_type(field_type);
             if existing.data_type != expected as i32 {
@@ -580,17 +624,14 @@ pub async fn ensure_collections(client: &Qdrant) -> Result<(), String> {
             continue;
         }
 
-        let mut builder =
-            CreateFieldIndexCollectionBuilder::new(collection, field, field_type);
+        let mut builder = CreateFieldIndexCollectionBuilder::new(collection, field, field_type);
         if is_tenant && field_type == FieldType::Keyword {
-            builder = builder.field_index_params(
-                KeywordIndexParamsBuilder::default().is_tenant(true),
-            );
+            builder =
+                builder.field_index_params(KeywordIndexParamsBuilder::default().is_tenant(true));
         }
-        client
-            .create_field_index(builder)
-            .await
-            .map_err(|error| format!("failed to create index '{field}' on '{collection}': {error}"))?;
+        client.create_field_index(builder).await.map_err(|error| {
+            format!("failed to create index '{field}' on '{collection}': {error}")
+        })?;
         info!("Created index '{field}' on '{collection}' (tenant={is_tenant})");
     }
 
@@ -628,5 +669,14 @@ mod tests {
         ] {
             assert_eq!(payload_schema_type(field_type), schema_type);
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pid_runs_binary_matches_only_the_exact_executable() {
+        let me = std::process::id();
+        let exe = std::env::current_exe().unwrap();
+        assert!(pid_runs_binary(me, &exe));
+        assert!(!pid_runs_binary(me, Path::new("/usr/bin/qdrant")));
     }
 }

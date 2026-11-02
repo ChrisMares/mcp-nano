@@ -291,28 +291,10 @@ fn init_logging(app: &tauri::AppHandle) {
     prod_logging::init(app);
 }
 
-/// Load configuration from a `.env` file: from the working directory
-/// (searching upward, so `src-tauri/.env` or the repo root work in dev) or,
-/// failing that, from next to the executable (for installed builds).
-/// Variables already set in the real environment always win.
-pub fn load_dotenv() {
-    if dotenvy::dotenv().is_ok() {
-        return;
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let _ = dotenvy::from_path(dir.join(".env"));
-        }
-    }
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    load_dotenv();
     tauri::Builder::default()
-        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_shell::init())
         .setup(|app| {
             init_logging(app.handle());
             if let Some(window) = app.get_webview_window("main") {
@@ -583,35 +565,4 @@ async fn wait_for_embedders(app: &tauri::AppHandle) -> Option<Arc<EmbedderState>
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     None
-}
-
-#[cfg(test)]
-mod tests {
-    /// The `.env` loader must never overwrite variables already present in
-    /// the environment (dotenvy semantics `load_dotenv` relies on).
-    #[test]
-    fn dotenv_file_does_not_override_existing_vars() {
-        let from_file = "MCP_NANO_DOTENV_TEST_FROM_FILE";
-        let overridden = "MCP_NANO_DOTENV_TEST_OVERRIDDEN";
-        std::env::set_var(overridden, "from-env");
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join(".env"),
-            format!("{from_file}=file-value\n{overridden}=file-value\n"),
-        )
-        .unwrap();
-
-        dotenvy::from_path(dir.path().join(".env")).unwrap();
-
-        assert_eq!(std::env::var(from_file).unwrap(), "file-value");
-        assert_eq!(std::env::var(overridden).unwrap(), "from-env");
-        std::env::remove_var(from_file);
-        std::env::remove_var(overridden);
-    }
-
-    #[test]
-    fn dotenv_missing_file_is_not_an_error() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(dotenvy::from_path(dir.path().join(".env")).is_err());
-    }
 }

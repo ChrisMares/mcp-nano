@@ -2,7 +2,7 @@
 //!
 //! Every rule here is a **denylist** so files with unknown or uncommon
 //! extensions are still embedded (a language without a dedicated code chunker
-//! falls back to the generic text splitter). Four independent rule sets are
+//! falls back to the generic text splitter). These independent rule sets are
 //! composed by [`IngestFilter`]:
 //!
 //! * [`is_junk`] — binaries, assets, generated/minified files and build/vendor
@@ -10,6 +10,9 @@
 //! * [`is_oversized_config_file`] — config-family files (`.json`, `.xml`,
 //!   `.yaml`, …) too large to be a hand-written config, i.e. data dumps wearing
 //!   a config extension. Always applied.
+//! * [`is_table_like_file`] — large source files that are mostly numeric
+//!   literals (lookup tables, generated constants). Always applied.
+//! * [`is_qt_translation_file`] — Qt Linguist `.ts` XML files. Always applied.
 //! * [`is_test_path`] — test/spec files and directories (applied only when the
 //!   caller enables it).
 //! * [`is_code_only_ignored`] — data/document/binary types excluded when the
@@ -25,9 +28,9 @@ use std::path::Path;
 
 /// Extensions that are never embedded: binaries, media, fonts, archives, locks.
 const JUNK_EXTS: &[&str] = &[
-    "map", "woff", "woff2", "ttf", "otf", "eot", "ico", "svg", "gif", "webp", "bmp", "mp3", "mp4",
-    "wav", "zip", "gz", "tar", "7z", "rar", "bin", "exe", "dll", "so", "dylib", "pdb", "lock",
-    "sum", "chm", "chw",
+    "map", "woff", "woff2", "ttf", "otf", "eot", "ico", "svg", "gif", "webp", "bmp", "png", "jpg",
+    "jpeg", "mp3", "mp4", "wav", "zip", "gz", "tar", "7z", "rar", "bin", "exe", "dll", "so",
+    "dylib", "pdb", "lock", "sum", "chm", "chw",
 ];
 
 /// Whole-filename matches that are never embedded.
@@ -77,14 +80,19 @@ fn extension_lower(path: &Path) -> String {
         .to_ascii_lowercase()
 }
 
-fn is_image(path: &Path) -> bool {
-    matches!(
-        path.extension()
-            .and_then(|e| e.to_str())
-            .map(|s| s.to_lowercase())
-            .as_deref(),
-        Some("png") | Some("jpg") | Some("jpeg")
-    )
+fn is_minified(name: &str) -> bool {
+    MINIFIED_SUFFIXES
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
+}
+
+/// Up to `limit` bytes from the start of `path`, `None` when it cannot be read.
+fn read_head(path: &Path, limit: usize) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).ok()?;
+    let mut head = Vec::with_capacity(limit);
+    file.take(limit as u64).read_to_end(&mut head).ok()?;
+    Some(head)
 }
 
 /// True if any `/<segment>/` appears in the (separator-normalized, lowercased)
@@ -105,18 +113,11 @@ fn contains_dir_segment(path: &Path, segments: &[&str]) -> bool {
 /// directories are handled separately by [`is_test_path`], which zip uploads
 /// apply only when `filter_test_files` is enabled.
 pub fn is_junk(path: &Path) -> bool {
-    if is_image(path) {
-        return true;
-    }
     let name = file_name_lower(path);
-    let ext = extension_lower(path);
-    if JUNK_EXTS.contains(&ext.as_str()) {
-        return true;
-    }
-    if MINIFIED_SUFFIXES.iter().any(|suffix| name.ends_with(suffix)) {
-        return true;
-    }
-    if JUNK_FILENAMES.contains(&name.as_str()) {
+    if JUNK_EXTS.contains(&extension_lower(path).as_str())
+        || is_minified(&name)
+        || JUNK_FILENAMES.contains(&name.as_str())
+    {
         return true;
     }
     contains_dir_segment(path, JUNK_DIR_SEGMENTS)
@@ -223,6 +224,7 @@ fn split_name_tokens(stem: &str) -> Vec<String> {
 // ---------------------------------------------------------------------------
 
 /// Lowercase extensions (no dot) excluded by "Code files only".
+#[rustfmt::skip]
 pub const CODE_ONLY_IGNORE_LIST: &[&str] = &[
     // Data / tabular / serialized
     "csv", "tsv", "psv", "jsonl", "ndjson", "json-seq", "parquet", "avro", "orc", "arrow",
@@ -321,14 +323,10 @@ pub const CODE_ONLY_IGNORE_DIRS: &[&str] = &[
 /// binaries / build dirs).
 pub fn is_code_only_ignored(path: &Path) -> bool {
     let name = file_name_lower(path);
-    if MINIFIED_SUFFIXES.iter().any(|suffix| name.ends_with(suffix)) {
-        return true;
-    }
-    if CODE_ONLY_IGNORE_FILENAMES.contains(&name.as_str()) {
-        return true;
-    }
-    let ext = extension_lower(path);
-    if !ext.is_empty() && CODE_ONLY_IGNORE_LIST.contains(&ext.as_str()) {
+    if is_minified(&name)
+        || CODE_ONLY_IGNORE_FILENAMES.contains(&name.as_str())
+        || CODE_ONLY_IGNORE_LIST.contains(&extension_lower(path).as_str())
+    {
         return true;
     }
     contains_dir_segment(path, CODE_ONLY_IGNORE_DIRS)
@@ -364,8 +362,125 @@ pub fn is_oversized_config_file(path: &Path) -> bool {
         return false;
     }
     path.metadata()
-        .map(|m| m.len() > MAX_CONFIG_FILE_BYTES)
-        .unwrap_or(false)
+        .is_ok_and(|m| m.len() > MAX_CONFIG_FILE_BYTES)
+}
+
+// ---------------------------------------------------------------------------
+// Data files: recorded with their line count so search can rank dumps lower.
+// ---------------------------------------------------------------------------
+
+/// Extensions of files that hold data rather than code or prose. Small ones
+/// are configs (`package.json`); large ones are dumps.
+pub const DATA_EXTENSIONS: [&str; 7] = ["json", "xml", "yaml", "yml", "csv", "tsv", "log"];
+
+/// Size of a data file, recorded on its chunks so search can tell a
+/// hand-written config from a dump.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DataFileStats {
+    pub lines: u64,
+    pub bytes: u64,
+}
+
+/// [`DataFileStats`] of a [`DATA_EXTENSIONS`] file, `None` for other files
+/// or when it cannot be read.
+pub fn data_file_stats(path: &Path) -> Option<DataFileStats> {
+    if !DATA_EXTENSIONS.contains(&extension_lower(path).as_str()) {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    let mut lines = bytes.iter().filter(|&&b| b == b'\n').count() as u64;
+    if bytes.last().is_some_and(|&b| b != b'\n') {
+        lines += 1;
+    }
+    Some(DataFileStats {
+        lines,
+        bytes: bytes.len() as u64,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Qt Linguist translations: `.ts` files that are XML, not TypeScript.
+// ---------------------------------------------------------------------------
+
+/// True for a Qt Linguist translation file: a `.ts` file whose content is a
+/// `<TS>` XML document. These hold UI strings in other languages and would
+/// otherwise be parsed as TypeScript.
+pub fn is_qt_translation_file(path: &Path) -> bool {
+    if extension_lower(path) != "ts" {
+        return false;
+    }
+    let Some(head) = read_head(path, 512) else {
+        return false;
+    };
+    let head = String::from_utf8_lossy(&head);
+    head.trim_start().starts_with("<?xml")
+        && (head.contains("<!DOCTYPE TS") || head.contains("<TS "))
+}
+
+// ---------------------------------------------------------------------------
+// Table-like source files: lookup tables and generated constants.
+// ---------------------------------------------------------------------------
+
+/// Source files at or below this size are always kept: a small table is
+/// cheap to embed and often sits next to the code that uses it.
+pub const MAX_TABLE_FILE_BYTES: u64 = 32 * 1024;
+
+/// Bytes read from the start of a file to judge whether it is a table.
+const TABLE_SAMPLE_BYTES: usize = 64 * 1024;
+
+/// Share of identifier-like tokens that must be numeric literals for a file
+/// to count as a table. Measured on OpenCV, FLTK and Chart.js: lookup tables
+/// (charset maps, CRC tables, SPIR-V blobs) score 0.70-1.00, while the
+/// numeric-heavy real code seen there stays at or below 0.60.
+const TABLE_NUMERIC_RATIO: f64 = 0.65;
+
+/// True when `path` is a source file larger than [`MAX_TABLE_FILE_BYTES`]
+/// whose content is mostly numeric literals. Such files produce hundreds of
+/// chunks that are useless as search results. Only files above the size cap
+/// with a code extension are read, so the zip walk stays cheap.
+pub fn is_table_like_file(path: &Path) -> bool {
+    if !crate::services::ingestion::code_chunker::is_code_file(path) {
+        return false;
+    }
+    if !path
+        .metadata()
+        .is_ok_and(|meta| meta.len() > MAX_TABLE_FILE_BYTES)
+    {
+        return false;
+    }
+    let Some(sample) = read_head(path, TABLE_SAMPLE_BYTES) else {
+        return false;
+    };
+    numeric_token_ratio(&String::from_utf8_lossy(&sample)) >= TABLE_NUMERIC_RATIO
+}
+
+/// Share of `[A-Za-z0-9_]+` tokens in `text` that are numeric literals
+/// (`42`, `0x1F`, `10UL`, `1f`). Returns 0 for text without tokens.
+fn numeric_token_ratio(text: &str) -> f64 {
+    let mut tokens = 0usize;
+    let mut numeric = 0usize;
+    for token in text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+        if token.is_empty() {
+            continue;
+        }
+        tokens += 1;
+        if is_numeric_literal(token) {
+            numeric += 1;
+        }
+    }
+    if tokens == 0 {
+        0.0
+    } else {
+        numeric as f64 / tokens as f64
+    }
+}
+
+fn is_numeric_literal(token: &str) -> bool {
+    let body = token.trim_end_matches(['u', 'U', 'l', 'L', 'f', 'F']);
+    if let Some(hex) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+        return !hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit());
+    }
+    !body.is_empty() && body.chars().all(|c| c.is_ascii_digit())
 }
 
 // ---------------------------------------------------------------------------
@@ -398,9 +513,10 @@ impl IngestFilter {
         if is_junk(path) {
             return false;
         }
-        // Unconditional: an oversized config-family file is a data dump
-        // regardless of the "Code files only" toggle.
-        if is_oversized_config_file(path) {
+        if is_oversized_config_file(path)
+            || is_table_like_file(path)
+            || is_qt_translation_file(path)
+        {
             return false;
         }
         if self.code_only && is_code_only_ignored(path) {
@@ -463,7 +579,9 @@ mod tests {
         assert!(is_test_path(Path::new("web/e2e/login.ts")));
         assert!(is_test_path(Path::new(r"repo\test\fixtures\a.js")));
         // Real source outside test directories is kept.
-        assert!(!is_test_path(Path::new("src/services/ingestion_service.rs")));
+        assert!(!is_test_path(Path::new(
+            "src/services/ingestion_service.rs"
+        )));
     }
 
     #[test]
@@ -599,7 +717,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let at_cap = dir.path().join("at-cap.xml");
         write_bytes(&at_cap, MAX_CONFIG_FILE_BYTES);
-        assert!(!is_oversized_config_file(&at_cap), "exactly the cap is kept");
+        assert!(
+            !is_oversized_config_file(&at_cap),
+            "exactly the cap is kept"
+        );
 
         let over_cap = dir.path().join("over-cap.yml");
         write_bytes(&over_cap, MAX_CONFIG_FILE_BYTES + 1);
@@ -631,6 +752,84 @@ mod tests {
             !permissive.allows(&dump, Path::new("crawl-findings/raw/showdetails_2024.json")),
             "oversized config is skipped even with every toggle off"
         );
+    }
+
+    fn write_text(path: &Path, line: &str, min_bytes: u64) {
+        let mut text = String::new();
+        while (text.len() as u64) <= min_bytes {
+            text.push_str(line);
+        }
+        std::fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn large_numeric_table_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = dir.path().join("big5.h");
+        write_text(
+            &table,
+            "  0x4e00, 0x4e01, 0x4e03, 0x4e07, 12UL, 7,\n",
+            MAX_TABLE_FILE_BYTES,
+        );
+        assert!(is_table_like_file(&table));
+        assert!(!IngestFilter::new(false, false).allows(&table, Path::new("big5.h")));
+    }
+
+    #[test]
+    fn small_table_and_large_real_code_are_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let small = dir.path().join("crc.h");
+        std::fs::write(&small, "0x1, 0x2, 0x3, 0x4,\n").unwrap();
+        assert!(!is_table_like_file(&small));
+
+        let code = dir.path().join("solver.cpp");
+        write_text(
+            &code,
+            "double solve(double a, double b) { return a * 2.0 + b / 3.0; }\n",
+            MAX_TABLE_FILE_BYTES,
+        );
+        assert!(!is_table_like_file(&code));
+    }
+
+    #[test]
+    fn large_numeric_non_code_file_is_not_judged_as_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("values.txt");
+        write_text(&data, "1, 2, 3, 4,\n", MAX_TABLE_FILE_BYTES);
+        assert!(!is_table_like_file(&data));
+    }
+
+    #[test]
+    fn data_file_stats_counts_only_data_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let json = dir.path().join("dump.json");
+        std::fs::write(&json, "[\n1,\n2\n]").unwrap();
+        assert_eq!(
+            data_file_stats(&json),
+            Some(DataFileStats { lines: 4, bytes: 8 })
+        );
+        let code = dir.path().join("main.rs");
+        std::fs::write(&code, "fn main() {}\n").unwrap();
+        assert_eq!(data_file_stats(&code), None);
+    }
+
+    #[test]
+    fn qt_translation_files_are_skipped_but_typescript_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let qt = dir.path().join("qbittorrent_bs.ts");
+        std::fs::write(
+            &qt,
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<!DOCTYPE TS>\n<TS version=\"2.1\" language=\"bs\">\n</TS>\n",
+        )
+        .unwrap();
+        let typescript = dir.path().join("api.ts");
+        std::fs::write(&typescript, "export const x = 1;\n").unwrap();
+
+        assert!(is_qt_translation_file(&qt));
+        assert!(!is_qt_translation_file(&typescript));
+        let filter = IngestFilter::new(false, false);
+        assert!(!filter.allows(&qt, Path::new("src/lang/qbittorrent_bs.ts")));
+        assert!(filter.allows(&typescript, Path::new("src/api.ts")));
     }
 
     #[test]

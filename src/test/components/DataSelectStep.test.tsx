@@ -1,7 +1,6 @@
 import { describe, it, expect, vi } from 'vitest'
 import { screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import React from 'react'
 import DataSelectStep from '@/components/mcp/DataSelectStep'
 import { renderWithProviders } from '../helpers'
 
@@ -83,5 +82,38 @@ describe('DataSelectStep', () => {
   it('enables Next when a group is selected', () => {
     renderWithProviders(<DataSelectStep {...baseProps} selectedGroups={new Set(['group-1'])} />)
     expect(screen.getByText('Next')).not.toBeDisabled()
+  })
+
+  it('shows the website list only when website options exist', () => {
+    const { rerender } = renderWithProviders(
+      <DataSelectStep {...baseProps} websiteOptions={['docs.example.com']} />,
+    )
+    expect(screen.getByText('Add Websites')).toBeInTheDocument()
+    rerender(<DataSelectStep {...baseProps} websiteOptions={[]} />)
+    expect(screen.queryByText('Add Websites')).not.toBeInTheDocument()
+  })
+
+  it('enables Next when a website is selected', () => {
+    renderWithProviders(
+      <DataSelectStep
+        {...baseProps}
+        websiteOptions={['example.com']}
+        selectedWebsites={new Set(['example.com'])}
+      />,
+    )
+    expect(screen.getByText('Next')).not.toBeDisabled()
+  })
+
+  it('calls onToggleWebsite with the clicked website', async () => {
+    const onToggleWebsite = vi.fn()
+    renderWithProviders(
+      <DataSelectStep
+        {...baseProps}
+        websiteOptions={['docs.example.com']}
+        onToggleWebsite={onToggleWebsite}
+      />,
+    )
+    await userEvent.click(screen.getByLabelText('docs.example.com'))
+    expect(onToggleWebsite).toHaveBeenCalledWith('docs.example.com')
   })
 })

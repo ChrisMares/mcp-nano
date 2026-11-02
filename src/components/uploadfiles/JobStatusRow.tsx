@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { EmbedJob } from "@/types/embed";
+import { errorMessage } from "@/lib/utils";
 import { RotateCw, X } from "lucide-react";
 import {
   btnCancel,
@@ -42,7 +43,7 @@ const JobStatusRow: React.FC<Props> = ({ embedJob }) => {
       setConfirmOpen(false);
     } catch (e) {
       setCancelRequested(false);
-      setCancelError(e instanceof Error ? e.message : String(e));
+      setCancelError(errorMessage(e));
     }
   };
 

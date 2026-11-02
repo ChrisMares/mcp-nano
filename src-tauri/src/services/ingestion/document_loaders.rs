@@ -45,7 +45,11 @@ pub fn load_document(path: &Path) -> anyhow::Result<Vec<DocumentChunk>> {
         .and_then(|n| n.to_str())
         .unwrap_or("unknown")
         .to_string();
-    let doc_type = if ext.is_empty() { "txt".to_string() } else { ext.clone() };
+    let doc_type = if ext.is_empty() {
+        "txt".to_string()
+    } else {
+        ext.clone()
+    };
 
     match ext.as_str() {
         "txt" | "" => load_text(path, &file_name, &doc_type),
@@ -70,7 +74,13 @@ fn one_chunk(file_name: &str, doc_type: &str, content: String) -> Vec<DocumentCh
     if content.trim().is_empty() {
         return Vec::new();
     }
-    let mut chunk = DocumentChunk::new(uuid::Uuid::new_v4().to_string(), file_name, content, doc_type, 0);
+    let mut chunk = DocumentChunk::new(
+        uuid::Uuid::new_v4().to_string(),
+        file_name,
+        content,
+        doc_type,
+        0,
+    );
     chunk
         .metadata
         .insert("source".into(), Value::String(file_name.to_string()));
@@ -88,7 +98,11 @@ fn load_csv(path: &Path, file_name: &str) -> anyhow::Result<Vec<DocumentChunk>> 
         .has_headers(true)
         .flexible(true)
         .from_path(path)?;
-    let headers = reader.headers()?.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let headers = reader
+        .headers()?
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>();
     let mut chunks = Vec::new();
     let mut idx = 0i64;
     for record in reader.records() {
@@ -101,9 +115,19 @@ fn load_csv(path: &Path, file_name: &str) -> anyhow::Result<Vec<DocumentChunk>> 
             .map(|((i, h), v)| format!("{i}: {h}: {v}"))
             .collect();
         let content = format!("row {}: \n{}", idx + 1, lines.join("\n"));
-        let mut chunk = DocumentChunk::new(uuid::Uuid::new_v4().to_string(), file_name, content, "csv", idx);
-        chunk.metadata.insert("source".into(), Value::String(file_name.to_string()));
-        chunk.metadata.insert("row".into(), Value::Number((idx + 1).into()));
+        let mut chunk = DocumentChunk::new(
+            uuid::Uuid::new_v4().to_string(),
+            file_name,
+            content,
+            "csv",
+            idx,
+        );
+        chunk
+            .metadata
+            .insert("source".into(), Value::String(file_name.to_string()));
+        chunk
+            .metadata
+            .insert("row".into(), Value::Number((idx + 1).into()));
         chunks.push(chunk);
         idx += 1;
     }
@@ -184,7 +208,10 @@ fn load_html(path: &Path, file_name: &str) -> anyhow::Result<Vec<DocumentChunk>>
             while let Some(p) = ancestor {
                 if let scraper::node::Node::Element(e) = p.value() {
                     let n = e.name();
-                    if matches!(n, "script" | "style" | "nav" | "footer" | "header" | "aside") {
+                    if matches!(
+                        n,
+                        "script" | "style" | "nav" | "footer" | "header" | "aside"
+                    ) {
                         is_in_noise = true;
                         break;
                     }
@@ -221,16 +248,22 @@ fn load_odt(path: &Path, file_name: &str) -> anyhow::Result<Vec<DocumentChunk>> 
     Ok(one_chunk(file_name, "odt", text))
 }
 
-fn load_spreadsheet(path: &Path, file_name: &str, doc_type: &str) -> anyhow::Result<Vec<DocumentChunk>> {
+fn load_spreadsheet(
+    path: &Path,
+    file_name: &str,
+    doc_type: &str,
+) -> anyhow::Result<Vec<DocumentChunk>> {
     use calamine::{open_workbook_auto, Data, Reader};
 
-    let mut workbook = open_workbook_auto(path)
-        .map_err(|e| anyhow::anyhow!("opening spreadsheet: {e}"))?;
+    let mut workbook =
+        open_workbook_auto(path).map_err(|e| anyhow::anyhow!("opening spreadsheet: {e}"))?;
     let mut chunks = Vec::new();
     let mut idx = 0i64;
     let sheet_names = workbook.sheet_names().to_vec();
     for sheet_name in sheet_names {
-        let Ok(range) = workbook.worksheet_range(&sheet_name) else { continue };
+        let Ok(range) = workbook.worksheet_range(&sheet_name) else {
+            continue;
+        };
         let mut rendered = String::new();
         rendered.push_str(&format!("Sheet: {sheet_name}\n"));
         for row in range.rows() {
@@ -252,9 +285,19 @@ fn load_spreadsheet(path: &Path, file_name: &str, doc_type: &str) -> anyhow::Res
             rendered.push('\n');
         }
         if !rendered.trim().is_empty() {
-            let mut chunk = DocumentChunk::new(uuid::Uuid::new_v4().to_string(), file_name, rendered, doc_type, idx);
-            chunk.metadata.insert("source".into(), Value::String(file_name.to_string()));
-            chunk.metadata.insert("sheet_name".into(), Value::String(sheet_name.clone()));
+            let mut chunk = DocumentChunk::new(
+                uuid::Uuid::new_v4().to_string(),
+                file_name,
+                rendered,
+                doc_type,
+                idx,
+            );
+            chunk
+                .metadata
+                .insert("source".into(), Value::String(file_name.to_string()));
+            chunk
+                .metadata
+                .insert("sheet_name".into(), Value::String(sheet_name.clone()));
             chunks.push(chunk);
             idx += 1;
         }
@@ -269,7 +312,10 @@ fn load_pdf(path: &Path, file_name: &str) -> anyhow::Result<Vec<DocumentChunk>> 
             "pdf extraction complete path={} extractor=pdftotext pages={} chars={}",
             path.display(),
             chunks.len(),
-            chunks.iter().map(|chunk| chunk.content.len()).sum::<usize>()
+            chunks
+                .iter()
+                .map(|chunk| chunk.content.len())
+                .sum::<usize>()
         );
         return Ok(chunks);
     }
@@ -281,17 +327,17 @@ fn load_pdf(path: &Path, file_name: &str) -> anyhow::Result<Vec<DocumentChunk>> 
         "pdf extraction complete path={} extractor=pdf-extract pages={} chars={}",
         path.display(),
         chunks.len(),
-        chunks.iter().map(|chunk| chunk.content.len()).sum::<usize>()
+        chunks
+            .iter()
+            .map(|chunk| chunk.content.len())
+            .sum::<usize>()
     );
     Ok(chunks)
 }
 
 /// Match PyPDFLoader: each non-empty PDF page becomes its own source document
 /// and carries a zero-based page index through subsequent token splitting.
-fn pdf_page_chunks(
-    file_name: &str,
-    pages: impl IntoIterator<Item = String>,
-) -> Vec<DocumentChunk> {
+fn pdf_page_chunks(file_name: &str, pages: impl IntoIterator<Item = String>) -> Vec<DocumentChunk> {
     pdf_numbered_page_chunks(file_name, pages.into_iter().enumerate())
 }
 
@@ -313,7 +359,9 @@ fn pdf_numbered_page_chunks(
                 page as i64,
             );
             chunk.page = Some(page as i64);
-            chunk.metadata.insert("source".into(), Value::String(file_name.to_string()));
+            chunk
+                .metadata
+                .insert("source".into(), Value::String(file_name.to_string()));
             Some(chunk)
         })
         .collect()
@@ -406,8 +454,8 @@ where
 }
 
 fn load_docx(path: &Path, file_name: &str) -> anyhow::Result<Vec<DocumentChunk>> {
-    let text = docx_lite::extract_text(path)
-        .map_err(|e| anyhow::anyhow!("extracting docx: {e}"))?;
+    let text =
+        docx_lite::extract_text(path).map_err(|e| anyhow::anyhow!("extracting docx: {e}"))?;
     Ok(one_chunk(file_name, "docx", text))
 }
 
@@ -424,7 +472,10 @@ mod tests {
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].content, "hello world");
         assert_eq!(chunks[0].doc_type, "txt");
-        assert_eq!(chunks[0].metadata.get("source").and_then(Value::as_str), Some("foo.txt"));
+        assert_eq!(
+            chunks[0].metadata.get("source").and_then(Value::as_str),
+            Some("foo.txt")
+        );
     }
 
     #[test]
@@ -437,7 +488,10 @@ mod tests {
         assert!(chunks[0].content.contains("Alice"));
         assert!(chunks[1].content.contains("Bob"));
         assert_eq!(chunks[0].doc_type, "csv");
-        assert_eq!(chunks[0].metadata.get("source").and_then(Value::as_str), Some("data.csv"));
+        assert_eq!(
+            chunks[0].metadata.get("source").and_then(Value::as_str),
+            Some("data.csv")
+        );
     }
 
     #[test]
@@ -474,11 +528,18 @@ mod tests {
     fn pdf_page_chunks_preserve_zero_based_page_metadata() {
         let chunks = pdf_page_chunks(
             "guide.pdf",
-            ["first page".to_string(), "".to_string(), "third page".to_string()],
+            [
+                "first page".to_string(),
+                "".to_string(),
+                "third page".to_string(),
+            ],
         );
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].page, Some(0));
-        assert_eq!(chunks[0].metadata.get("source").and_then(Value::as_str), Some("guide.pdf"));
+        assert_eq!(
+            chunks[0].metadata.get("source").and_then(Value::as_str),
+            Some("guide.pdf")
+        );
         assert_eq!(chunks[0].chunk_index, 0);
         assert_eq!(chunks[1].page, Some(2));
         assert_eq!(chunks[1].chunk_index, 2);

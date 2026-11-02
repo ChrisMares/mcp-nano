@@ -8,12 +8,10 @@ use std::time::Duration;
 use mcp_nano_lib::mcp::{extract_server_id, McpAppState, McpHandler};
 use mcp_nano_lib::models::request::{ScopePayload, ToolPayload};
 use mcp_nano_lib::services::mcp_config;
-use mcp_nano_lib::services::rag_service::RagService;
+use mcp_nano_lib::services::rag::RagService;
 use mcp_nano_lib::services::QdrantService;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
-use rmcp::transport::streamable_http_server::{
-    StreamableHttpServerConfig, StreamableHttpService,
-};
+use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::ServiceExt;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -39,6 +37,22 @@ async fn memory_pool() -> SqlitePool {
     pool
 }
 
+async fn add_tool(pool: &SqlitePool, server_id: &str, name: &str, scopes: Vec<ScopePayload>) {
+    mcp_config::create_tool(
+        pool,
+        server_id,
+        ToolPayload {
+            name: name.into(),
+            description: Some(format!("{name} description")),
+            code_search_scopes: scopes,
+            document_search_scopes: vec![],
+            max_chunk_limit: None,
+        },
+    )
+    .await
+    .unwrap();
+}
+
 async fn build_rag_if_possible() -> Option<(Arc<RagService>, common::ChildGuard)> {
     let embedders = common::load_embedders()?;
     let (client, child) = common::spawn_qdrant().await?;
@@ -52,40 +66,17 @@ async fn list_tools_filtered_by_server_id() {
     let server = mcp_config::create_server(&pool, "code_search".into(), None)
         .await
         .unwrap();
-    mcp_config::create_tool(
-        &pool,
-        &server.server.id,
-        ToolPayload {
-            name: "search_my_code".into(),
-            description: Some("Search the codebase".into()),
-            code_search_scopes: vec![ScopePayload {
-                collection: "codebase".into(),
-                repo_names: Some(vec!["mcp-nano".into()]),
-                group_ids: None,
-            }],
-            document_search_scopes: vec![],
-            max_chunk_limit: None,
-        },
-    )
-    .await
-    .unwrap();
+    let scope = ScopePayload {
+        collection: "codebase".into(),
+        repo_names: Some(vec!["mcp-nano".into()]),
+        group_ids: None,
+    };
+    add_tool(&pool, &server.server.id, "search_my_code", vec![scope]).await;
 
     let other = mcp_config::create_server(&pool, "other".into(), None)
         .await
         .unwrap();
-    mcp_config::create_tool(
-        &pool,
-        &other.server.id,
-        ToolPayload {
-            name: "other_tool".into(),
-            description: Some("other".into()),
-            code_search_scopes: vec![],
-            document_search_scopes: vec![],
-            max_chunk_limit: None,
-        },
-    )
-    .await
-    .unwrap();
+    add_tool(&pool, &other.server.id, "other_tool", vec![]).await;
 
     let tools = mcp_config::list_active_tools(&pool, Some(&server.server.name))
         .await
@@ -108,21 +99,8 @@ async fn mcp_http_list_tools_via_streamable_http() {
     let server = mcp_config::create_server(&pool, "http_server".into(), None)
         .await
         .unwrap();
-    let server_id = server.server.id.clone();
     let server_name = server.server.name.clone();
-    mcp_config::create_tool(
-        &pool,
-        &server_id,
-        ToolPayload {
-            name: "http_search".into(),
-            description: Some("HTTP exposed tool".into()),
-            code_search_scopes: vec![],
-            document_search_scopes: vec![],
-            max_chunk_limit: None,
-        },
-    )
-    .await
-    .unwrap();
+    add_tool(&pool, &server.server.id, "http_search", vec![]).await;
 
     let state = Arc::new(McpAppState::new(pool, rag));
     let ct = CancellationToken::new();

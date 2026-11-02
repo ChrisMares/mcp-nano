@@ -1,9 +1,11 @@
-import React, { useState, useEffect, useCallback } from "react";
-import { getMetadataValues, ragQuery } from "@/utils/apicalls";
+/** Fetch Context page: semantic search and code symbol lookup over embedded data. */
+import React from "react";
 import { Loader2 } from "lucide-react";
 import {
   radioInput,
   textareaInput,
+  textInput,
+  selectInput,
   btnPrimary,
   fieldLabel,
   sliderBounds,
@@ -11,87 +13,34 @@ import {
 } from "@/styles/classes";
 import PageHead from "@/components/shared/PageHead";
 import { useTheme } from "@/contexts/ThemeContext";
-import type { RagQueryPayload, RagResponse } from "@/types/rag";
+import { useRagQuery, type RagCollection, type SearchMode } from "@/hooks/use-rag-query";
+import type { SymbolRelation } from "@/types/rag";
 import RagResultsPanel from "@/components/fetchcontext/RagResultsPanel";
 import FilterSelect from "@/components/fetchcontext/FilterSelect";
 
+const COLLECTIONS: RagCollection[] = ["codebase", "general"];
+
+const MODES: { value: SearchMode; label: string }[] = [
+  { value: "semantic", label: "Semantic search" },
+  { value: "symbol", label: "Symbol lookup" },
+];
+
+const RELATIONS: { value: SymbolRelation; label: string }[] = [
+  { value: "definition", label: "Definition" },
+  { value: "references", label: "References (callers)" },
+  { value: "callees", label: "Callees" },
+  { value: "members", label: "Members (class/interface)" },
+];
+
+const isRelation = (value: string): value is SymbolRelation =>
+  RELATIONS.some((r) => r.value === value);
+
+/** Search form plus results; state lives in {@link useRagQuery}. */
 const FetchContext: React.FC = () => {
   const { theme } = useTheme();
-  const [collection, setCollection] = useState<"codebase" | "general">(
-    "codebase",
-  );
-  const [query, setQuery] = useState("");
-  const [limit, setLimit] = useState(10);
-  const [filterOptions, setFilterOptions] = useState<string[]>([]);
-  const [selectedFilters, setSelectedFilters] = useState<Set<string>>(
-    new Set(),
-  );
-  const [loading, setLoading] = useState(false);
-  const [result, setResult] = useState<{
-    rag_response?: RagResponse;
-    error?: string;
-  } | null>(null);
-
-  useEffect(() => {
-    setSelectedFilters(new Set());
-    const key = collection === "codebase" ? "repo_name" : "group";
-    getMetadataValues(collection, key)
-      .then((res) => {
-        if (res?.values) {
-          const sorted = [...res.values].sort();
-          setFilterOptions(sorted);
-        }
-      })
-      .catch(() => setFilterOptions([]));
-  }, [collection]);
-
-  const handleCollectionChange = (val: "codebase" | "general") => {
-    setCollection(val);
-    setResult(null);
-  };
-
-  const toggleFilter = (name: string) => {
-    setSelectedFilters((prev) => {
-      const next = new Set(prev);
-      if (next.has(name)) next.delete(name);
-      else next.add(name);
-      return next;
-    });
-  };
-
-  const handleSubmit = useCallback(async () => {
-    if (!query.trim()) return;
-
-    setLoading(true);
-    setResult(null);
-
-    const filterKey = collection === "codebase" ? "repo_name" : "group";
-    const payload: RagQueryPayload = {
-      collection,
-      query: query.trim(),
-      show_documents: false,
-      limit,
-    };
-
-    if (selectedFilters.size > 0) {
-      payload.where = {
-        $or: Array.from(selectedFilters).map((v) => ({ [filterKey]: v })),
-      };
-    }
-
-    try {
-      const response = await ragQuery(payload);
-      setResult({ rag_response: response });
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      setResult({ error: msg });
-    } finally {
-      setLoading(false);
-    }
-  }, [collection, query, limit, selectedFilters]);
-
-  const filterLabel = collection === "codebase" ? "Repos" : "Groups";
-  const canSubmit = query.trim().length > 0 && !loading;
+  const rag = useRagQuery();
+  const isCode = rag.collection === "codebase";
+  const { symbolMode } = rag;
 
   return (
     <div className="rounded-lg border border-border bg-card p-6">
@@ -105,66 +54,110 @@ const FetchContext: React.FC = () => {
       </p>
 
       <div className="max-w-3xl space-y-6">
-        {/* Collection Radio */}
         <div>
-          <label className="block text-sm font-medium text-foreground mb-3">
-            Collection
-          </label>
+          <label className="block text-sm font-medium text-foreground mb-3">Collection</label>
           <div className="flex gap-6">
-            {(["codebase", "general"] as const).map((val) => (
-              <label
-                key={val}
-                className="flex items-center gap-2 cursor-pointer"
-              >
+            {COLLECTIONS.map((val) => (
+              <label key={val} className="flex items-center gap-2 cursor-pointer">
                 <input
                   type="radio"
                   name="collection"
                   value={val}
-                  checked={collection === val}
-                  onChange={() => handleCollectionChange(val)}
+                  checked={rag.collection === val}
+                  onChange={() => rag.setCollection(val)}
                   className={radioInput}
                 />
-                <span className="text-sm text-foreground capitalize">
-                  {val}
-                </span>
+                <span className="text-sm text-foreground capitalize">{val}</span>
               </label>
             ))}
           </div>
         </div>
 
-        {filterOptions.length > 0 && (
+        {isCode && (
+          <div role="radiogroup" aria-label="Search mode" className="inline-flex rounded-md border border-border p-0.5">
+            {MODES.map((m) => (
+              <button
+                key={m.value}
+                type="button"
+                role="radio"
+                aria-checked={rag.mode === m.value}
+                onClick={() => rag.setMode(m.value)}
+                className={`rounded px-3 py-1.5 text-sm ${
+                  rag.mode === m.value
+                    ? "bg-primary text-primary-foreground"
+                    : "text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                {m.label}
+              </button>
+            ))}
+          </div>
+        )}
+
+        {rag.filterOptions.length > 0 && (
           <FilterSelect
-            label={filterLabel}
-            options={filterOptions}
-            selected={selectedFilters}
-            onToggle={toggleFilter}
+            label={isCode ? "Repos" : "Groups"}
+            options={rag.filterOptions}
+            selected={rag.selectedFilters}
+            onToggle={rag.toggleFilter}
           />
         )}
 
-        {/* Query */}
+        {symbolMode && (
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label htmlFor="symbol-input" className={fieldLabel}>Symbol</label>
+              <input
+                id="symbol-input"
+                value={rag.symbol}
+                onChange={(e) => rag.setSymbol(e.target.value)}
+                className={textInput}
+                placeholder="run_rag_query or RagService::run_rag_query"
+              />
+            </div>
+            <div>
+              <label htmlFor="relation-select" className={fieldLabel}>Relation</label>
+              <select
+                id="relation-select"
+                value={rag.relation}
+                onChange={(e) => {
+                  if (isRelation(e.target.value)) rag.setRelation(e.target.value);
+                }}
+                className={selectInput}
+              >
+                {RELATIONS.map((r) => (
+                  <option key={r.value} value={r.value}>{r.label}</option>
+                ))}
+              </select>
+            </div>
+          </div>
+        )}
+
         <div>
-          <label className={fieldLabel}>Query</label>
+          <label htmlFor="query-input" className={fieldLabel}>
+            {symbolMode ? "Rank by (optional)" : "Query"}
+          </label>
           <textarea
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
+            id="query-input"
+            value={rag.query}
+            onChange={(e) => rag.setQuery(e.target.value)}
             className={textareaInput}
-            placeholder="Enter your query..."
+            placeholder={symbolMode ? "Optional text to rank matches..." : "Enter your query..."}
           />
         </div>
 
-        {/* Results limit */}
         <div className="grid grid-cols-2 gap-6">
           <div>
             <label className={fieldLabel}>
-              Results Limit: <span className="text-primary">{limit}</span>
+              Results Limit: <span className="text-primary">{rag.limit}</span>
             </label>
             <input
               type="range"
               min={5}
               max={100}
               step={5}
-              value={limit}
-              onChange={(e) => setLimit(Number(e.target.value))}
+              value={rag.limit}
+              onChange={(e) => rag.setLimit(Number(e.target.value))}
               className="w-full accent-primary"
             />
             <div className={sliderBounds}>
@@ -172,30 +165,39 @@ const FetchContext: React.FC = () => {
               <span>100</span>
             </div>
           </div>
+          {isCode && !symbolMode && (
+            <label className="flex items-center gap-2 self-center cursor-pointer text-sm text-foreground">
+              <input
+                type="checkbox"
+                checked={rag.expand}
+                onChange={(e) => rag.setExpand(e.target.checked)}
+                className="w-3.5 h-3.5 rounded border-border text-primary"
+              />
+              Expand callees
+            </label>
+          )}
         </div>
 
-        <button
-          onClick={handleSubmit}
-          disabled={!canSubmit}
-          className={btnPrimary}
-        >
-          {loading ? (
+        <button onClick={rag.submit} disabled={!rag.canSubmit} className={btnPrimary}>
+          {rag.loading ? (
             <>
               <Loader2 className="h-4 w-4 animate-spin" />
               Fetching...
             </>
+          ) : symbolMode ? (
+            "Look up"
           ) : (
             "Fetch Context"
           )}
         </button>
 
-        {result?.error && (
+        {rag.error && (
           <div className={alertError} role="alert">
-            {result.error}
+            {rag.error}
           </div>
         )}
 
-        <RagResultsPanel data={result?.rag_response} theme={theme} />
+        <RagResultsPanel data={rag.response} theme={theme} />
       </div>
     </div>
   );
