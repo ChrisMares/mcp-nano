@@ -50,6 +50,8 @@ jobs:
           cache: npm
 
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          components: clippy
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
         with:
@@ -76,12 +78,38 @@ jobs:
         shell: bash
         run: bash src-tauri/scripts/download-qdrant.sh
 
+      - name: Check frontend
+        if: runner.os == 'Linux'
+        run: |
+          npm run typecheck
+          npm run lint
+          npm test
+
+      - name: Check backend
+        shell: bash
+        working-directory: src-tauri
+        env:
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_PROFILE_TEST_DEBUG: "0"
+        run: |
+          cargo clippy --all-targets ${{ matrix.args }} -- -D warnings
+          cargo test --all-targets ${{ matrix.args }}
+
       - uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: v${{ needs.version.outputs.version }}
           releaseName: mcp-nano v${{ needs.version.outputs.version }}
-          releaseDraft: false
+          releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
+
+  publish:
+    needs: [version, release]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "v${{ needs.version.outputs.version }}" --repo "${{ github.repository }}" --draft=false --latest

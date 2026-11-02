@@ -294,9 +294,14 @@ fn init_logging(app: &tauri::AppHandle) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            show_existing_window(app);
+        }))
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             init_logging(app.handle());
+            #[cfg(unix)]
+            exit_on_signal(app.handle());
             if let Some(window) = app.get_webview_window("main") {
                 if let Ok(icon) =
                     tauri::image::Image::from_bytes(include_bytes!("../icons/icon.png"))
@@ -309,20 +314,43 @@ pub fn run() {
             )));
             app.manage(website::WebsiteCrawlState::default());
 
-            let (http_port, grpc_port, qdrant_child) = qdrant::start(app.handle())?;
-            app.manage(qdrant::QdrantChild(std::sync::Mutex::new(Some(
-                qdrant_child,
-            ))));
-            let handle = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                if let Err(error) = qdrant::init(handle.clone(), http_port, grpc_port).await {
-                    error!("Qdrant initialization failed: {error}");
-                    qdrant::publish_status(&handle, |s| {
-                        s.qdrant_ready = false;
-                        s.qdrant_error = Some(error);
+            match qdrant::lock_data_dir(app.handle()) {
+                Ok(lock) => {
+                    app.manage(lock);
+                }
+                Err(error) => {
+                    error!("Backend not started: {error}");
+                    qdrant::publish_status(app.handle(), |s| s.qdrant_error = Some(error));
+                    return Ok(());
+                }
+            }
+            match qdrant::start(app.handle()) {
+                Ok((http_port, grpc_port, qdrant_child)) => {
+                    app.manage(qdrant::QdrantChild(std::sync::Mutex::new(Some(
+                        qdrant_child,
+                    ))));
+                    let handle = app.handle().clone();
+                    tauri::async_runtime::spawn(async move {
+                        if let Err(error) = qdrant::init(handle.clone(), http_port, grpc_port).await
+                        {
+                            error!("Qdrant initialization failed: {error}");
+                            qdrant::publish_status(&handle, |s| {
+                                s.qdrant_ready = false;
+                                s.qdrant_error = Some(error);
+                            });
+                        }
                     });
                 }
-            });
+                Err(error) => {
+                    error!("Qdrant failed to start: {error}");
+                    qdrant::publish_status(app.handle(), |s| {
+                        s.qdrant_error = Some(
+                            "Qdrant failed to start. See qdrant-sidecar.log in the logs folder."
+                                .to_string(),
+                        );
+                    });
+                }
+            }
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 match db::init(handle.clone()).await {
@@ -491,6 +519,45 @@ pub fn run() {
         });
 }
 
+/// Bring the running copy's window forward when the app is launched again.
+fn show_existing_window(app: &tauri::AppHandle) {
+    let label = if app.get_webview_window("splashscreen").is_some() {
+        "splashscreen"
+    } else {
+        "main"
+    };
+    if let Some(window) = app.get_webview_window(label) {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+/// Quit through the normal exit path on SIGTERM, SIGINT or SIGHUP, so
+/// Qdrant is stopped and background work is cancelled.
+#[cfg(unix)]
+fn exit_on_signal(app: &tauri::AppHandle) {
+    use tokio::signal::unix::{signal, SignalKind};
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let (Ok(mut term), Ok(mut int), Ok(mut hup)) = (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::interrupt()),
+            signal(SignalKind::hangup()),
+        ) else {
+            warn!("could not install shutdown signal handlers");
+            return;
+        };
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = int.recv() => {}
+            _ = hup.recv() => {}
+        }
+        info!("shutdown signal received");
+        app.exit(0);
+    });
+}
+
 fn start_splash_watcher(app: &tauri::AppHandle) {
     let app_handle = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -504,11 +571,10 @@ fn start_splash_watcher(app: &tauri::AppHandle) {
             let ready = app_handle
                 .try_state::<qdrant::BackendStatusState>()
                 .and_then(|state| {
-                    state
-                        .0
-                        .read()
-                        .ok()
-                        .map(|s| s.qdrant_ready && s.db_ready && s.embedders_ready)
+                    state.0.read().ok().map(|s| {
+                        (s.qdrant_ready && s.db_ready && s.embedders_ready)
+                            || s.qdrant_error.is_some()
+                    })
                 })
                 .unwrap_or(false);
 

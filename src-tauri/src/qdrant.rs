@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    fs::{self, File, OpenOptions},
+    fs::{self, File, OpenOptions, TryLockError},
     io::Read,
     net::TcpListener,
     path::{Path, PathBuf},
@@ -32,6 +32,86 @@ fn hide_console(command: &mut Command) {
 
 #[cfg(not(windows))]
 fn hide_console(_command: &mut Command) {}
+
+/// Linux: the kernel sends Qdrant SIGTERM when the app process dies, even
+/// when the app is killed or crashes.
+#[cfg(target_os = "linux")]
+fn set_parent_death_signal(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: prctl is async-signal-safe and touches no parent state.
+    unsafe {
+        command.pre_exec(|| {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+            Ok(())
+        });
+    }
+}
+
+/// Windows: put Qdrant in a job that is killed when its last handle closes.
+/// The handle is never closed here, so Windows closes it when the app exits.
+#[cfg(windows)]
+fn assign_kill_on_close_job(child: &Child) {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+    let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    // SAFETY: plain Win32 calls on a job handle created here and the live
+    // child's process handle; `info` outlives the call that reads it.
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() {
+            warn!(
+                "could not create a job object for Qdrant: {}",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+        let configured = SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            (&info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        ) != 0;
+        if !configured || AssignProcessToJobObject(job, child.as_raw_handle()) == 0 {
+            warn!(
+                "could not tie Qdrant to the app lifetime: {}",
+                std::io::Error::last_os_error()
+            );
+            CloseHandle(job);
+        }
+    }
+}
+
+/// Exclusive lock on the app data folder, held for the app's lifetime.
+pub struct InstanceLock(pub File);
+
+pub const ALREADY_RUNNING: &str =
+    "MCP Nano is already running. Close the other copy, then start MCP Nano again.";
+
+/// Lock the data folder so a second copy of the app cannot start Qdrant on
+/// the same storage or stop the first copy's Qdrant. The OS releases the lock
+/// when the process exits, however it exits.
+pub fn lock_data_dir(app: &AppHandle) -> Result<InstanceLock, String> {
+    let path = data_dir(app)?.join("instance.lock");
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(|error| format!("failed to open {}: {error}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(InstanceLock(file)),
+        Err(TryLockError::WouldBlock) => Err(ALREADY_RUNNING.to_string()),
+        Err(TryLockError::Error(error)) => {
+            Err(format!("failed to lock {}: {error}", path.display()))
+        }
+    }
+}
 
 /// Owns the Qdrant sidecar so it is killed on app exit.
 pub struct QdrantChild(pub Mutex<Option<Child>>);
@@ -160,8 +240,9 @@ fn clear_pidfile(app: &AppHandle) {
 }
 
 /// Stop a sidecar left over from a previous run, using the recorded PID.
-/// On Linux the PID is only signalled if it still runs our bundled binary,
-/// so a recycled PID never hits an unrelated process.
+/// The PID is only stopped if it still runs our bundled binary (Linux: exact
+/// path; Windows: image name), so a recycled PID never hits an unrelated
+/// process.
 fn kill_from_pidfile(app: &AppHandle, bin: &Path) {
     let Ok(path) = pidfile_path(app) else {
         return;
@@ -196,9 +277,13 @@ fn kill_from_pidfile(app: &AppHandle, bin: &Path) {
         }
         #[cfg(windows)]
         {
+            let image = bin.file_name().unwrap_or_default().to_string_lossy();
             let mut command = Command::new("taskkill");
             hide_console(&mut command);
-            let _ = command.args(["/PID", &pid.to_string(), "/F"]).status();
+            let _ = command
+                .args(["/F", "/PID", &pid.to_string(), "/FI"])
+                .arg(format!("IMAGENAME eq {image}"))
+                .status();
         }
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -275,6 +360,8 @@ pub fn start(app: &AppHandle) -> Result<(u16, u16, Child), String> {
 
         let mut qdrant_command = Command::new(&bin);
         hide_console(&mut qdrant_command);
+        #[cfg(target_os = "linux")]
+        set_parent_death_signal(&mut qdrant_command);
         let mut spawned = qdrant_command
             .env("QDRANT__SERVICE__HOST", "127.0.0.1")
             .env("QDRANT__SERVICE__HTTP_PORT", http_port.to_string())
@@ -293,6 +380,8 @@ pub fn start(app: &AppHandle) -> Result<(u16, u16, Child), String> {
             .stderr(Stdio::from(stderr))
             .spawn()
             .map_err(|error| format!("failed to start Qdrant ({}): {error}", bin.display()))?;
+        #[cfg(windows)]
+        assign_kill_on_close_job(&spawned);
 
         let pid = spawned.id();
         write_pidfile(app, pid)?;

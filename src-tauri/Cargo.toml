@@ -1,6 +1,6 @@
 [package]
 name = "mcp-nano"
-version = "0.2.2"
+version = "0.2.3"
 description = "MCP Nano - a self contained locally running mcp server"
 authors = ["Chris Mares"]
 edition = "2021"
@@ -55,6 +55,7 @@ uuid = { version = "1.24.0", features = ["v4", "v5", "serde"] }
 sha2 = "0.11.0"
 chrono = { version = "0.4.45", features = ["serde"] }
 tauri-plugin-dialog = "2.7.2"
+tauri-plugin-single-instance = "~2.4.5"
 tree-sitter = "0.26.11"
 tree-sitter-rust = "0.24.2"
 tree-sitter-python = "0.25.0"
@@ -85,3 +86,9 @@ murmur3 = "0.5.2"
 rust-stemmers = "1.2.0"
 
 [dev-dependencies]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
